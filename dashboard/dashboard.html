@@ -527,7 +527,7 @@ function PlansView({ jobs }) {
                                   className="text-xs text-blue-600 hover:underline">LinkedIn</a>
                               )}
                               {job.resume_path && (
-                                <button onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title)}
+                                <button onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title, job.id)}
                                   className="text-xs text-blue-600 hover:underline">View Resume</button>
                               )}
                               {job.pdf_path && (
@@ -1594,7 +1594,7 @@ function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
                                                     )}
                                                     {j.resume_path && (
                                                       <button
-                                                        onClick={e => { e.stopPropagation(); window._showResume && window._showResume(j.resume_path, j.company, j.title); }}
+                                                        onClick={e => { e.stopPropagation(); window._showResume && window._showResume(j.resume_path, j.company, j.title, j.id); }}
                                                         className="px-2.5 py-1 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">
                                                         View Resume
                                                       </button>
@@ -2520,7 +2520,7 @@ function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans 
                                 className="px-2.5 py-1 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">LinkedIn Posting</a>
                             )}
                             {j.resume_path && (
-                              <button onClick={e => { e.stopPropagation(); window._showResume && window._showResume(j.resume_path, j.company, j.title); }}
+                              <button onClick={e => { e.stopPropagation(); window._showResume && window._showResume(j.resume_path, j.company, j.title, j.id); }}
                                 className="px-2.5 py-1 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">View Resume</button>
                             )}
                             {j.pdf_path && (
@@ -3806,7 +3806,7 @@ function JobDetailModal() {
               </a>
             )}
             {job.resume_path && (
-              <button onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title)}
+              <button onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title, job.id)}
                 className="px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">
                 View Resume
               </button>
