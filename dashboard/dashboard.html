@@ -1227,7 +1227,7 @@ function StatsPanel({ jobs }) {
   };
 
   const fetchCompanyInfo = (companyName) => {
-    const key = companyName.trim().toLowerCase();
+    const key = (companyName || '').trim().toLowerCase();
     if (companyCache[key] !== undefined) return;
     setCompanyCache(prev => ({ ...prev, [key]: { loading: true } }));
     fetch('/api/company-info/' + encodeURIComponent(companyName))
@@ -1524,7 +1524,7 @@ function StatsPanel({ jobs }) {
                                                     </div>
                                                     {/* Right: Company Info */}
                                                     {(() => {
-                                                      const key = j.company.trim().toLowerCase();
+                                                      const key = (j.company || '').trim().toLowerCase();
                                                       const info = companyCache[key];
                                                       if (!info) return null;
                                                       if (info.loading) return (
@@ -1810,7 +1810,7 @@ function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans 
   };
 
   const fetchCompanyInfo = (companyName) => {
-    const key = companyName.trim().toLowerCase();
+    const key = (companyName || '').trim().toLowerCase();
     if (companyCache[key]) return;
     setCompanyCache(prev => ({ ...prev, [key]: { loading: true } }));
     fetch('/api/company-info/' + encodeURIComponent(companyName))
@@ -2038,7 +2038,7 @@ function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans 
                               })()}
                             </div>
                             {(() => {
-                              const key = j.company.trim().toLowerCase();
+                              const key = (j.company || '').trim().toLowerCase();
                               const info = companyCache[key];
                               if (!info) return null;
                               if (info.loading) return (
