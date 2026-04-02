@@ -73,14 +73,14 @@ _tier_thresholds = _config["scoring"]["tier_thresholds"]
 TIER_STRONG = _tier_thresholds["strong"]
 TIER_MATCH = _tier_thresholds["match"]
 
-# Build BULLETS dict from config experience entries
+# Build BULLETS dict from config experience entries (keyed by display_name)
 BULLETS = {
-    key: entry["bullets"]
+    entry.get("display_name", key): entry["bullets"]
     for key, entry in _config["experience"].items()
 }
 
 BULLET_LIMITS = {
-    key: entry["bullet_limit"]
+    entry.get("display_name", key): entry["bullet_limit"]
     for key, entry in _config["experience"].items()
 }
 
