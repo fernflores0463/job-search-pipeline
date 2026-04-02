@@ -1771,6 +1771,135 @@ function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
   );
 }
 
+function AIResumeAssistant({ job }) {
+  const { useState, useCallback, useEffect, useRef } = React;
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const [thinking, setThinking] = useState(false);
+  const messagesEndRef = useRef(null);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, thinking]);
+
+  // Reset messages when job changes
+  useEffect(() => { setMessages([]); }, [job && job.id]);
+
+  const sendMessage = useCallback(async (text, opts = {}) => {
+    if (!text.trim() || thinking) return;
+    const userMsg = { role: 'user', content: text.trim() };
+    const newMessages = [...messages, userMsg];
+    setMessages(newMessages);
+    setInput('');
+    setThinking(true);
+    try {
+      const res = await fetch('/api/ai-review', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: userMsg.content,
+          job_id: job ? job.id : null,
+          history: messages,
+          include_pdf: opts.include_pdf || false,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setMessages(prev => [...prev, { role: 'assistant', content: 'Error: ' + data.error }]);
+      } else {
+        setMessages(prev => [...prev, { role: 'assistant', content: data.response }]);
+      }
+    } catch (err) {
+      setMessages(prev => [...prev, { role: 'assistant', content: 'Error: Could not connect to AI service.' }]);
+    }
+    setThinking(false);
+  }, [messages, job, thinking]);
+
+  const quickPrompts = [
+    { label: 'Analyze Fit', prompt: 'Analyze this job posting against my resume. Rate the fit from 1-10. List which requirements my experience covers well, and identify any gaps. Be specific \u2014 reference my actual bullets.' },
+    { label: 'Tailor Bullets', prompt: 'Review my tailored resume for this job. Suggest specific bullet rewordings, reorderings, or substitutions from my full bullet pool that would improve the keyword match. Show the before and after for each suggestion.' },
+    { label: 'Interview Prep', prompt: 'Based on this job description and my resume, generate 5 technical and 5 behavioral interview questions I should prepare for. For each, suggest a strong answer that references my specific experience.' },
+    { label: 'Cover Letter', prompt: 'Draft a concise 2-paragraph cover letter for this position. Reference my most relevant experience from the resume. Keep it professional and specific to this role \u2014 no generic filler. Two paragraphs maximum.' },
+  ];
+
+  return (
+    <div className="bg-white rounded-lg border p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold text-gray-700">AI Resume Assistant</h3>
+        <span className="text-xs text-gray-400">Powered by Claude</span>
+      </div>
+
+      {/* Quick prompt buttons */}
+      <div className="flex flex-wrap gap-2 mb-3">
+        {quickPrompts.map((qp, i) => (
+          <button key={i} onClick={() => sendMessage(qp.prompt)} disabled={thinking}
+            className="px-3 py-1.5 bg-purple-50 text-purple-700 rounded-full text-xs font-medium hover:bg-purple-100 border border-purple-200 disabled:opacity-50">
+            {qp.label}
+          </button>
+        ))}
+        {job && job.pdf_path && (
+          <button onClick={() => sendMessage(
+            "I've uploaded a PDF version of my resume for this position. Compare the PDF resume text against the job description. Identify missing keywords, suggest improvements, and rate how well it targets this specific role.",
+            { include_pdf: true }
+          )} disabled={thinking}
+            className="px-3 py-1.5 bg-green-50 text-green-700 rounded-full text-xs font-medium hover:bg-green-100 border border-green-200 disabled:opacity-50">
+            Review PDF
+          </button>
+        )}
+      </div>
+
+      {/* Messages area */}
+      {(messages.length > 0 || thinking) && (
+        <div className="border rounded-lg mb-3 overflow-y-auto space-y-3 p-3" style={{ maxHeight: '500px' }}>
+          {messages.map((msg, i) => (
+            <div key={i} className={msg.role === 'user' ? 'flex justify-end' : 'flex justify-start'}>
+              {msg.role === 'user' ? (
+                <div className="bg-purple-600 text-white rounded-lg px-3 py-2 max-w-full text-sm whitespace-pre-wrap">
+                  {msg.content}
+                </div>
+              ) : (
+                <div className="bg-gray-50 text-gray-800 rounded-lg px-3 py-2 max-w-full text-sm ai-response border"
+                  dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+              )}
+            </div>
+          ))}
+          {thinking && (
+            <div className="flex justify-start">
+              <div className="bg-gray-50 text-gray-500 rounded-lg px-3 py-2 text-sm animate-pulse border">
+                Analyzing with Claude...
+              </div>
+            </div>
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+      )}
+
+      {/* Follow-up input */}
+      <div className="flex gap-2">
+        <input
+          ref={inputRef}
+          type="text"
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input); } }}
+          placeholder="Ask a follow-up question..."
+          className="flex-1 px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-purple-400"
+          disabled={thinking}
+        />
+        <button
+          onClick={() => sendMessage(input)}
+          disabled={thinking || !input.trim()}
+          className="px-4 py-2 bg-purple-600 text-white rounded text-sm font-medium hover:bg-purple-700 disabled:opacity-50"
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
 function JobDetailPage({ job, appPlans = [], saveAppPlans, changeStatus, onBack }) {
   const { useState, useEffect, useCallback } = React;
   const [description, setDescription] = useState(null);
@@ -2056,6 +2185,9 @@ function JobDetailPage({ job, appPlans = [], saveAppPlans, changeStatus, onBack 
               ) : null}
               <BatchPdfDropZone job={job} />
             </div>
+
+            {/* AI Resume Assistant */}
+            {IS_SERVED && <AIResumeAssistant job={job} />}
           </div>
         </div>
       </div>

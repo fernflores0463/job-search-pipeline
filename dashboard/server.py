@@ -774,6 +774,60 @@ def _call_ollama(messages, model="qwen2.5:14b"):
     return result.get("message", {}).get("content", "")
 
 
+def _load_anthropic_key():
+    """Load Anthropic API key from env var or AWS Parameter Store."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key:
+        return key
+    try:
+        import boto3
+        ssm = boto3.client(
+            "ssm",
+            region_name=os.environ.get("AWS_REGION", "us-west-2")
+        )
+        resp = ssm.get_parameter(
+            Name="/job-search/anthropic-api-key",
+            WithDecryption=True
+        )
+        return resp["Parameter"]["Value"]
+    except Exception:
+        return ""
+
+
+_ANTHROPIC_KEY = _load_anthropic_key()
+
+
+def _call_claude(system_prompt, messages, model="claude-sonnet-4-20250514"):
+    """Call the Anthropic Claude API."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=_ANTHROPIC_KEY)
+    response = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system=system_prompt,
+        messages=messages,
+    )
+    return response.content[0].text
+
+
+def _extract_pdf_text(pdf_path):
+    """Extract text from a PDF file. Returns None on failure."""
+    try:
+        from PyPDF2 import PdfReader
+        full_path = os.path.join(PARENT_DIR, pdf_path)
+        if not os.path.exists(full_path):
+            return None
+        reader = PdfReader(full_path)
+        text_parts = []
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                text_parts.append(t)
+        return "\n".join(text_parts) if text_parts else None
+    except Exception:
+        return None
+
+
 # ─────────────────────────────────────────────────────────
 # CAREERS PAGE SCRAPER
 # ─────────────────────────────────────────────────────────
@@ -1739,6 +1793,99 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             try:
                 response = _call_ollama(messages, model=model)
                 _json_response(self, {"response": response, "model": model})
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── POST /api/ai-review (Claude API) ──────────────
+        if self.path == "/api/ai-review":
+            if not _ANTHROPIC_KEY:
+                _json_response(
+                    self,
+                    {"error": "Anthropic API key not configured. "
+                     "Set ANTHROPIC_API_KEY env var or add "
+                     "/job-search/anthropic-api-key to Parameter Store."},
+                    500)
+                return
+
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+            user_message = body.get("message", "")
+            job_id = body.get("job_id")
+            history = body.get("history", [])
+            include_pdf = body.get("include_pdf", False)
+
+            if not user_message:
+                _json_response(self, {"error": "No message provided"}, 400)
+                return
+
+            _candidate_name = _config["candidate"]["name"]
+            _experience_contexts = ", ".join(
+                entry.get("context", key)
+                for key, entry in _config["experience"].items()
+            )
+            system_parts = [
+                "You are a job search assistant for a software engineer "
+                f"named {_candidate_name}.",
+                f"{_candidate_name} has experience at: "
+                f"{_experience_contexts}.",
+                f"Their skills include: {_CANDIDATE_SKILLS}",
+                "",
+                "YOUR ROLE:",
+                f"- Analyze job postings and evaluate fit against "
+                f"{_candidate_name}'s actual experience",
+                "- Suggest SPECIFIC resume bullet rewording or reordering "
+                "based on job requirements",
+                "- When suggesting resume changes, reference their ACTUAL "
+                "bullets by quoting them and suggest concrete edits",
+                "- For interview prep, tailor questions to the specific "
+                "technologies and responsibilities in the job posting",
+                "- Be direct and actionable — no generic advice",
+                "",
+                f"IMPORTANT: When discussing resume improvements, you must "
+                f"work with {_candidate_name}'s ACTUAL experience bullets "
+                "listed below.",
+                f"\n--- {_candidate_name.upper()}'S FULL EXPERIENCE "
+                "BULLET POOL ---",
+                "These are all the resume bullets available:",
+                _format_bullet_pool(),
+            ]
+
+            if job_id:
+                job_context, resume_text = _build_job_context(job_id)
+                if job_context:
+                    system_parts.append(
+                        "\n--- TARGET JOB POSTING ---\n" + job_context
+                    )
+                if resume_text:
+                    system_parts.append(
+                        "\n--- CURRENT TAILORED RESUME FOR THIS JOB ---"
+                    )
+                    system_parts.append(resume_text)
+
+                if include_pdf:
+                    job = load_job(job_id)
+                    pdf_path = None
+                    if job:
+                        state = load_state()
+                        pdf_path = state.get(job_id, {}).get("pdf_path")
+                    if pdf_path:
+                        pdf_text = _extract_pdf_text(pdf_path)
+                        if pdf_text:
+                            system_parts.append(
+                                "\n--- UPLOADED PDF RESUME ---"
+                            )
+                            system_parts.append(pdf_text)
+
+            system_prompt = "\n".join(system_parts)
+            claude_messages = list(history)
+            claude_messages.append(
+                {"role": "user", "content": user_message}
+            )
+
+            try:
+                response = _call_claude(system_prompt, claude_messages)
+                _json_response(self, {"response": response})
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
             return
