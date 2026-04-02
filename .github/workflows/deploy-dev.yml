@@ -41,6 +41,61 @@ jobs:
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:dev .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:dev
 
+      - name: Create deploy script
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          cat > /tmp/deploy-dev.sh << 'SCRIPT'
+          #!/bin/bash
+          IMAGE=$1
+          REGISTRY=$2
+          REGION=$3
+
+          echo "==> Logging in to ECR..."
+          aws ecr get-login-password --region "$REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+
+          echo "==> Pulling dev image..."
+          docker pull "$IMAGE"
+
+          echo "==> Stopping old dev container..."
+          docker stop job-search-dev 2>/dev/null || true
+          docker rm   job-search-dev 2>/dev/null || true
+          pkill -f 'sleep.*job-search-dev' 2>/dev/null || true
+
+          echo "==> Reading DB credentials from Parameter Store..."
+          DB_HOST=$(aws ssm get-parameter --name /job-search/db-host --query Parameter.Value --output text)
+          DB_USER=$(aws ssm get-parameter --name /job-search/db-user --query Parameter.Value --output text)
+          DB_PASS=$(aws ssm get-parameter --name /job-search/db-password --with-decryption --query Parameter.Value --output text)
+
+          echo "==> Applying schema to jobsearch_dev..."
+          docker run --rm \
+            -e DB_HOST="$DB_HOST" \
+            -e DB_NAME=jobsearch_dev \
+            -e DB_USER="$DB_USER" \
+            -e DB_PASSWORD="$DB_PASS" \
+            "$IMAGE" \
+            python3 -c 'import sys; sys.path.insert(0,"."); from db.db import init_pool,get_conn,put_conn; init_pool(); c=get_conn(); c.cursor().execute(open("db/schema.sql").read()); c.commit(); put_conn(c); print("Schema applied to jobsearch_dev")' \
+          || echo "WARNING: Schema apply failed (run one-time DB setup if this is a fresh environment)"
+
+          echo "==> Starting dev container on port 8081..."
+          docker run -d --name job-search-dev \
+            -p 8081:8080 \
+            -e DB_HOST="$DB_HOST" \
+            -e DB_NAME=jobsearch_dev \
+            -e DB_USER="$DB_USER" \
+            -e DB_PASSWORD="$DB_PASS" \
+            -v /home/ec2-user/config.json:/app/config.json:ro \
+            "$IMAGE"
+
+          echo "==> Scheduling auto-kill in 1 hour..."
+          nohup sh -c 'sleep 3600 && docker stop job-search-dev && docker rm job-search-dev 2>/dev/null' \
+            >/dev/null 2>&1 &
+
+          echo "==> Dev environment running on port 8081"
+          SCRIPT
+          chmod +x /tmp/deploy-dev.sh
+
       - name: Deploy dev container to EC2
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -48,48 +103,12 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/deploy_key.pem
           chmod 600 /tmp/deploy_key.pem
 
-          ssh -i /tmp/deploy_key.pem \
-            -o StrictHostKeyChecking=no \
-            -o ServerAliveInterval=30 \
-            -o ServerAliveCountMax=10 \
-            ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
-            "
-              # Login to ECR
-              aws ecr get-login-password --region ${{ env.AWS_REGION }} \
-                | docker login --username AWS --password-stdin $ECR_REGISTRY
+          SSH_OPTS="-i /tmp/deploy_key.pem -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10"
+          SSH_TARGET="${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}"
+          IMAGE="$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:dev"
 
-              # Pull new dev image
-              docker pull $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:dev
-
-              # Stop existing dev container + kill timer (if any)
-              docker stop ${{ env.DEV_CONTAINER }} 2>/dev/null || true
-              docker rm   ${{ env.DEV_CONTAINER }} 2>/dev/null || true
-              pkill -f 'sleep.*job-search-dev' 2>/dev/null || true
-
-              # Read DB credentials from Parameter Store
-              DB_HOST=\$(aws ssm get-parameter --name /job-search/db-host --query Parameter.Value --output text)
-              DB_USER=\$(aws ssm get-parameter --name /job-search/db-user --query Parameter.Value --output text)
-              DB_PASS=\$(aws ssm get-parameter --name /job-search/db-password --with-decryption --query Parameter.Value --output text)
-
-              # Apply schema to dev database (idempotent — all tables use IF NOT EXISTS)
-              docker run --rm -e DB_HOST=\$DB_HOST -e DB_NAME=jobsearch_dev -e DB_USER=\$DB_USER -e DB_PASSWORD=\$DB_PASS $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:dev python3 -c 'import sys; sys.path.insert(0, \".\"); from db.db import init_pool,get_conn,put_conn; init_pool(); c=get_conn(); c.cursor().execute(open(\"db/schema.sql\").read()); c.commit(); put_conn(c); print(\"Schema applied to jobsearch_dev\")' || echo 'Schema apply skipped — run one-time DB setup if this is a fresh environment'
-
-              # Start dev container (no auth password = open access)
-              docker run -d --name ${{ env.DEV_CONTAINER }} \
-                -p ${{ env.DEV_PORT }}:8080 \
-                -e DB_HOST=\$DB_HOST \
-                -e DB_NAME=jobsearch_dev \
-                -e DB_USER=\$DB_USER \
-                -e DB_PASSWORD=\$DB_PASS \
-                -v /home/ec2-user/config.json:/app/config.json:ro \
-                $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:dev
-
-              # Schedule auto-kill in 1 hour
-              nohup sh -c 'sleep ${{ env.DEV_TTL }} && docker stop ${{ env.DEV_CONTAINER }} && docker rm ${{ env.DEV_CONTAINER }} 2>/dev/null' \
-                >/dev/null 2>&1 &
-
-              echo 'Dev environment running on port ${{ env.DEV_PORT }} — auto-kills in 1 hour'
-            "
+          scp $SSH_OPTS /tmp/deploy-dev.sh "$SSH_TARGET:/tmp/deploy-dev.sh"
+          ssh $SSH_OPTS "$SSH_TARGET" "bash /tmp/deploy-dev.sh '$IMAGE' '$ECR_REGISTRY' '${{ env.AWS_REGION }}' && rm -f /tmp/deploy-dev.sh"
 
           rm -f /tmp/deploy_key.pem
 
