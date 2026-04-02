@@ -1,0 +1,114 @@
+name: Deploy Dev
+
+on:
+  push:
+    branches: ['dev/**']
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: job-search-pipeline
+  DEV_CONTAINER: job-search-dev
+  DEV_PORT: 8081
+  DEV_TTL: 3600   # 1 hour in seconds
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy-dev:
+    name: Build & Deploy Dev
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/job-search-github-actions
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push dev image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:dev .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:dev
+
+      - name: Deploy dev container to EC2
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/deploy_key.pem
+          chmod 600 /tmp/deploy_key.pem
+
+          ssh -i /tmp/deploy_key.pem \
+            -o StrictHostKeyChecking=no \
+            ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
+            "
+              # Login to ECR
+              aws ecr get-login-password --region ${{ env.AWS_REGION }} \
+                | docker login --username AWS --password-stdin $ECR_REGISTRY
+
+              # Pull new dev image
+              docker pull $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:dev
+
+              # Stop existing dev container + kill timer (if any)
+              docker stop ${{ env.DEV_CONTAINER }} 2>/dev/null || true
+              docker rm   ${{ env.DEV_CONTAINER }} 2>/dev/null || true
+              pkill -f 'sleep.*job-search-dev' 2>/dev/null || true
+
+              # Read DB credentials from Parameter Store
+              DB_HOST=\$(aws ssm get-parameter --name /job-search/db-host --query Parameter.Value --output text)
+              DB_USER=\$(aws ssm get-parameter --name /job-search/db-user --query Parameter.Value --output text)
+              DB_PASS=\$(aws ssm get-parameter --name /job-search/db-password --with-decryption --query Parameter.Value --output text)
+
+              # Apply schema to dev database (idempotent — all tables use IF NOT EXISTS)
+              docker run --rm \
+                -e DB_HOST=\$DB_HOST \
+                -e DB_NAME=jobsearch_dev \
+                -e DB_USER=\$DB_USER \
+                -e DB_PASSWORD=\$DB_PASS \
+                $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:dev \
+                python3 -c \"
+import sys; sys.path.insert(0, '.')
+from db.db import init_pool, get_conn, put_conn
+init_pool()
+conn = get_conn()
+with open('db/schema.sql') as f:
+    conn.cursor().execute(f.read())
+conn.commit()
+put_conn(conn)
+print('Schema applied to jobsearch_dev')
+\"
+
+              # Start dev container (no auth password = open access)
+              docker run -d --name ${{ env.DEV_CONTAINER }} \
+                -p ${{ env.DEV_PORT }}:8080 \
+                -e DB_HOST=\$DB_HOST \
+                -e DB_NAME=jobsearch_dev \
+                -e DB_USER=\$DB_USER \
+                -e DB_PASSWORD=\$DB_PASS \
+                -v /home/ec2-user/config.json:/app/config.json:ro \
+                $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:dev
+
+              # Schedule auto-kill in 1 hour
+              nohup sh -c 'sleep ${{ env.DEV_TTL }} && docker stop ${{ env.DEV_CONTAINER }} && docker rm ${{ env.DEV_CONTAINER }} 2>/dev/null' \
+                >/dev/null 2>&1 &
+
+              echo 'Dev environment running on port ${{ env.DEV_PORT }} — auto-kills in 1 hour'
+            "
+
+          rm -f /tmp/deploy_key.pem
+
+      - name: Post dev URL
+        run: |
+          echo "## Dev Environment" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** http://${{ secrets.EC2_HOST }}:${{ env.DEV_PORT }}" >> $GITHUB_STEP_SUMMARY
+          echo "Auto-kills in 1 hour. No login required." >> $GITHUB_STEP_SUMMARY

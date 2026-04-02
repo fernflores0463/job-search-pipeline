@@ -1,0 +1,58 @@
+# Local development: hot reload + auto schema
+# Usage:
+#   docker compose -f docker-compose.dev.yml up
+#   Open http://localhost:8080  (no auth required)
+#
+# Reset DB:
+#   docker compose -f docker-compose.dev.yml down -v
+#   docker compose -f docker-compose.dev.yml up
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: jobsearch
+      POSTGRES_USER: jobsearch
+      POSTGRES_PASSWORD: localdev
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata_dev:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobsearch"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DB_HOST: db
+      DB_NAME: jobsearch
+      DB_USER: jobsearch
+      DB_PASSWORD: localdev
+      DB_PORT: "5432"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./dashboard:/app/dashboard
+      - ./db:/app/db
+      - ./process_new_postings.py:/app/process_new_postings.py
+      - ./scrape_careers_page.py:/app/scrape_careers_page.py
+      - ./config.json:/app/config.json:ro
+    command: >
+      bash -c "
+        pip install -q watchdog[watchmedo] &&
+        watchmedo auto-restart
+          --directory=/app/dashboard --directory=/app/db
+          --patterns='*.py'
+          --recursive
+          -- python3 dashboard/server.py
+      "
+
+volumes:
+  pgdata_dev:
