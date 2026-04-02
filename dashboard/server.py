@@ -14,6 +14,7 @@ import html as html_module
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -44,6 +45,95 @@ def _load_config():
         return json.load(f)
 
 _config = _load_config()
+
+# ─────────────────────────────────────────────────────────
+# AUTH
+# ─────────────────────────────────────────────────────────
+
+def _load_auth_password():
+    """
+    Password resolution order:
+    1. DASHBOARD_PASSWORD env var (local dev / docker-compose override)
+    2. AWS Parameter Store /job-search/dashboard-password (production)
+    3. Empty string → auth bypassed (local dev with no password set)
+    """
+    pw = os.environ.get("DASHBOARD_PASSWORD", "")
+    if pw:
+        return pw
+    try:
+        import boto3
+        ssm = boto3.client("ssm", region_name=os.environ.get("AWS_REGION", "us-west-2"))
+        resp = ssm.get_parameter(Name="/job-search/dashboard-password", WithDecryption=True)
+        return resp["Parameter"]["Value"]
+    except Exception:
+        pass
+    return ""
+
+_AUTH_PASSWORD = _load_auth_password()
+_SESSIONS: set = set()   # In-memory active session tokens; cleared on restart
+
+_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Job Dashboard \u2014 Login</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: #f1f5f9; display: flex; align-items: center;
+           justify-content: center; min-height: 100vh; }}
+    .card {{ background: white; border-radius: 12px; padding: 2.5rem;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.08); width: 100%; max-width: 380px; }}
+    h1 {{ font-size: 1.4rem; font-weight: 700; color: #1e293b; margin-bottom: 0.25rem; }}
+    p  {{ font-size: 0.875rem; color: #64748b; margin-bottom: 1.75rem; }}
+    label {{ display: block; font-size: 0.8rem; font-weight: 600;
+            color: #374151; margin-bottom: 0.4rem; }}
+    input[type=password] {{
+      width: 100%; padding: 0.65rem 0.875rem; border: 1.5px solid #e2e8f0;
+      border-radius: 8px; font-size: 0.9rem; outline: none;
+      transition: border-color 0.15s; }}
+    input[type=password]:focus {{ border-color: #3b82f6; }}
+    button {{ width: 100%; margin-top: 1.25rem; padding: 0.7rem;
+             background: #2563eb; color: white; border: none;
+             border-radius: 8px; font-size: 0.9rem; font-weight: 600;
+             cursor: pointer; transition: background 0.15s; }}
+    button:hover {{ background: #1d4ed8; }}
+    .error {{ background: #fef2f2; color: #dc2626; border: 1px solid #fecaca;
+             border-radius: 8px; padding: 0.65rem 0.875rem;
+             font-size: 0.8rem; margin-bottom: 1rem; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Job Dashboard</h1>
+    <p>Enter your password to continue.</p>
+    {error_block}
+    <form method="POST" action="/api/login">
+      <label for="pw">Password</label>
+      <input id="pw" type="password" name="password" autofocus autocomplete="current-password">
+      <button type="submit">Sign In</button>
+    </form>
+  </div>
+</body>
+</html>"""
+
+
+def _get_session_cookie(handler):
+    """Extract the 'session' cookie value from the request, or None."""
+    for part in handler.headers.get("Cookie", "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k.strip() == "session":
+            return v.strip()
+    return None
+
+
+def _is_authenticated(handler):
+    """Return True if auth is disabled (no password set) or the session cookie is valid."""
+    if not _AUTH_PASSWORD:
+        return True
+    return _get_session_cookie(handler) in _SESSIONS
+
 
 # Initialize DB connection pool at startup
 try:
@@ -1080,6 +1170,41 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         super().__init__(*args, directory=DIR, **kwargs)
 
     def do_GET(self):
+        # ── /login — serve login page (no auth required) ─
+        if self.path.startswith("/login"):
+            error = "error=1" in self.path
+            error_block = (
+                '<div class="error">Incorrect password. Please try again.</div>'
+                if error else ""
+            )
+            html = _LOGIN_HTML.replace("{error_block}", error_block)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode())
+            return
+
+        # ── /api/logout — clear session ───────────────────
+        if self.path == "/api/logout":
+            token = _get_session_cookie(self)
+            if token:
+                _SESSIONS.discard(token)
+            self.send_response(302)
+            self.send_header("Location", "/login")
+            self.send_header(
+                "Set-Cookie",
+                "session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0",
+            )
+            self.end_headers()
+            return
+
+        # ── Auth gate — redirect to /login if unauthenticated ─
+        if not _is_authenticated(self):
+            self.send_response(302)
+            self.send_header("Location", "/login")
+            self.end_headers()
+            return
+
         if self.path == "/":
             self.path = "/dashboard.html"
 
@@ -1292,6 +1417,35 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        # ── POST /api/login — check password, set session cookie ──
+        if self.path == "/api/login":
+            length = int(self.headers.get("Content-Length", 0))
+            params = urllib.parse.parse_qs(self.rfile.read(length).decode())
+            password = params.get("password", [""])[0]
+            if _AUTH_PASSWORD and password == _AUTH_PASSWORD:
+                token = secrets.token_hex(32)
+                _SESSIONS.add(token)
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.send_header(
+                    "Set-Cookie",
+                    f"session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000",
+                )
+                self.end_headers()
+            else:
+                self.send_response(302)
+                self.send_header("Location", "/login?error=1")
+                self.end_headers()
+            return
+
+        # ── Auth gate for POST routes ─────────────────────
+        if not _is_authenticated(self):
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"Unauthorized"}')
+            return
+
         # ── /api/upload-resume/<path> ────────────────────
         if self.path.startswith("/api/upload-resume/"):
             from urllib.parse import unquote
