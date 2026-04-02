@@ -9,3 +9,11 @@ __pycache__/
 .DS_Store
 *.pages
 historical_resumes/
+
+# AWS / deployment secrets
+*.pem
+*.key
+.env
+infra/secrets.sh
+infra/.terraform/
+infra/terraform.tfstate*
