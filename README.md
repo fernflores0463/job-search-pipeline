@@ -2,41 +2,70 @@
 
 A personal job search automation system that processes LinkedIn CSV exports, scores and filters postings against your tech stack, generates tailored resumes, and serves an interactive dashboard with an AI assistant.
 
+Live at **[jobs.fernflores.dev](https://jobs.fernflores.dev)** — password protected, hosted on AWS (EC2 + RDS PostgreSQL).
+
 ## Features
 
 - **Scoring & Filtering**: Automatically scores job postings based on tech keyword matches, seniority level, and company tier. Filters out staffing agencies, wrong seniority levels, and irrelevant specializations.
-- **Resume Tailoring**: Selects and orders your resume bullets based on keyword overlap with each job's description. Generates a `resume.txt` and `info.txt` for every qualifying position.
-- **Interactive Dashboard**: A single-file HTML dashboard showing all jobs with status tracking, notes, batch history, and a Sankey flow visualization.
-- **AI Assistant**: Chat with a local Ollama model about any job posting — get fit analysis, resume suggestions, and interview prep.
+- **Resume Tailoring**: Selects and orders resume bullets based on keyword overlap with each job's description. Generates a tailored resume for every qualifying position.
+- **Interactive Dashboard**: Shows all jobs with status tracking, notes, batch history, a Sankey flow visualization, and an application pipeline board.
+- **AI Assistant**: Chat with a local Ollama model about any job posting — fit analysis, resume suggestions, interview prep.
 - **Careers Scraper**: Scrape Greenhouse, Lever, and Ashby job boards directly into the pipeline.
+- **Login Protection**: Single-password session auth with HTTP-only cookies. Password stored in AWS Parameter Store — changeable without a rebuild.
 - **Config-Driven**: All personal data (name, LinkedIn URL, resume bullets, scoring weights) lives in `config.json`. The code ships with no personal information.
 
-## Quick Start
+---
+
+## Architecture
+
+```
+GitHub (main branch)
+       │  push
+       ▼
+GitHub Actions CI/CD
+  ├── Build Docker image
+  ├── Push to ECR
+  └── SSH deploy to EC2
+       │
+       ▼
+EC2 (t3.micro, Amazon Linux 2023)
+  ├── nginx (HTTPS, TLS 1.3, rate limiting)
+  └── Docker: dashboard/server.py → port 8080
+       │
+       ▼
+RDS PostgreSQL 15 (t3.micro)
+  └── 5 tables: jobs, job_state, application_plans,
+                application_plan_jobs, company_cache
+```
+
+---
+
+## Quick Start (Local)
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/your-username/job-search-pipeline.git
+# 1. Clone and configure
+git clone https://github.com/fernflores0463/job-search-pipeline.git
 cd job-search-pipeline
-
-# 2. Copy the example config and fill in your details
 cp config.example.json config.json
-# Edit config.json with your name, LinkedIn URL, experience bullets, and scoring preferences
+# Edit config.json with your name, LinkedIn URL, bullets, and scoring weights
 
-# 3. Test with the sample data
-python3 process_new_postings.py sample_data/sample_jobs.csv
+# 2. Start a local Postgres + the server (Docker required)
+docker compose up
 
-# 4. Start the dashboard
-cd dashboard && python3 server.py
+# 3. Or run the server directly against a local DB
+DB_HOST=localhost DB_PASSWORD=localdev python3 dashboard/server.py
 
-# 5. Open http://localhost:8080 in your browser
+# 4. Open http://localhost:8080
+# No password required when DASHBOARD_PASSWORD env var is not set.
 ```
+
+---
 
 ## Configuration Guide
 
 All personal data lives in `config.json` (gitignored). Copy `config.example.json` to get started.
 
 ### `candidate`
-Your basic information:
 ```json
 {
   "candidate": {
@@ -49,7 +78,7 @@ Your basic information:
 ```
 
 ### `experience`
-Your work history, organized by company key. Each entry has a `display_name`, a `context` string (used in the AI prompt), a `bullet_limit` (max bullets from this employer per resume), and your `bullets`:
+Your work history, organized by company key. Each entry has a `display_name`, a `context` string (used in the AI prompt), a `bullet_limit` (max bullets per resume from this employer), and your `bullets`:
 ```json
 {
   "experience": {
@@ -68,15 +97,15 @@ Your work history, organized by company key. Each entry has a `display_name`, a 
 
 ### `scoring`
 Controls how jobs are scored and tiered:
-- `tech_keywords`: Map of regex patterns to point values. Jobs accumulate points for each keyword found in the description.
+- `tech_keywords`: Map of regex patterns to point values.
 - `tier_thresholds`: `strong` (default: 13) and `match` (default: 7) thresholds.
 - `top_companies`: Company name substrings that get a +2 bonus.
 
 ### `filters`
 Controls which jobs are excluded:
-- `exclude_companies_containing`: Substrings — any company whose name contains one of these is filtered out (e.g., `"staffing"`, `"recruiting"`).
+- `exclude_companies_containing`: Substrings — any company whose name contains one is filtered out (e.g., `"staffing"`, `"recruiting"`).
 - `exclude_title_keywords`: Job title keywords to reject (e.g., `"principal"`, `"intern"`).
-- `exclude_role_keywords`: Description/title keywords for wrong specializations (e.g., `"mobile"`, `"devops"`).
+- `exclude_role_keywords`: Description keywords for wrong specializations (e.g., `"mobile"`, `"devops"`).
 
 ### `bullet_keyword_pairs`
 A list of `[description_pattern, bullet_keyword]` pairs that drive bullet selection. When a job description matches `description_pattern`, bullets containing `bullet_keyword` score higher.
@@ -93,6 +122,8 @@ Default skills section for generated resumes:
 }
 ```
 
+---
+
 ## Pipeline Workflow
 
 ```
@@ -103,23 +134,54 @@ process_new_postings.py
   ├── Filter (company, title, role type)
   ├── Score (tech keywords + level bonus + company bonus)
   ├── Tier (Strong Match / Match / Weak Match)
-  ├── Generate resumes/  (resume.txt + info.txt per job)
-  ├── Save metadata  (resumes/all_jobs_metadata.json)
-  └── Rebuild dashboard.html
+  ├── Generate resumes/ (resume.txt + info.txt per job)
+  └── Write metadata → PostgreSQL (jobs + job_state tables)
        │
        ▼
-dashboard/server.py
-  ├── Serve dashboard.html
-  ├── /api/state  (read/write job status, notes, timestamps)
-  ├── /api/config  (name + LinkedIn URL for the frontend)
-  ├── /api/ai-chat  (Ollama AI assistant)
-  ├── /api/scrape-careers  (scrape a careers page)
-  └── /api/run-live-check  (check if postings are still open)
+dashboard/server.py (port 8080)
+  ├── GET  /               → dashboard.html
+  ├── GET  /login          → login page
+  ├── POST /api/login      → set session cookie
+  ├── GET  /api/logout     → clear session
+  ├── GET  /api/jobs-data  → all jobs + state merged
+  ├── GET  /api/batch-stats
+  ├── GET  /api/state      → all job state
+  ├── POST /api/state      → save job state
+  ├── GET  /api/plans      → application plans
+  ├── POST /api/plans      → save plans
+  ├── GET  /api/config     → name + LinkedIn URL
+  ├── POST /api/ai-chat    → Ollama AI assistant
+  ├── POST /api/scrape-careers
+  └── POST /api/run-live-check
 ```
+
+---
+
+## Database
+
+PostgreSQL schema lives in `db/schema.sql`. Five tables:
+
+| Table | Contents |
+|---|---|
+| `jobs` | Job metadata — title, company, score, tier, links |
+| `job_state` | Per-job status, notes, timestamps, live status |
+| `application_plans` | Named batches of jobs to apply to |
+| `application_plan_jobs` | Jobs within each plan |
+| `company_cache` | Company summaries and logo URLs |
+
+DB credentials are read from environment variables (`DB_HOST`, `DB_PASSWORD`, etc.) or pulled from AWS Parameter Store automatically in production.
+
+### One-time migration from JSON files
+If you have existing data in the legacy JSON files:
+```bash
+DB_HOST=<host> DB_PASSWORD=<pw> python3 db/migrate_json_to_pg.py
+```
+
+---
 
 ## CSV Format
 
-The pipeline expects LinkedIn's job export CSV format with these columns:
+The pipeline expects LinkedIn's job export CSV format:
 
 | Column | Description |
 |---|---|
@@ -133,53 +195,92 @@ The pipeline expects LinkedIn's job export CSV format with these columns:
 | `Description` | Full job description text |
 | `Application Link` | Direct apply URL |
 | `Job Link` | LinkedIn job URL |
-| `Search Location` | (Optional) Metro area used in batch label |
+| `Search Location` | (Optional) Metro area used as batch label |
 
-A sample file with 5 fictional job postings is included at `sample_data/sample_jobs.csv`.
+A sample file with fictional job postings is included at `sample_data/sample_jobs.csv`.
+
+---
+
+## Deployment (AWS)
+
+The app runs on EC2 behind nginx with a TLS certificate from Let's Encrypt. CI/CD is fully automated via GitHub Actions.
+
+### Infrastructure
+| Resource | Detail |
+|---|---|
+| EC2 | t3.micro, Amazon Linux 2023 |
+| RDS | PostgreSQL 15, t3.micro |
+| ECR | Docker image registry |
+| IAM | OIDC role for GitHub Actions (ECR push only); EC2 instance role (SSM + ECR pull) |
+| nginx | HTTP→HTTPS redirect, TLS 1.2/1.3, rate limiting on `/api/login` |
+
+### CI/CD flow
+Every push to `main`:
+1. GitHub Actions authenticates to AWS via OIDC (no stored AWS keys)
+2. Builds and pushes Docker image to ECR
+3. SSHs to EC2, pulls new image, restarts container
+
+### Setting the dashboard password
+The password lives in AWS Parameter Store — never in code or config files:
+```bash
+# Set (or rotate) the password
+aws ssm put-parameter \
+  --name "/job-search/dashboard-password" \
+  --value "your-strong-password-here" \
+  --type SecureString \
+  --overwrite
+
+# Restart the container to load the new password (~5 seconds)
+ssh -i ~/.ssh/job-search-key.pem ec2-user@<EC2-IP> \
+  "docker compose restart server"
+```
+
+For local dev, set the `DASHBOARD_PASSWORD` environment variable instead. If neither is set, auth is bypassed entirely (open access).
+
+### Deploy nginx config changes
+After editing `infra/nginx.conf`, copy it to the server and reload:
+```bash
+scp -i ~/.ssh/job-search-key.pem infra/nginx.conf ec2-user@<EC2-IP>:/etc/nginx/conf.d/jobs.conf
+ssh -i ~/.ssh/job-search-key.pem ec2-user@<EC2-IP> "sudo nginx -t && sudo systemctl reload nginx"
+```
+
+---
 
 ## Optional Tools
 
 ### `scrape_careers_page.py`
-Scrapes job listings directly from Greenhouse, Lever, and Ashby career pages. The dashboard's "Scrape Careers" button calls this under the hood.
-
+Scrapes job listings from Greenhouse, Lever, and Ashby career pages. The dashboard's "Import URL" button calls this under the hood.
 ```bash
 python3 scrape_careers_page.py https://boards.greenhouse.io/yourcompany
 ```
 
 ### `eightfold_scraper_console.js`
 A browser console script for scraping Eightfold.ai-based job boards (Wayfair, Boeing, etc.) that require JavaScript rendering.
-
-1. Open the company's careers page in Chrome
+1. Open the careers page in Chrome
 2. Open DevTools Console
 3. Paste and run the script
 4. Copy the output JSON
 
 ### `update_applicants.py`
-Standalone script that curls LinkedIn for updated applicant counts without starting the full dashboard server.
-
+Standalone script that fetches updated applicant counts without starting the dashboard server.
 ```bash
 python3 update_applicants.py
 ```
 
+---
+
 ## AI Assistant
 
-The dashboard includes a chat interface powered by a local [Ollama](https://ollama.ai) model. The AI has full context about the job posting, your tailored resume, and your complete bullet pool.
+The dashboard includes a chat interface powered by a local [Ollama](https://ollama.ai) model.
 
-**Setup:**
 ```bash
 # Install Ollama: https://ollama.ai
 ollama pull qwen2.5:14b   # recommended model
 ```
 
-The AI can:
-- Analyze job-resume fit and explain the score
-- Suggest which bullets to emphasize or reword
-- Generate interview prep questions tailored to the specific role
-- Compare two roles side-by-side
+The AI can analyze job-resume fit, suggest which bullets to emphasize, generate interview prep questions, and compare roles side-by-side.
 
-## Screenshots
-
-_Add screenshots of the dashboard here._
+---
 
 ## License
 
