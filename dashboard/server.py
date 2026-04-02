@@ -57,9 +57,8 @@ def _load_auth_password():
     2. AWS Parameter Store /job-search/dashboard-password (production)
     3. Empty string → auth bypassed (local dev with no password set)
     """
-    pw = os.environ.get("DASHBOARD_PASSWORD", "")
-    if pw:
-        return pw
+    if "DASHBOARD_PASSWORD" in os.environ:
+        return os.environ["DASHBOARD_PASSWORD"]  # empty string = auth bypassed
     try:
         import boto3
         ssm = boto3.client("ssm", region_name=os.environ.get("AWS_REGION", "us-west-2"))
