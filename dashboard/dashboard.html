@@ -1,0 +1,3564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Job Search Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script src="https://unpkg.com/d3-sankey@0.12.3/dist/d3-sankey.min.js"></script>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+  .job-row:nth-child(even) { background-color: #f1f5f9; }
+  .job-row:hover { background-color: #f0f9ff; }
+  .job-row.selected { background-color: #dbeafe; }
+  .scrollable { max-height: calc(100vh - 280px); overflow-y: auto; }
+  .detail-scroll { max-height: calc(100vh - 180px); overflow-y: auto; }
+  .tier-strong { background: #dcfce7; color: #166534; }
+  .tier-match { background: #dbeafe; color: #1e40af; }
+  .tier-weak { background: #fef3c7; color: #92400e; }
+  textarea:focus, select:focus, input:focus { outline: none; box-shadow: 0 0 0 2px rgba(59,130,246,0.5); }
+  @keyframes slideInRight { from { transform: translateX(100%); } to { transform: translateX(0); } }
+  @media print {
+    .no-print { display: none !important; }
+    body { background: white !important; }
+  }
+</style>
+</head>
+<body class="bg-gray-50">
+<div id="root"></div>
+
+<script>
+window.__APP_CONFIG = {}; fetch('/api/config').then(r=>r.json()).then(c=>{window.__APP_CONFIG=c;}).catch(()=>{});
+const JOBS_DATA = [];
+</script>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+// ── Simple Markdown to HTML renderer ─────────────────────────────────
+function renderMarkdown(text) {
+  if (!text) return '';
+  let html = text
+    // Escape HTML
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    // Bold
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    // Italic
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    // Inline code
+    .replace(/`([^`]+)`/g, '<code style="background:#f3f4f6;padding:1px 4px;border-radius:3px;font-size:0.85em">$1</code>')
+    // Headers
+    .replace(/^### (.+)$/gm, '<h4 style="font-weight:700;font-size:0.95em;margin:8px 0 4px">$1</h4>')
+    .replace(/^## (.+)$/gm, '<h3 style="font-weight:700;font-size:1.05em;margin:10px 0 4px">$1</h3>')
+    .replace(/^# (.+)$/gm, '<h2 style="font-weight:700;font-size:1.15em;margin:12px 0 4px">$1</h2>')
+    // Numbered lists
+    .replace(/^\d+\.\s+(.+)$/gm, '<li style="margin-left:16px;list-style:decimal;margin-bottom:2px">$1</li>')
+    // Bullet lists
+    .replace(/^[-*]\s+(.+)$/gm, '<li style="margin-left:16px;list-style:disc;margin-bottom:2px">$1</li>')
+    // Paragraphs (double newlines)
+    .replace(/\n\n/g, '</p><p style="margin:6px 0">')
+    // Single newlines (within paragraphs)
+    .replace(/\n/g, '<br/>');
+  return '<p style="margin:6px 0">' + html + '</p>';
+}
+
+// ── Hash-based routing ───────────────────────────────────────────────
+const VALID_ROUTES = ['jobs', 'stats', 'pipeline', 'sankey', 'plans'];
+function parseHash() {
+  const raw = decodeURIComponent(window.location.hash.replace(/^#\/?/, ''));
+  // Check for batch route: #/batch/<date>
+  const batchMatch = raw.match(/^batch\/(.+)$/i);
+  if (batchMatch) return { view: 'stats', batchDate: batchMatch[1], jobId: null };
+  // Check for job route: #/job/<id>
+  const jobMatch = raw.match(/^job\/(.+)$/i);
+  if (jobMatch) return { view: 'jobs', batchDate: null, jobId: jobMatch[1] };
+  // Standard route
+  const v = raw.toLowerCase();
+  return { view: VALID_ROUTES.includes(v) ? v : 'jobs', batchDate: null, jobId: null };
+}
+function useHashRoute() {
+  const initial = parseHash();
+  const [view, setViewState] = useState(initial.view);
+  const [hashBatchDate, setHashBatchDate] = useState(initial.batchDate);
+  const [hashJobId, setHashJobId] = useState(initial.jobId);
+  const suppressHash = useRef(false);
+
+  useEffect(() => {
+    const onHash = () => {
+      if (suppressHash.current) { suppressHash.current = false; return; }
+      const parsed = parseHash();
+      setViewState(parsed.view);
+      setHashBatchDate(parsed.batchDate);
+      setHashJobId(parsed.jobId);
+    };
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
+  const setView = useCallback((v) => {
+    setViewState(v);
+    setHashBatchDate(null);
+    setHashJobId(null);
+    suppressHash.current = true;
+    window.location.hash = '#/' + v;
+  }, []);
+
+  return [view, setView, hashBatchDate, setHashBatchDate, hashJobId, setHashJobId];
+}
+
+const STATUSES = [
+  "Not Applied", "Applied", "1st Interview", "2nd Interview",
+  "Final", "Rejected", "Auto-Reject", "Applied, Closed, No Update",
+  "Position Closed, No Application Submitted", "Verbal Offer", "Offer", "Accepted"
+];
+const BATCH_STATS = [];
+
+const STATUS_COLORS = {
+  "Not Applied": "bg-gray-100 text-gray-600",
+  "Applied": "bg-blue-100 text-blue-700",
+  "1st Interview": "bg-cyan-100 text-cyan-700",
+  "2nd Interview": "bg-indigo-100 text-indigo-700",
+  "Final": "bg-purple-100 text-purple-700",
+  "Rejected": "bg-red-100 text-red-700",
+  "Auto-Reject": "bg-yellow-100 text-yellow-700",
+  "Applied, Closed, No Update": "bg-orange-100 text-orange-700",
+  "Position Closed, No Application Submitted": "bg-gray-200 text-gray-600",
+  "Verbal Offer": "bg-emerald-100 text-emerald-700",
+  "Offer": "bg-green-100 text-green-700",
+  "Accepted": "bg-green-200 text-green-800",
+};
+
+const TIER_COLORS = {
+  "Strong Match": "tier-strong",
+  "Match": "tier-match",
+  "Weak Match": "tier-weak",
+};
+
+// Persistence: server API with localStorage fallback
+const IS_SERVED = window.location.protocol === "http:" || window.location.protocol === "https:";
+let _serverState = null;
+
+async function fetchServerState() {
+  if (!IS_SERVED) return {};
+  try {
+    const res = await fetch("/api/state");
+    if (res.ok) return await res.json();
+  } catch {}
+  return {};
+}
+
+function loadJobState(id) {
+  // First check server state (loaded at init), then fall back to localStorage
+  if (_serverState && _serverState[id]) return _serverState[id];
+  try {
+    const raw = localStorage.getItem("job_" + id);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function saveJobState(id, state) {
+  // Always save to localStorage as cache
+  try { localStorage.setItem("job_" + id, JSON.stringify(state)); } catch {}
+  // Save to server if available
+  if (IS_SERVED) {
+    fetch("/api/state", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id, state}),
+    }).catch(() => {});
+  }
+}
+
+function initJobs(serverState) {
+  _serverState = serverState || {};
+  return JOBS_DATA.map(j => {
+    const saved = loadJobState(j.id);
+    return {
+      ...j,
+      status: saved?.status || "Not Applied",
+      notes: saved?.notes || "",
+      timestamps: saved?.timestamps || {},
+      favorited: saved?.favorited || false,
+      applicants: saved?.applicants || j.applicants || "Unknown",
+      pdf_path: saved?.pdf_path || j.pdf_path || null,
+      live_status: saved?.live_status || null,
+      live_status_checked: saved?.live_status_checked || null,
+    };
+  });
+}
+
+// Metrics
+function calcMetrics(jobs) {
+  const byStatus = {};
+  STATUSES.forEach(s => byStatus[s] = 0);
+  const byTier = { "Strong Match": 0, "Match": 0, "Weak Match": 0 };
+  
+  jobs.forEach(j => {
+    byStatus[j.status] = (byStatus[j.status] || 0) + 1;
+    byTier[j.tier] = (byTier[j.tier] || 0) + 1;
+  });
+
+  const applied = jobs.filter(j => j.status !== "Not Applied");
+  const transitions = {};
+  const pairs = [
+    ["Applied", "1st Interview"],
+    ["1st Interview", "2nd Interview"],
+    ["2nd Interview", "Final"],
+    ["Applied", "Rejected"],
+    ["Applied", "Auto-Reject"],
+  ];
+  pairs.forEach(([from, to]) => {
+    const times = applied
+      .filter(j => j.timestamps[from] && j.timestamps[to])
+      .map(j => j.timestamps[to] - j.timestamps[from]);
+    if (times.length > 0) {
+      const avg = times.reduce((a, b) => a + b, 0) / times.length;
+      transitions[from + " to " + to] = Math.round(avg / (1000 * 60 * 60 * 24) * 10) / 10;
+    }
+  });
+
+  return { byStatus, byTier, total: jobs.length, applied: applied.length, transitions };
+}
+
+
+
+
+function PlansView({ jobs }) {
+  const { useState, useEffect, useCallback, useMemo } = React;
+  const [plans, setPlans] = useState([]);
+  const [selectedPlan, setSelectedPlan] = useState(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [newDate, setNewDate] = useState(new Date().toISOString().slice(0, 10));
+  const [newTitle, setNewTitle] = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [addingJobs, setAddingJobs] = useState(false);
+
+  // Load plans from server
+  useEffect(() => {
+    fetch('/api/plans').then(r => r.json()).then(data => {
+      if (Array.isArray(data)) setPlans(data);
+    }).catch(() => {});
+  }, []);
+
+  const savePlans = useCallback((updated) => {
+    setPlans(updated);
+    fetch('/api/plans', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(updated),
+    }).catch(() => {});
+    // Sync App-level plans state so _getPlans stays current
+    if (window._syncAppPlans) window._syncAppPlans(updated);
+  }, []);
+
+  // Sync local plans state with App-level plans (kept in sync via _getPlans)
+  useEffect(() => {
+    const appPlans = window._getPlans ? window._getPlans() : [];
+    if (appPlans.length && !plans.length) setPlans(appPlans);
+  }, []);
+
+  const createPlan = useCallback(() => {
+    const plan = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      date: newDate,
+      title: newTitle || 'Application Plan for ' + newDate,
+      jobs: [],
+      created: Date.now(),
+    };
+    const updated = [plan, ...plans];
+    savePlans(updated);
+    setSelectedPlan(plan);
+    setShowCreate(false);
+    setNewTitle('');
+  }, [newDate, newTitle, plans, savePlans]);
+
+  const deletePlan = useCallback((planId) => {
+    const updated = plans.filter(p => p.id !== planId);
+    savePlans(updated);
+    if (selectedPlan?.id === planId) setSelectedPlan(null);
+  }, [plans, selectedPlan, savePlans]);
+
+  const addJobToPlan = useCallback((job) => {
+    if (!selectedPlan) return;
+    if (selectedPlan.jobs.some(j => j.id === job.id)) return;
+    const updatedPlan = {
+      ...selectedPlan,
+      jobs: [...selectedPlan.jobs, { id: job.id, company: job.company, title: job.title, notes: '' }],
+    };
+    const updated = plans.map(p => p.id === updatedPlan.id ? updatedPlan : p);
+    savePlans(updated);
+    setSelectedPlan(updatedPlan);
+  }, [selectedPlan, plans, savePlans]);
+
+  const removeJobFromPlan = useCallback((jobId) => {
+    if (!selectedPlan) return;
+    const updatedPlan = {
+      ...selectedPlan,
+      jobs: selectedPlan.jobs.filter(j => j.id !== jobId),
+    };
+    const updated = plans.map(p => p.id === updatedPlan.id ? updatedPlan : p);
+    savePlans(updated);
+    setSelectedPlan(updatedPlan);
+  }, [selectedPlan, plans, savePlans]);
+
+  const updateJobNotes = useCallback((jobId, notes) => {
+    if (!selectedPlan) return;
+    const updatedPlan = {
+      ...selectedPlan,
+      jobs: selectedPlan.jobs.map(j => j.id === jobId ? { ...j, notes } : j),
+    };
+    const updated = plans.map(p => p.id === updatedPlan.id ? updatedPlan : p);
+    savePlans(updated);
+    setSelectedPlan(updatedPlan);
+  }, [selectedPlan, plans, savePlans]);
+
+  const downloadPdf = useCallback((planId) => {
+    window.open('/api/plan-pdf/' + planId, '_blank');
+  }, []);
+
+  // Search available jobs to add
+  const searchResults = useMemo(() => {
+    if (!searchTerm || searchTerm.length < 2) return [];
+    const term = searchTerm.toLowerCase();
+    const planJobIds = new Set((selectedPlan?.jobs || []).map(j => j.id));
+    return jobs
+      .filter(j => !planJobIds.has(j.id) &&
+        (j.company.toLowerCase().includes(term) || j.title.toLowerCase().includes(term)))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 20);
+  }, [searchTerm, jobs, selectedPlan]);
+
+  const TIER_COLORS = {
+    'Strong Match': { bg: 'bg-green-100', text: 'text-green-700', border: 'border-green-300' },
+    'Match': { bg: 'bg-blue-100', text: 'text-blue-700', border: 'border-blue-300' },
+    'Weak Match': { bg: 'bg-yellow-100', text: 'text-yellow-700', border: 'border-yellow-300' },
+  };
+
+  const getJob = (id) => jobs.find(j => j.id === id) || {};
+
+  return (
+    <div className="flex" style={{height: 'calc(100vh - 130px)'}}>
+      {/* Left: Plan list */}
+      <div className="w-72 bg-white border-r flex flex-col flex-shrink-0">
+        <div className="p-4 border-b">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-bold text-gray-800">Application Plans</h3>
+            <button onClick={() => setShowCreate(!showCreate)}
+              className="px-2 py-1 bg-blue-600 text-white rounded text-xs font-medium hover:bg-blue-700">
+              + New
+            </button>
+          </div>
+          {showCreate && (
+            <div className="bg-gray-50 rounded-lg p-3 space-y-2 mb-2 border">
+              <input type="date" value={newDate}
+                onChange={e => setNewDate(e.target.value)}
+                className="w-full px-2 py-1.5 border rounded text-sm" />
+              <input type="text" placeholder="Plan title (optional)"
+                value={newTitle} onChange={e => setNewTitle(e.target.value)}
+                className="w-full px-2 py-1.5 border rounded text-sm" />
+              <button onClick={createPlan}
+                className="w-full py-1.5 bg-blue-600 text-white rounded text-xs font-medium hover:bg-blue-700">
+                Create Plan
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="flex-1 overflow-y-auto">
+          {plans.length === 0 && (
+            <div className="p-6 text-center text-sm text-gray-400">
+              No plans yet. Click "+ New" to create one.
+            </div>
+          )}
+          {plans.map(plan => (
+            <div key={plan.id}
+              onClick={() => { setSelectedPlan(plan); setAddingJobs(false); setSearchTerm(''); }}
+              className={"p-3 border-b cursor-pointer hover:bg-blue-50 transition-colors " +
+                (selectedPlan?.id === plan.id ? 'bg-blue-50 border-l-4 border-l-blue-500' : '')}>
+              <div className="flex justify-between items-start">
+                <div>
+                  <div className="text-sm font-semibold text-gray-800">{plan.date}</div>
+                  <div className="text-xs text-gray-500 truncate" style={{maxWidth: '180px'}}>{plan.title}</div>
+                  <div className="text-xs text-gray-400 mt-0.5">{plan.jobs.length} job{plan.jobs.length !== 1 ? 's' : ''}</div>
+                </div>
+                <button onClick={(e) => { e.stopPropagation(); deletePlan(plan.id); }}
+                  className="text-gray-300 hover:text-red-500 text-xs px-1" title="Delete plan">
+                  &#10005;
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Right: Plan detail */}
+      <div className="flex-1 overflow-y-auto bg-gray-50">
+        {!selectedPlan ? (
+          <div className="flex items-center justify-center h-full text-gray-400">
+            <div className="text-center">
+              <div className="text-4xl mb-3">&#128203;</div>
+              <p className="text-lg font-medium">Select or create a plan</p>
+              <p className="text-sm mt-1">Plan your daily job applications and download as a PDF</p>
+            </div>
+          </div>
+        ) : (
+          <div className="p-6">
+            {/* Plan header */}
+            <div className="flex items-center justify-between mb-6">
+              <div>
+                <h2 className="text-xl font-bold text-gray-800">{selectedPlan.title}</h2>
+                <p className="text-sm text-gray-500">Date: {selectedPlan.date} &bull; {selectedPlan.jobs.length} position{selectedPlan.jobs.length !== 1 ? 's' : ''}</p>
+              </div>
+              <div className="flex gap-2">
+                <button onClick={() => { setAddingJobs(!addingJobs); setSearchTerm(''); }}
+                  className={"px-3 py-1.5 rounded text-xs font-medium border " +
+                    (addingJobs ? 'bg-blue-600 text-white' : 'bg-white text-gray-700 hover:bg-gray-50')}>
+                  {addingJobs ? 'Done Adding' : '+ Add Jobs'}
+                </button>
+                {selectedPlan.jobs.length > 0 && (
+                  <button onClick={() => downloadPdf(selectedPlan.id)}
+                    className="px-3 py-1.5 bg-green-600 text-white rounded text-xs font-medium hover:bg-green-700">
+                    &#128196; Download PDF
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Add jobs panel */}
+            {addingJobs && (
+              <div className="bg-white rounded-lg border p-4 mb-6">
+                <h3 className="text-sm font-semibold text-gray-700 mb-2">Search jobs to add</h3>
+                <input type="text" placeholder="Search by company or title..."
+                  value={searchTerm} onChange={e => setSearchTerm(e.target.value)}
+                  className="w-full px-3 py-2 border rounded text-sm mb-3" autoFocus />
+                {searchResults.length > 0 && (
+                  <div className="max-h-64 overflow-y-auto space-y-1">
+                    {searchResults.map(job => {
+                      const tc = TIER_COLORS[job.tier] || TIER_COLORS['Weak Match'];
+                      return (
+                        <div key={job.id}
+                          className="flex items-center justify-between p-2 rounded hover:bg-gray-50 border border-gray-100">
+                          <div className="flex items-center gap-3 min-w-0">
+                            <span className={"px-1.5 py-0.5 rounded text-xs font-medium " + tc.bg + " " + tc.text}>
+                              {job.score}
+                            </span>
+                            <div className="min-w-0">
+                              <span className="text-sm font-medium text-gray-800">{job.company}</span>
+                              <span className="text-sm text-gray-500 ml-2 truncate">{job.title}</span>
+                            </div>
+                          </div>
+                          <button onClick={() => addJobToPlan(job)}
+                            className="px-2 py-1 bg-blue-50 text-blue-600 rounded text-xs font-medium hover:bg-blue-100 flex-shrink-0">
+                            + Add
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {searchTerm.length >= 2 && searchResults.length === 0 && (
+                  <p className="text-sm text-gray-400 text-center py-4">No matching jobs found</p>
+                )}
+              </div>
+            )}
+
+            {/* Job cards */}
+            {selectedPlan.jobs.length === 0 ? (
+              <div className="text-center py-16 text-gray-400">
+                <p className="text-lg">No jobs in this plan yet</p>
+                <p className="text-sm mt-1">Click "+ Add Jobs" to search and add positions</p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {selectedPlan.jobs.map((planJob, idx) => {
+                  const job = getJob(planJob.id);
+                  const tc = TIER_COLORS[job.tier] || TIER_COLORS['Weak Match'];
+                  return (
+                    <div key={planJob.id}
+                      className={"bg-white rounded-lg border p-4 " + tc.border}
+                      style={{ borderLeftWidth: '4px' }}>
+                      <div className="flex items-start justify-between">
+                        <div className="flex items-start gap-3">
+                          <span className="text-lg font-bold text-gray-300 mt-0.5">{idx + 1}</span>
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="font-semibold text-gray-800">{job.company || planJob.company}</span>
+                              <span className={"px-1.5 py-0.5 rounded text-xs font-medium " + tc.bg + " " + tc.text}>
+                                {job.tier} &bull; Score: {job.score}
+                              </span>
+                            </div>
+                            <div className="text-sm text-gray-600 mt-0.5">{job.title || planJob.title}</div>
+                            <div className="flex gap-4 mt-1.5 text-xs text-gray-500">
+                              {job.salary && job.salary !== 'N/A' && <span className="text-green-600 font-medium">{job.salary}</span>}
+                              {job.location && <span>{job.location}</span>}
+                              {job.work_type && <span>{job.work_type}</span>}
+                            </div>
+                            <div className="flex gap-3 mt-2">
+                              {job.apply_link && (
+                                <a href={job.apply_link} target="_blank" rel="noopener"
+                                  className="text-xs text-blue-600 hover:underline">Apply</a>
+                              )}
+                              {job.job_link && (
+                                <a href={job.job_link} target="_blank" rel="noopener"
+                                  className="text-xs text-blue-600 hover:underline">LinkedIn</a>
+                              )}
+                              {job.resume_path && (
+                                <button onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title)}
+                                  className="text-xs text-blue-600 hover:underline">View Resume</button>
+                              )}
+                              {job.pdf_path && (
+                                <a href={'/' + job.pdf_path} target="_blank" rel="noopener"
+                                  className="text-xs text-green-600 hover:underline">PDF</a>
+                              )}
+                            </div>
+                            {/* Extended actions — hidden when printing */}
+                            <div className="flex gap-2 mt-2 flex-wrap no-print">
+                              <button onClick={() => window._showJobDetail && window._showJobDetail(job.id)}
+                                className="px-2 py-1 bg-purple-600 text-white rounded text-xs font-medium hover:bg-purple-700">
+                                Edit Details
+                              </button>
+                              <button onClick={() => window._openAIChat && window._openAIChat(job.id, job.company + ' — ' + job.title)}
+                                className="px-2 py-1 bg-purple-500 text-white rounded text-xs font-medium hover:bg-purple-600">
+                                Ask AI
+                              </button>
+                              <span className={"px-2 py-1 rounded text-xs font-medium " + (STATUS_COLORS[job.status] || "bg-gray-100 text-gray-600")}>
+                                {job.status || "Not Applied"}
+                              </span>
+                            </div>
+                            {/* PDF upload drop zone — hidden when printing */}
+                            <div className="mt-2 no-print"
+                              onDragOver={e => { e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.add('border-blue-400', 'bg-blue-50', 'text-blue-600'); e.currentTarget.classList.remove('border-gray-200', 'text-gray-400'); }}
+                              onDragLeave={e => { e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.remove('border-blue-400', 'bg-blue-50', 'text-blue-600'); e.currentTarget.classList.add('border-gray-200', 'text-gray-400'); }}
+                              onDrop={e => {
+                                e.preventDefault(); e.stopPropagation();
+                                e.currentTarget.classList.remove('border-blue-400', 'bg-blue-50', 'text-blue-600');
+                                e.currentTarget.classList.add('border-gray-200', 'text-gray-400');
+                                const file = e.dataTransfer.files[0];
+                                if (file && file.name.toLowerCase().endsWith('.pdf') && window._uploadPdf) {
+                                  window._uploadPdf(job, file);
+                                }
+                              }}>
+                              <div className="rounded border-2 border-dashed border-gray-200 px-3 py-1.5 text-center text-xs text-gray-400 hover:border-gray-300 cursor-pointer">
+                                {job.pdf_path ? 'Drop PDF to replace' : 'Drop PDF resume here'}
+                                <label className="ml-2 text-blue-500 hover:text-blue-700 cursor-pointer underline">
+                                  or browse
+                                  <input type="file" accept=".pdf" className="hidden" onChange={e => {
+                                    const file = e.target.files[0];
+                                    if (file && window._uploadPdf) window._uploadPdf(job, file);
+                                    e.target.value = '';
+                                  }} />
+                                </label>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                        <button onClick={() => removeJobFromPlan(planJob.id)}
+                          className="text-gray-300 hover:text-red-500 text-sm px-1 flex-shrink-0 no-print" title="Remove">
+                          &#10005;
+                        </button>
+                      </div>
+                      <div className="mt-3 ml-8">
+                        <textarea
+                          value={planJob.notes}
+                          onChange={e => updateJobNotes(planJob.id, e.target.value)}
+                          placeholder="Add strategy notes (e.g., 'mention Kafka experience', 'follow up with referral')..."
+                          className="w-full px-3 py-2 border rounded text-sm h-16 resize-none text-purple-700 bg-purple-50 placeholder-gray-400"
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PipelineView({ jobs, changeStatus }) {
+  const { useState, useMemo, useCallback } = React;
+  const [draggedJob, setDraggedJob] = useState(null);
+  const [hoveredStage, setHoveredStage] = useState(null);
+  const [logoErrors, setLogoErrors] = useState({});
+
+  // Only show jobs that have been applied to (or further), plus Not Applied with favorites
+  const PIPELINE_STAGES = [
+    { id: "Applied", color: "#3b82f6", bg: "#eff6ff", border: "#bfdbfe" },
+    { id: "1st Interview", color: "#0891b2", bg: "#ecfeff", border: "#a5f3fc" },
+    { id: "2nd Interview", color: "#6366f1", bg: "#eef2ff", border: "#c7d2fe" },
+    { id: "Final", color: "#7c3aed", bg: "#f5f3ff", border: "#ddd6fe" },
+    { id: "Verbal Offer", color: "#059669", bg: "#ecfdf5", border: "#a7f3d0" },
+    { id: "Offer", color: "#16a34a", bg: "#f0fdf4", border: "#bbf7d0" },
+    { id: "Accepted", color: "#15803d", bg: "#f0fdf4", border: "#86efac" },
+    { id: "Rejected", color: "#dc2626", bg: "#fef2f2", border: "#fecaca" },
+    { id: "Auto-Reject", color: "#d97706", bg: "#fffbeb", border: "#fde68a" },
+  ];
+
+  const stageMap = useMemo(() => {
+    const map = {};
+    PIPELINE_STAGES.forEach(s => { map[s.id] = []; });
+    jobs.forEach(j => {
+      if (j.status !== "Not Applied" && map[j.status]) {
+        map[j.status].push(j);
+      }
+    });
+    // Sort each column by score descending
+    Object.values(map).forEach(arr => arr.sort((a, b) => b.score - a.score));
+    return map;
+  }, [jobs]);
+
+  const activeCount = useMemo(() =>
+    jobs.filter(j => j.status !== "Not Applied").length
+  , [jobs]);
+
+  const getLogoUrl = useCallback((company) => {
+    if (!company || logoErrors[company]) return null;
+    const domain = company.toLowerCase()
+      .replace(/[^a-z0-9\s]/g, '')
+      .replace(/\s+/g, '')
+      + '.com';
+    return `https://logo.clearbit.com/${domain}?size=40`;
+  }, [logoErrors]);
+
+  const handleLogError = useCallback((company) => {
+    setLogoErrors(prev => ({ ...prev, [company]: true }));
+  }, []);
+
+  const onDragStart = useCallback((e, job) => {
+    setDraggedJob(job);
+    e.dataTransfer.effectAllowed = 'move';
+  }, []);
+
+  const onDragOver = useCallback((e, stageId) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    setHoveredStage(stageId);
+  }, []);
+
+  const onDragLeave = useCallback(() => {
+    setHoveredStage(null);
+  }, []);
+
+  const onDrop = useCallback((e, stageId) => {
+    e.preventDefault();
+    setHoveredStage(null);
+    if (draggedJob && draggedJob.status !== stageId) {
+      changeStatus(draggedJob.id, stageId);
+    }
+    setDraggedJob(null);
+  }, [draggedJob, changeStatus]);
+
+  const tierDot = (tier) => {
+    if (tier === 'Strong Match') return { bg: '#16a34a', label: 'S' };
+    if (tier === 'Match') return { bg: '#3b82f6', label: 'M' };
+    return { bg: '#d97706', label: 'W' };
+  };
+
+  return (
+    <div className="p-4 overflow-auto" style={{height: 'calc(100vh - 130px)'}}>
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h2 className="text-lg font-bold text-gray-800">Application Pipeline</h2>
+          <p className="text-sm text-gray-500">{activeCount} active applications &middot; Drag cards between stages</p>
+        </div>
+      </div>
+
+      <div className="flex gap-3 overflow-x-auto pb-4" style={{minHeight: 'calc(100vh - 220px)'}}>
+        {PIPELINE_STAGES.map(stage => {
+          const stageJobs = stageMap[stage.id] || [];
+          const isHovered = hoveredStage === stage.id;
+          return (
+            <div
+              key={stage.id}
+              className="flex-shrink-0 rounded-lg flex flex-col"
+              style={{
+                width: '220px',
+                backgroundColor: isHovered ? stage.bg : '#f8fafc',
+                border: `2px ${isHovered ? 'dashed' : 'solid'} ${isHovered ? stage.color : '#e2e8f0'}`,
+                transition: 'all 0.15s ease',
+              }}
+              onDragOver={(e) => onDragOver(e, stage.id)}
+              onDragLeave={onDragLeave}
+              onDrop={(e) => onDrop(e, stage.id)}
+            >
+              {/* Column header */}
+              <div className="px-3 py-2 border-b flex items-center justify-between flex-shrink-0"
+                style={{ borderColor: stage.border }}>
+                <div className="flex items-center gap-2">
+                  <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: stage.color }} />
+                  <span className="text-xs font-bold" style={{ color: stage.color }}>{stage.id}</span>
+                </div>
+                <span className="text-xs font-bold rounded-full px-2 py-0.5"
+                  style={{ backgroundColor: stage.bg, color: stage.color }}>
+                  {stageJobs.length}
+                </span>
+              </div>
+
+              {/* Cards */}
+              <div className="p-2 flex-1 overflow-y-auto space-y-2"
+                style={{ maxHeight: 'calc(100vh - 300px)' }}>
+                {stageJobs.length === 0 && (
+                  <div className="text-center py-8 text-xs text-gray-400">
+                    Drop jobs here
+                  </div>
+                )}
+                {stageJobs.map(job => {
+                  const td = tierDot(job.tier);
+                  const logoUrl = getLogoUrl(job.company);
+                  return (
+                    <div
+                      key={job.id}
+                      draggable
+                      onDragStart={(e) => onDragStart(e, job)}
+                      onClick={() => { if (!draggedJob) window._showJobDetail && window._showJobDetail(job.id); }}
+                      className="bg-white rounded-lg border border-gray-200 p-2.5 cursor-grab active:cursor-grabbing hover:shadow-md transition-shadow"
+                      style={{ opacity: draggedJob?.id === job.id ? 0.4 : 1 }}
+                    >
+                      <div className="flex items-start gap-2 mb-1.5">
+                        {logoUrl ? (
+                          <img
+                            src={logoUrl}
+                            alt=""
+                            className="w-7 h-7 rounded flex-shrink-0 bg-gray-50 object-contain"
+                            style={{ border: '1px solid #e5e7eb' }}
+                            onError={() => handleLogError(job.company)}
+                          />
+                        ) : (
+                          <div className="w-7 h-7 rounded flex-shrink-0 bg-gray-100 flex items-center justify-center text-xs font-bold text-gray-400"
+                            style={{ border: '1px solid #e5e7eb' }}>
+                            {(job.company || '?')[0]}
+                          </div>
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs font-semibold text-gray-800 truncate" title={job.company}>{job.company}</div>
+                          <div className="text-xs text-gray-500 truncate" title={job.title}>{job.title}</div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between mt-1">
+                        <div className="flex items-center gap-1.5">
+                          <span className="inline-flex items-center justify-center w-4 h-4 rounded-full text-white font-bold"
+                            style={{ backgroundColor: td.bg, fontSize: '8px' }}>
+                            {td.label}
+                          </span>
+                          <span className="text-xs text-gray-400">Score: {job.score}</span>
+                        </div>
+                        {job.salary && job.salary !== 'N/A' && (
+                          <span className="text-xs text-green-600 font-medium truncate ml-1" style={{maxWidth: '90px'}} title={job.salary}>
+                            {job.salary}
+                          </span>
+                        )}
+                      </div>
+
+                      {job.location && (
+                        <div className="text-xs text-gray-400 mt-1 truncate" title={job.location}>
+                          {job.location}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function BatchPdfDropZone({ job }) {
+  const [dragging, setDragging] = useState(false);
+  const [uploading, setUploading] = useState(false);
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragging(false);
+    const file = e.dataTransfer.files[0];
+    if (!file || !file.name.toLowerCase().endsWith('.pdf')) return;
+    setUploading(true);
+    if (window._uploadPdf) {
+      window._uploadPdf(job, file).then(() => setUploading(false)).catch(() => setUploading(false));
+    }
+  };
+
+  const handleFileInput = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setUploading(true);
+    if (window._uploadPdf) {
+      window._uploadPdf(job, file).then(() => setUploading(false)).catch(() => setUploading(false));
+    }
+    e.target.value = "";
+  };
+
+  return (
+    <div className="mt-2 border-t pt-2"
+      onDragOver={e => { e.preventDefault(); e.stopPropagation(); setDragging(true); }}
+      onDragLeave={e => { e.preventDefault(); e.stopPropagation(); setDragging(false); }}
+      onDrop={handleDrop}
+      onClick={e => e.stopPropagation()}>
+      <div className={'rounded border-2 border-dashed px-3 py-2 text-center text-xs transition-colors ' +
+        (dragging ? 'border-blue-400 bg-blue-50 text-blue-600' :
+         uploading ? 'border-green-300 bg-green-50 text-green-600' :
+         'border-gray-200 text-gray-400 hover:border-gray-300')}>
+        {uploading ? 'Uploading...' : (
+          <>
+            {job.pdf_path ? 'Drop PDF to replace' : 'Drop PDF resume here'}
+            <label className="ml-2 text-blue-500 hover:text-blue-700 cursor-pointer underline">
+              or browse
+              <input type="file" accept=".pdf" className="hidden" onChange={handleFileInput} />
+            </label>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Sankey Diagram ──────────────────────────────────────────────────
+const SANKEY_STAGES = [
+  "Applied", "1st Interview", "2nd Interview", "Final",
+  "Verbal Offer", "Offer", "Accepted"
+];
+const SANKEY_STAGE_INDEX = {};
+SANKEY_STAGES.forEach((s, i) => { SANKEY_STAGE_INDEX[s] = i; });
+
+const SANKEY_NODE_COLORS = {
+  "Applied": "#3b82f6",
+  "1st Interview": "#0891b2",
+  "2nd Interview": "#6366f1",
+  "Final": "#7c3aed",
+  "Verbal Offer": "#059669",
+  "Offer": "#16a34a",
+  "Accepted": "#15803d",
+  "Rejected": "#dc2626",
+};
+
+function buildSankeyData(jobs) {
+  const EXCLUDED_SANKEY = new Set(["Not Applied", "Auto-Reject", "Applied, Closed, No Update", "Position Closed, No Application Submitted"]);
+  const pipelineJobs = jobs.filter(j =>
+    !EXCLUDED_SANKEY.has(j.status) && (SANKEY_STAGE_INDEX[j.status] !== undefined || j.status === "Rejected")
+  );
+
+  if (pipelineJobs.length === 0) return { nodes: [], links: [], jobsByNode: {}, jobsByLink: {} };
+
+  // Determine the highest stage each job reached
+  function getHighestStage(job) {
+    if (job.status === "Rejected") {
+      // Check timestamps to find furthest stage reached
+      for (let i = SANKEY_STAGES.length - 1; i >= 0; i--) {
+        if (job.timestamps && job.timestamps[SANKEY_STAGES[i]]) return i;
+      }
+      return 0; // default to Applied
+    }
+    return SANKEY_STAGE_INDEX[job.status] ?? 0;
+  }
+
+  // Track link values and associated jobs
+  const linkMap = {}; // "source->target" => { value, jobs }
+  const nodeSet = new Set();
+  const jobsByNode = {}; // nodeId => [jobs]
+
+  pipelineJobs.forEach(job => {
+    const highest = getHighestStage(job);
+    const isRejected = job.status === "Rejected";
+
+    // Job flows through Applied up to its highest stage
+    for (let i = 0; i <= highest; i++) {
+      const stage = SANKEY_STAGES[i];
+      nodeSet.add(stage);
+      if (!jobsByNode[stage]) jobsByNode[stage] = [];
+      jobsByNode[stage].push(job);
+
+      if (i > 0) {
+        const key = SANKEY_STAGES[i - 1] + "->" + stage;
+        if (!linkMap[key]) linkMap[key] = { value: 0, jobs: [] };
+        linkMap[key].value++;
+        linkMap[key].jobs.push(job);
+      }
+    }
+
+    // If rejected, add a link from highest stage to Rejected
+    if (isRejected) {
+      nodeSet.add("Rejected");
+      if (!jobsByNode["Rejected"]) jobsByNode["Rejected"] = [];
+      jobsByNode["Rejected"].push(job);
+      const fromStage = SANKEY_STAGES[highest];
+      const key = fromStage + "->Rejected";
+      if (!linkMap[key]) linkMap[key] = { value: 0, jobs: [] };
+      linkMap[key].value++;
+      linkMap[key].jobs.push(job);
+    }
+  });
+
+  // Build nodes array - order matters for layout
+  const orderedNodes = [...SANKEY_STAGES, "Rejected"].filter(s => nodeSet.has(s));
+  const nodes = orderedNodes.map(s => ({
+    id: s,
+    label: s,
+    color: SANKEY_NODE_COLORS[s],
+    count: (jobsByNode[s] || []).length,
+  }));
+
+  const links = Object.entries(linkMap).map(([key, data]) => {
+    const [source, target] = key.split("->");
+    return { source, target, value: data.value, jobs: data.jobs };
+  });
+
+  return { nodes, links, jobsByNode, linkMap };
+}
+
+function SankeyView({ jobs }) {
+  const { useState, useEffect, useMemo, useRef, useCallback } = React;
+  const svgRef = useRef(null);
+  const containerRef = useRef(null);
+  const [dimensions, setDimensions] = useState({ width: 900, height: 500 });
+  const [tooltip, setTooltip] = useState(null);
+  const [selectedDetail, setSelectedDetail] = useState(null);
+  const [detailSearch, setDetailSearch] = useState("");
+
+  const sankeyData = useMemo(() => buildSankeyData(jobs), [jobs]);
+
+  // Responsive sizing
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect;
+      setDimensions({ width: Math.max(600, width), height: Math.max(350, height) });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // D3 rendering
+  useEffect(() => {
+    if (!svgRef.current || sankeyData.nodes.length === 0) return;
+
+    const { width, height } = dimensions;
+    const margin = { top: 30, right: 160, bottom: 30, left: 30 };
+
+    const svg = d3.select(svgRef.current);
+    svg.selectAll("*").remove();
+    svg.attr("width", width).attr("height", height);
+
+    const g = svg.append("g");
+
+    // Deep-clone data since d3-sankey mutates in place
+    const clonedNodes = sankeyData.nodes.map(n => ({ ...n }));
+    const clonedLinks = sankeyData.links.map(l => ({ ...l, source: l.source, target: l.target }));
+
+    const sankeyLayout = d3.sankey()
+      .nodeId(d => d.id)
+      .nodeAlign(d3.sankeyLeft)
+      .nodeWidth(28)
+      .nodePadding(24)
+      .extent([[margin.left, margin.top], [width - margin.right, height - margin.bottom]]);
+
+    let layout;
+    try {
+      layout = sankeyLayout({ nodes: clonedNodes, links: clonedLinks });
+    } catch (e) {
+      console.error("Sankey layout error:", e);
+      return;
+    }
+
+    const { nodes, links } = layout;
+
+    // Links
+    const linkGroup = g.append("g").attr("fill", "none");
+    const linkPaths = linkGroup.selectAll("path")
+      .data(links)
+      .join("path")
+      .attr("d", d3.sankeyLinkHorizontal())
+      .attr("stroke", d => d.source.color)
+      .attr("stroke-width", d => Math.max(2, d.width))
+      .attr("opacity", 0.35)
+      .style("cursor", "pointer")
+      .style("transition", "opacity 0.2s");
+
+    // Link hover
+    linkPaths
+      .on("mouseenter", function(event, d) {
+        linkPaths.attr("opacity", l => l === d ? 0.6 : 0.08);
+        const total = sankeyData.jobsByNode["Applied"] ? sankeyData.jobsByNode["Applied"].length : d.value;
+        const pct = total > 0 ? Math.round(d.value / total * 100) : 0;
+        setTooltip({
+          x: event.offsetX,
+          y: event.offsetY,
+          text: d.source.label + " \u2192 " + d.target.label + ": " + d.value + " job" + (d.value !== 1 ? "s" : "") + " (" + pct + "%)"
+        });
+      })
+      .on("mousemove", function(event) {
+        setTooltip(prev => prev ? { ...prev, x: event.offsetX, y: event.offsetY } : null);
+      })
+      .on("mouseleave", function() {
+        linkPaths.attr("opacity", 0.35);
+        setTooltip(null);
+      })
+      .on("click", function(event, d) {
+        const srcLink = sankeyData.links.find(l => l.source === d.source.id && l.target === d.target.id);
+        setSelectedDetail({
+          title: d.source.label + " \u2192 " + d.target.label,
+          jobs: srcLink ? srcLink.jobs : d.jobs || [],
+        });
+        setDetailSearch("");
+      });
+
+    // Nodes — rendered after links so they sit on top in SVG z-order
+    const nodeGroup = g.append("g");
+    const nodeRects = nodeGroup.selectAll("rect")
+      .data(nodes)
+      .join("rect")
+      .attr("x", d => d.x0)
+      .attr("y", d => d.y0)
+      .attr("width", d => d.x1 - d.x0)
+      .attr("height", d => Math.max(4, d.y1 - d.y0))
+      .attr("fill", d => d.color)
+      .attr("rx", 3)
+      .style("cursor", "pointer");
+
+    // Raise entire node group above links to ensure node clicks take priority
+    nodeGroup.raise();
+
+    // Node hover & click
+    nodeRects
+      .on("mouseenter", function(event, d) {
+        linkPaths.attr("opacity", l =>
+          l.source === d || l.target === d ? 0.5 : 0.06
+        );
+        nodeRects.attr("opacity", n =>
+          n === d || links.some(l => (l.source === d || l.target === d) && (l.source === n || l.target === n)) ? 1 : 0.3
+        );
+        const total = sankeyData.jobsByNode["Applied"] ? sankeyData.jobsByNode["Applied"].length : d.count;
+        const pct = total > 0 ? Math.round(d.count / total * 100) : 0;
+        setTooltip({
+          x: event.offsetX,
+          y: event.offsetY,
+          text: d.label + ": " + d.count + " job" + (d.count !== 1 ? "s" : "") + " (" + pct + "%)"
+        });
+      })
+      .on("mousemove", function(event) {
+        setTooltip(prev => prev ? { ...prev, x: event.offsetX, y: event.offsetY } : null);
+      })
+      .on("mouseleave", function() {
+        linkPaths.attr("opacity", 0.35);
+        nodeRects.attr("opacity", 1);
+        setTooltip(null);
+      })
+      .on("click", function(event, d) {
+        setSelectedDetail({
+          title: d.label,
+          jobs: sankeyData.jobsByNode[d.id] || [],
+        });
+        setDetailSearch("");
+      });
+
+    // Node labels (also clickable)
+    nodeGroup.selectAll("text")
+      .data(nodes)
+      .join("text")
+      .attr("x", d => d.x1 + 8)
+      .attr("y", d => (d.y0 + d.y1) / 2)
+      .attr("dy", "0.35em")
+      .attr("font-size", "13px")
+      .attr("font-weight", "600")
+      .attr("font-family", "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif")
+      .attr("fill", "#374151")
+      .text(d => d.label + " (" + d.count + ")")
+      .style("cursor", "pointer")
+      .on("click", function(event, d) {
+        event.stopPropagation();
+        setSelectedDetail({
+          title: d.label,
+          jobs: sankeyData.jobsByNode[d.id] || [],
+        });
+        setDetailSearch("");
+      });
+
+  }, [sankeyData, dimensions]);
+
+  const pipelineJobs = useMemo(() =>
+    jobs.filter(j => j.status !== "Not Applied" && j.status !== "Auto-Reject"),
+    [jobs]
+  );
+
+  // Filtered detail jobs
+  const filteredDetailJobs = useMemo(() => {
+    if (!selectedDetail) return [];
+    let list = selectedDetail.jobs;
+    if (detailSearch) {
+      const q = detailSearch.toLowerCase();
+      list = list.filter(j => j.company.toLowerCase().includes(q) || j.title.toLowerCase().includes(q));
+    }
+    return list.sort((a, b) => b.score - a.score);
+  }, [selectedDetail, detailSearch]);
+
+  if (pipelineJobs.length === 0) {
+    return React.createElement("div", { className: "flex flex-col items-center justify-center h-full text-gray-400 py-20" },
+      React.createElement("div", { className: "text-5xl mb-4" }, "\u{1F4CA}"),
+      React.createElement("p", { className: "text-lg" }, "No jobs in the interview pipeline yet."),
+      React.createElement("p", { className: "text-sm mt-1" }, "Apply to jobs and track their progress to see the Sankey flow.")
+    );
+  }
+
+  return React.createElement("div", { className: "flex flex-col", style: { height: "calc(100vh - 120px)" } },
+    // Header
+    React.createElement("div", { className: "bg-white border-b px-6 py-3 flex items-center justify-between" },
+      React.createElement("div", null,
+        React.createElement("h2", { className: "text-lg font-bold text-gray-800" }, "Interview Pipeline Flow"),
+        React.createElement("p", { className: "text-xs text-gray-500" },
+          pipelineJobs.length + " job" + (pipelineJobs.length !== 1 ? "s" : "") + " in pipeline"
+        )
+      ),
+      React.createElement("div", { className: "flex gap-2 flex-wrap" },
+        SANKEY_STAGES.concat(["Rejected"]).filter(s => sankeyData.jobsByNode[s] && sankeyData.jobsByNode[s].length > 0).map(s =>
+          React.createElement("span", {
+            key: s,
+            className: "px-2 py-0.5 rounded text-xs font-medium text-white",
+            style: { backgroundColor: SANKEY_NODE_COLORS[s] }
+          }, s + ": " + sankeyData.jobsByNode[s].length)
+        )
+      )
+    ),
+    // Chart area
+    React.createElement("div", { className: "flex flex-1 overflow-hidden" },
+      React.createElement("div", {
+        ref: containerRef,
+        className: "flex-1 relative overflow-auto bg-gray-50 p-4",
+      },
+        React.createElement("svg", { ref: svgRef, className: "w-full h-full", style: { minWidth: 600, minHeight: 350 } }),
+        // Tooltip
+        tooltip && React.createElement("div", {
+          className: "absolute bg-gray-900 text-white text-xs rounded-lg px-3 py-2 shadow-lg pointer-events-none z-50",
+          style: { left: tooltip.x + 14, top: tooltip.y - 14 }
+        }, tooltip.text)
+      ),
+      // Detail panel
+      selectedDetail && React.createElement("div", {
+        className: "w-80 bg-white border-l shadow-lg overflow-y-auto flex-shrink-0",
+        style: { animation: "slideInRight 0.2s ease-out" }
+      },
+        React.createElement("div", { className: "sticky top-0 bg-white border-b p-4 z-10" },
+          React.createElement("div", { className: "flex justify-between items-center mb-2" },
+            React.createElement("h3", { className: "font-bold text-gray-800 text-sm" }, selectedDetail.title),
+            React.createElement("button", {
+              onClick: () => setSelectedDetail(null),
+              className: "text-gray-400 hover:text-gray-600 text-lg leading-none"
+            }, "\u00D7")
+          ),
+          React.createElement("p", { className: "text-xs text-gray-500 mb-2" },
+            filteredDetailJobs.length + " of " + selectedDetail.jobs.length + " jobs"
+          ),
+          selectedDetail.jobs.length > 5 && React.createElement("input", {
+            type: "text",
+            placeholder: "Search jobs...",
+            value: detailSearch,
+            onChange: e => setDetailSearch(e.target.value),
+            className: "w-full px-2 py-1 border rounded text-xs"
+          })
+        ),
+        React.createElement("div", { className: "p-4 space-y-2" },
+          filteredDetailJobs.slice(0, 100).map(job =>
+            React.createElement("div", {
+              key: job.id,
+              onClick: () => window._showJobDetail && window._showJobDetail(job.id),
+              className: "p-2 rounded border hover:bg-blue-50 cursor-pointer transition-colors"
+            },
+              React.createElement("div", { className: "font-medium text-sm text-gray-800 truncate" }, job.company),
+              React.createElement("div", { className: "text-xs text-gray-500 truncate" }, job.title),
+              React.createElement("div", { className: "flex gap-2 mt-1 items-center" },
+                React.createElement("span", {
+                  className: "px-1.5 py-0.5 rounded text-xs text-white",
+                  style: { backgroundColor: SANKEY_NODE_COLORS[job.status] || "#9ca3af" }
+                }, job.status),
+                React.createElement("span", { className: "text-xs text-gray-400" }, "Score: " + job.score)
+              )
+            )
+          ),
+          filteredDetailJobs.length > 100 && React.createElement("p", { className: "text-xs text-gray-400 text-center py-2" },
+            "Showing 100 of " + filteredDetailJobs.length + ". Use search to filter."
+          )
+        )
+      )
+    )
+  );
+}
+
+function StatsPanel({ jobs }) {
+  const { useMemo, useState } = React;
+  const [expandedBatch, setExpandedBatch] = useState(null);
+  const [batchTierFilter, setBatchTierFilter] = useState('all');
+  const [selectedBatchJobId, setSelectedBatchJobId] = useState(null);
+  const [descCache, setDescCache] = useState({});
+  const [companyCache, setCompanyCache] = useState({});
+  // Set your LinkedIn profile URL here for quick copy during applications
+  const LINKEDIN_PROFILE = window.__APP_CONFIG.linkedin_url || '';
+
+  const fetchDescription = (jobId) => {
+    if (descCache[jobId] !== undefined) return;
+    setDescCache(prev => ({ ...prev, [jobId]: { loading: true } }));
+    fetch('/api/job-description/' + jobId)
+      .then(r => r.json())
+      .then(data => setDescCache(prev => ({ ...prev, [jobId]: { html: data.formatted || '', text: data.description || 'No description available.' } })))
+      .catch(() => setDescCache(prev => ({ ...prev, [jobId]: { error: true } })));
+  };
+
+  const fetchCompanyInfo = (companyName) => {
+    const key = companyName.trim().toLowerCase();
+    if (companyCache[key] !== undefined) return;
+    setCompanyCache(prev => ({ ...prev, [key]: { loading: true } }));
+    fetch('/api/company-info/' + encodeURIComponent(companyName))
+      .then(r => r.json())
+      .then(data => setCompanyCache(prev => ({ ...prev, [key]: data })))
+      .catch(() => setCompanyCache(prev => ({ ...prev, [key]: { error: true } })));
+  };
+
+  const batchStats = useMemo(() => {
+    const byDate = {};
+    jobs.forEach(j => {
+      const d = j.import_date || 'Unknown';
+      if (!byDate[d]) byDate[d] = { date: d, total: 0, strong: 0, match: 0, weak: 0 };
+      byDate[d].total++;
+      if (j.tier === 'Strong Match') byDate[d].strong++;
+      else if (j.tier === 'Match') byDate[d].match++;
+      else byDate[d].weak++;
+    });
+    return Object.values(byDate).sort((a, b) => b.date.localeCompare(a.date));
+  }, [jobs]);
+
+  const topCompanies = useMemo(() => {
+    const counts = {};
+    jobs.forEach(j => { counts[j.company] = (counts[j.company] || 0) + 1; });
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 15);
+  }, [jobs]);
+
+  const workTypes = useMemo(() => {
+    const counts = {};
+    jobs.forEach(j => { const wt = j.work_type || 'Unknown'; counts[wt] = (counts[wt] || 0) + 1; });
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  }, [jobs]);
+
+  const scoreHist = useMemo(() => {
+    const buckets = {};
+    for (let i = 0; i <= 24; i++) buckets[i] = 0;
+    jobs.forEach(j => { const s = Math.min(Math.max(j.score || 0, 0), 24); buckets[s]++; });
+    return Object.entries(buckets).map(([score, count]) => ({ score: Number(score), count }));
+  }, [jobs]);
+
+  const maxCompany = Math.max(...topCompanies.map(([, c]) => c), 1);
+  const maxScore = Math.max(...scoreHist.map(b => b.count), 1);
+  const totalJobs = jobs.length;
+
+  const tierOverall = useMemo(() => ({
+    strong: jobs.filter(j => j.tier === 'Strong Match').length,
+    match: jobs.filter(j => j.tier === 'Match').length,
+    weak: jobs.filter(j => j.tier === 'Weak Match').length,
+  }), [jobs]);
+
+  return (
+    <div className="p-6 overflow-auto" style={{maxHeight: 'calc(100vh - 130px)'}}>
+      <h2 className="text-lg font-bold text-gray-800 mb-1">Pipeline Analytics</h2>
+      <p className="text-sm text-gray-500 mb-6">{totalJobs.toLocaleString()} total positions tracked</p>
+
+      {/* Overall tier summary cards */}
+      <div className="grid grid-cols-3 gap-4 mb-6">
+        {[
+          { label: 'Strong Match', count: tierOverall.strong, bg: 'bg-green-50', border: 'border-green-200', text: 'text-green-700', bar: 'bg-green-400' },
+          { label: 'Match', count: tierOverall.match, bg: 'bg-blue-50', border: 'border-blue-200', text: 'text-blue-700', bar: 'bg-blue-400' },
+          { label: 'Weak Match', count: tierOverall.weak, bg: 'bg-yellow-50', border: 'border-yellow-200', text: 'text-yellow-700', bar: 'bg-yellow-300' },
+        ].map(t => (
+          <div key={t.label} className={"rounded-lg border p-4 " + t.bg + " " + t.border}>
+            <div className={"text-2xl font-bold " + t.text}>{t.count.toLocaleString()}</div>
+            <div className={"text-sm font-medium " + t.text}>{t.label}</div>
+            <div className="text-xs text-gray-500 mt-1">{Math.round(t.count / totalJobs * 100)}% of pipeline</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="grid gap-6" style={{gridTemplateColumns: '1fr 1fr'}}>
+
+        {/* Batch History */}
+        <div className="bg-white rounded-lg border p-4 col-span-2">
+          <h3 className="font-semibold text-gray-700 mb-4">Batch History</h3>
+          <p className="text-xs text-gray-400 mb-3">Click a row to drill into that batch</p>
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-xs text-gray-400 border-b">
+                <th className="text-left py-2 pr-4 font-medium">Import Date</th>
+                <th className="text-right py-2 px-3 font-medium text-green-600">Strong</th>
+                <th className="text-right py-2 px-3 font-medium text-blue-600">Match</th>
+                <th className="text-right py-2 px-3 font-medium text-yellow-600">Weak</th>
+                <th className="text-right py-2 px-3 font-medium">Total</th>
+                <th className="py-2 pl-4 w-48 font-medium">Breakdown</th>
+                <th className="py-2 pl-2 font-medium"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {batchStats.map(b => {
+                const isExpanded = expandedBatch === b.date;
+                const batchJobs = isExpanded ? jobs.filter(j => (j.import_date || 'Unknown') === b.date) : [];
+                const batchCompanies = isExpanded ? (() => {
+                  const cc = {};
+                  batchJobs.forEach(j => { cc[j.company] = (cc[j.company] || 0) + 1; });
+                  return Object.entries(cc).sort((a, b) => b[1] - a[1]).slice(0, 20);
+                })() : [];
+                const batchPositions = isExpanded ? (() => {
+                  const pp = {};
+                  batchJobs.forEach(j => {
+                    const norm = j.title.replace(/\s+(I{1,3}|IV|V|VI|[23456])\s*$/, '').replace(/\s*-\s*$/, '').trim();
+                    pp[norm] = (pp[norm] || 0) + 1;
+                  });
+                  return Object.entries(pp).sort((a, b) => b[1] - a[1]).slice(0, 20);
+                })() : [];
+                const filteredJobs = isExpanded ? (batchTierFilter === 'all' ? [...batchJobs] :
+                  batchJobs.filter(j => j.tier === batchTierFilter)).sort((a, b) => b.score - a.score) : [];
+                const maxBatchCo = isExpanded && batchCompanies.length > 0 ? batchCompanies[0][1] : 1;
+
+                return (
+                  <React.Fragment key={b.date}>
+                    <tr className={"border-b cursor-pointer transition-colors " + (isExpanded ? "bg-blue-50" : "hover:bg-gray-50")}
+                        onClick={() => { setExpandedBatch(isExpanded ? null : b.date); setBatchTierFilter('all'); setSelectedBatchJobId(null); }}>
+                      <td className="py-2 pr-4 font-medium text-gray-700">
+                        <span className={"inline-block mr-2 text-xs transition-transform " + (isExpanded ? "transform rotate-90" : "")}>&#9654;</span>
+                        {b.date}
+                      </td>
+                      <td className="text-right px-3 text-green-700 font-medium">{b.strong}</td>
+                      <td className="text-right px-3 text-blue-700 font-medium">{b.match}</td>
+                      <td className="text-right px-3 text-yellow-700 font-medium">{b.weak}</td>
+                      <td className="text-right px-3 font-bold text-gray-800">{b.total}</td>
+                      <td className="pl-4">
+                        <div className="flex h-5 rounded overflow-hidden bg-gray-100">
+                          {b.strong > 0 && <div className="bg-green-400 flex items-center justify-center text-white text-xs" style={{width: b.strong/b.total*100+'%'}} title={"Strong: "+b.strong}/>}
+                          {b.match > 0 && <div className="bg-blue-400" style={{width: b.match/b.total*100+'%'}} title={"Match: "+b.match}/>}
+                          {b.weak > 0 && <div className="bg-yellow-300" style={{width: b.weak/b.total*100+'%'}} title={"Weak: "+b.weak}/>}
+                        </div>
+                      </td>
+                      <td className="pl-2">
+                        <button
+                          onClick={e => { e.stopPropagation(); window._openBatchDetail && window._openBatchDetail(b.date); }}
+                          className="px-2 py-1 bg-indigo-600 text-white rounded text-xs font-medium hover:bg-indigo-700 whitespace-nowrap">
+                          Full View
+                        </button>
+                      </td>
+                    </tr>
+                    {isExpanded && (
+                      <tr>
+                        <td colSpan="6" className="p-0">
+                          <div className="bg-gray-50 border-t border-b border-blue-200 p-4">
+                            <div className="grid gap-4" style={{gridTemplateColumns: '1fr 1fr'}}>
+                              {/* Top Companies in this batch */}
+                              <div className="bg-white rounded-lg border p-3">
+                                <h4 className="text-sm font-semibold text-gray-700 mb-3">Top Companies ({batchCompanies.length})</h4>
+                                <div className="space-y-1.5 max-h-52 overflow-y-auto">
+                                  {batchCompanies.map(([co, cnt]) => (
+                                    <div key={co} className="flex items-center gap-2">
+                                      <span className="text-xs text-gray-700 w-32 truncate flex-shrink-0" title={co}>{co}</span>
+                                      <div className="flex-1 bg-gray-100 rounded-full h-3 overflow-hidden">
+                                        <div className="bg-blue-400 h-3 rounded-full" style={{width: cnt/maxBatchCo*100+'%'}}/>
+                                      </div>
+                                      <span className="text-xs font-medium text-gray-500 w-6 text-right flex-shrink-0">{cnt}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                              {/* Most Common Positions */}
+                              <div className="bg-white rounded-lg border p-3">
+                                <h4 className="text-sm font-semibold text-gray-700 mb-3">Most Common Positions</h4>
+                                <div className="space-y-1.5 max-h-52 overflow-y-auto">
+                                  {batchPositions.map(([pos, cnt]) => (
+                                    <div key={pos} className="flex items-center gap-2">
+                                      <span className="text-xs text-gray-700 flex-1 truncate" title={pos}>{pos}</span>
+                                      <span className="text-xs font-medium text-gray-500 flex-shrink-0">{cnt}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            </div>
+                            {/* Job list by tier */}
+                            <div className="bg-white rounded-lg border p-3 mt-4">
+                              <div className="flex items-center gap-3 mb-3">
+                                <h4 className="text-sm font-semibold text-gray-700">Jobs in Batch</h4>
+                                <div className="flex gap-1">
+                                  {[
+                                    { key: 'all', label: 'All', count: batchJobs.length, bg: 'bg-gray-100', activeBg: 'bg-gray-700', activeText: 'text-white' },
+                                    { key: 'Strong Match', label: 'Strong', count: b.strong, bg: 'bg-green-50', activeBg: 'bg-green-600', activeText: 'text-white' },
+                                    { key: 'Match', label: 'Match', count: b.match, bg: 'bg-blue-50', activeBg: 'bg-blue-600', activeText: 'text-white' },
+                                    { key: 'Weak Match', label: 'Weak', count: b.weak, bg: 'bg-yellow-50', activeBg: 'bg-yellow-500', activeText: 'text-white' },
+                                  ].map(f => (
+                                    <button key={f.key}
+                                      className={"px-2 py-0.5 rounded text-xs font-medium transition-colors " +
+                                        (batchTierFilter === f.key ? f.activeBg + " " + f.activeText : f.bg + " text-gray-600 hover:opacity-80")}
+                                      onClick={(e) => { e.stopPropagation(); setBatchTierFilter(f.key); setSelectedBatchJobId(null); }}>
+                                      {f.label} ({f.count})
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                              <div className="max-h-72 overflow-y-auto">
+                                <table className="w-full text-xs">
+                                  <thead>
+                                    <tr className="text-gray-400 border-b sticky top-0 bg-white">
+                                      <th className="text-left py-1.5 pr-2 font-medium">Score</th>
+                                      <th className="text-left py-1.5 pr-2 font-medium">Tier</th>
+                                      <th className="text-left py-1.5 pr-2 font-medium">Company</th>
+                                      <th className="text-left py-1.5 pr-2 font-medium">Title</th>
+                                      <th className="text-left py-1.5 pr-2 font-medium">Location</th>
+                                      <th className="text-left py-1.5 font-medium">Salary</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {filteredJobs.slice(0, 100).map(j => {
+                                      const tc = j.tier === 'Strong Match' ? 'text-green-700 bg-green-50' :
+                                                 j.tier === 'Match' ? 'text-blue-700 bg-blue-50' : 'text-yellow-700 bg-yellow-50';
+                                      const isJobExpanded = selectedBatchJobId === j.id;
+                                      return (
+                                        <React.Fragment key={j.id}>
+                                          <tr className={"border-b border-gray-100 cursor-pointer " + (isJobExpanded ? "bg-blue-50" : "hover:bg-gray-50")}
+                                              onClick={() => { if (!isJobExpanded) { fetchDescription(j.id); fetchCompanyInfo(j.company); } setSelectedBatchJobId(isJobExpanded ? null : j.id); }}>
+                                            <td className="py-1.5 pr-2 font-bold text-gray-700">{j.score}</td>
+                                            <td className="py-1.5 pr-2">
+                                              <span className={"px-1.5 py-0.5 rounded text-xs font-medium " + tc}>
+                                                {j.tier === 'Strong Match' ? 'Strong' : j.tier === 'Match' ? 'Match' : 'Weak'}
+                                              </span>
+                                            </td>
+                                            <td className="py-1.5 pr-2 font-medium text-gray-800 truncate" style={{maxWidth: '160px'}} title={j.company}>{j.company}</td>
+                                            <td className="py-1.5 pr-2 text-gray-600 truncate" style={{maxWidth: '220px'}} title={j.title}>{j.title}</td>
+                                            <td className="py-1.5 pr-2 text-gray-500 truncate" style={{maxWidth: '130px'}} title={j.location}>{j.location}</td>
+                                            <td className="py-1.5 text-gray-500 truncate" style={{maxWidth: '120px'}}>{j.salary || '—'}</td>
+                                          </tr>
+                                          {isJobExpanded && (
+                                            <tr>
+                                              <td colSpan="6" className="p-0">
+                                                <div className="bg-white border-t border-b border-blue-100 p-4">
+                                                  <div className="flex justify-between items-start mb-3">
+                                                    <div>
+                                                      <h4 className="font-bold text-gray-900 text-sm">{j.company}</h4>
+                                                      <p className="text-xs text-gray-600">{j.title}</p>
+                                                      <div className="flex items-center gap-2 mt-1">
+                                                        <span className={"inline-block px-2 py-0.5 rounded text-xs font-medium " + tc}>
+                                                          {j.tier} &bull; Score: {j.score}
+                                                        </span>
+                                                        <span className="text-xs text-gray-400">ID: {j.id.slice(0, 12)}</span>
+                                                      </div>
+                                                    </div>
+                                                    <button onClick={(e) => { e.stopPropagation(); setSelectedBatchJobId(null); }}
+                                                      className="text-gray-400 hover:text-gray-600 text-sm">&times;</button>
+                                                  </div>
+                                                  <div className="grid grid-cols-3 gap-3 text-xs mb-3">
+                                                    <div>
+                                                      <span className="text-gray-400">Salary</span>
+                                                      <p className="font-medium text-gray-800">{j.salary !== 'N/A' ? j.salary : 'Not listed'}</p>
+                                                    </div>
+                                                    <div>
+                                                      <span className="text-gray-400">Location</span>
+                                                      <p className="font-medium text-gray-800">{j.location || 'Not listed'}</p>
+                                                    </div>
+                                                    <div>
+                                                      <span className="text-gray-400">Work Type</span>
+                                                      <p className="font-medium text-gray-800">{j.work_type || 'Not listed'}</p>
+                                                    </div>
+                                                    <div>
+                                                      <span className="text-gray-400">Posted</span>
+                                                      <p className="font-medium text-gray-800">{j.posted_date || 'Unknown'}</p>
+                                                    </div>
+                                                    <div>
+                                                      <span className="text-gray-400">Applicants</span>
+                                                      <p className="font-medium text-gray-800">{j.applicants || 'Unknown'}</p>
+                                                    </div>
+                                                    <div>
+                                                      <span className="text-gray-400">Status</span>
+                                                      <select value={j.status || 'New'}
+                                                        onClick={e => e.stopPropagation()}
+                                                        onChange={e => { e.stopPropagation(); window._changeStatus && window._changeStatus(j.id, e.target.value); }}
+                                                        className="block mt-0.5 text-xs font-medium text-gray-800 bg-white border border-gray-300 rounded px-1 py-0.5 cursor-pointer">
+                                                        {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+                                                      </select>
+                                                    </div>
+                                                  </div>
+                                                  {/* Description + Company Info side by side */}
+                                                  <div className="flex gap-4 mb-3">
+                                                    {/* Left: Description */}
+                                                    <div className="flex-1 min-w-0">
+                                                      {(() => {
+                                                        const desc = descCache[j.id];
+                                                        if (!desc) return null;
+                                                        return (
+                                                          <div>
+                                                            <span className="text-xs text-gray-400 block mb-1">Description</span>
+                                                            {desc.loading ? (
+                                                              <p className="text-xs text-gray-400">Loading...</p>
+                                                            ) : desc.error ? (
+                                                              <p className="text-xs text-red-400">Failed to load description.</p>
+                                                            ) : desc.html ? (
+                                                              <div className="bg-gray-50 border rounded p-3 max-h-64 overflow-auto max-w-2xl text-xs"
+                                                                dangerouslySetInnerHTML={{ __html: desc.html }} />
+                                                            ) : (
+                                                              <div className="text-xs text-gray-700 bg-gray-50 border rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap max-w-2xl">{desc.text}</div>
+                                                            )}
+                                                          </div>
+                                                        );
+                                                      })()}
+                                                    </div>
+                                                    {/* Right: Company Info */}
+                                                    {(() => {
+                                                      const key = j.company.trim().toLowerCase();
+                                                      const info = companyCache[key];
+                                                      if (!info) return null;
+                                                      if (info.loading) return (
+                                                        <div className="w-64 flex-shrink-0">
+                                                          <span className="text-xs text-gray-400 block mb-1">Company</span>
+                                                          <div className="bg-gray-50 border rounded p-3 text-xs text-gray-400">Loading company info...</div>
+                                                        </div>
+                                                      );
+                                                      if (info.error) return (
+                                                        <div className="w-64 flex-shrink-0">
+                                                          <span className="text-xs text-gray-400 block mb-1">Company</span>
+                                                          <div className="bg-gray-50 border rounded p-3 text-xs text-red-400">Could not load info.</div>
+                                                        </div>
+                                                      );
+                                                      return (
+                                                        <div className="w-64 flex-shrink-0">
+                                                          <span className="text-xs text-gray-400 block mb-1">Company</span>
+                                                          <div className="bg-gray-50 border rounded p-3 max-h-64 overflow-auto">
+                                                            <div className="flex items-center gap-2 mb-2">
+                                                              <img src={info.logo_url} alt={info.name + ' logo'}
+                                                                className="w-10 h-10 rounded bg-white border object-contain"
+                                                                onError={(e) => { e.target.style.display = 'none'; }} />
+                                                              <div>
+                                                                <p className="font-semibold text-sm text-gray-900">{info.name}</p>
+                                                                {info.industry && <p className="text-xs text-blue-600">{info.industry}</p>}
+                                                              </div>
+                                                            </div>
+                                                            {info.known_for && (
+                                                              <p className="text-xs text-gray-700 mb-2 leading-relaxed">{info.known_for}</p>
+                                                            )}
+                                                            {info.summary && info.known_for && info.summary.length > info.known_for.length + 10 && (
+                                                              <details className="text-xs">
+                                                                <summary className="text-blue-600 cursor-pointer hover:text-blue-800">More about {info.name}</summary>
+                                                                <p className="text-gray-600 mt-1 leading-relaxed">{info.summary.slice(info.known_for.length).trim()}</p>
+                                                              </details>
+                                                            )}
+                                                            {info.website && (
+                                                              <a href={'https://' + info.website} target="_blank" rel="noopener"
+                                                                onClick={e => e.stopPropagation()}
+                                                                className="text-xs text-blue-500 hover:underline mt-2 block">{info.website}</a>
+                                                            )}
+                                                          </div>
+                                                        </div>
+                                                      );
+                                                    })()}
+                                                  </div>
+                                                  <div className="flex gap-2 flex-wrap items-center">
+                                                    {j.apply_link && (
+                                                      <a href={j.apply_link} target="_blank" rel="noopener"
+                                                        onClick={e => e.stopPropagation()}
+                                                        className="px-2.5 py-1 bg-blue-600 text-white rounded text-xs font-medium hover:bg-blue-700">
+                                                        Apply
+                                                      </a>
+                                                    )}
+                                                    {j.job_link && (
+                                                      <a href={j.job_link} target="_blank" rel="noopener"
+                                                        onClick={e => e.stopPropagation()}
+                                                        className="px-2.5 py-1 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">
+                                                        LinkedIn Posting
+                                                      </a>
+                                                    )}
+                                                    {j.resume_path && (
+                                                      <button
+                                                        onClick={e => { e.stopPropagation(); window._showResume && window._showResume(j.resume_path, j.company, j.title); }}
+                                                        className="px-2.5 py-1 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">
+                                                        View Resume
+                                                      </button>
+                                                    )}
+                                                    {j.pdf_path && (
+                                                      <a href={'/' + j.pdf_path} target="_blank" rel="noopener"
+                                                        onClick={e => e.stopPropagation()}
+                                                        className="px-2.5 py-1 bg-green-600 text-white rounded text-xs font-medium hover:bg-green-700">
+                                                        View PDF Resume
+                                                      </a>
+                                                    )}
+                                                    <button
+                                                      onClick={e => {
+                                                        e.stopPropagation();
+                                                        navigator.clipboard.writeText(LINKEDIN_PROFILE).then(() => {
+                                                          e.target.textContent = 'Copied!';
+                                                          setTimeout(() => { e.target.textContent = 'Copy My LinkedIn'; }, 1500);
+                                                        });
+                                                      }}
+                                                      className="px-2.5 py-1 bg-blue-100 text-blue-700 rounded text-xs font-medium hover:bg-blue-200 border border-blue-200">
+                                                      Copy My LinkedIn
+                                                    </button>
+                                                    <button
+                                                      onClick={e => { e.stopPropagation(); window._showJobDetail && window._showJobDetail(j.id); }}
+                                                      className="px-2.5 py-1 bg-purple-600 text-white rounded text-xs font-medium hover:bg-purple-700">
+                                                      Edit Details
+                                                    </button>
+                                                    <button
+                                                      onClick={e => { e.stopPropagation(); window._openAIChat && window._openAIChat(j.id, j.company + ' — ' + j.title); }}
+                                                      className="px-2.5 py-1 bg-purple-500 text-white rounded text-xs font-medium hover:bg-purple-600">
+                                                      Ask AI
+                                                    </button>
+                                                    {appPlans.length > 0 && (() => {
+                                                      const currentPlan = appPlans.find(p => p.jobs.some(pj => pj.id === j.id));
+                                                      return (
+                                                        <select
+                                                          value={currentPlan ? currentPlan.id : ""}
+                                                          onClick={e => e.stopPropagation()}
+                                                          onChange={e => {
+                                                            e.stopPropagation();
+                                                            const targetId = e.target.value;
+                                                            let updated = appPlans.map(p => ({ ...p, jobs: p.jobs.filter(pj => pj.id !== j.id) }));
+                                                            if (targetId) {
+                                                              updated = updated.map(p => p.id === targetId
+                                                                ? { ...p, jobs: [...p.jobs, { id: j.id, company: j.company, title: j.title, notes: '' }] }
+                                                                : p
+                                                              );
+                                                            }
+                                                            saveAppPlans(updated);
+                                                          }}
+                                                          className={"px-2.5 py-1 rounded text-xs font-medium border cursor-pointer " + (currentPlan ? "bg-green-100 text-green-700 border-green-300" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}>
+                                                          <option value="">Add to Plan...</option>
+                                                          {appPlans.map(p => {
+                                                            const already = p.jobs.some(pj => pj.id === j.id);
+                                                            return <option key={p.id} value={p.id} >{p.title}{already ? ' ✓' : ''}</option>;
+                                                          })}
+                                                        </select>
+                                                      );
+                                                    })()}
+                                                  </div>
+                                                  <BatchPdfDropZone job={j} />
+                                                </div>
+                                              </td>
+                                            </tr>
+                                          )}
+                                        </React.Fragment>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                                {filteredJobs.length > 100 && (
+                                  <p className="text-xs text-gray-400 text-center py-2">Showing first 100 of {filteredJobs.length} jobs</p>
+                                )}
+                                {filteredJobs.length === 0 && (
+                                  <p className="text-xs text-gray-400 text-center py-4">No jobs in this tier for this batch</p>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+            <tfoot>
+              <tr className="border-t-2 border-gray-300 bg-gray-50">
+                <td className="py-2 pr-4 font-bold text-gray-700">Total</td>
+                <td className="text-right px-3 text-green-700 font-bold">{tierOverall.strong}</td>
+                <td className="text-right px-3 text-blue-700 font-bold">{tierOverall.match}</td>
+                <td className="text-right px-3 text-yellow-700 font-bold">{tierOverall.weak}</td>
+                <td className="text-right px-3 font-bold text-gray-800">{totalJobs}</td>
+                <td className="pl-4">
+                  <div className="flex h-5 rounded overflow-hidden bg-gray-100">
+                    <div className="bg-green-400" style={{width: tierOverall.strong/totalJobs*100+'%'}}/>
+                    <div className="bg-blue-400" style={{width: tierOverall.match/totalJobs*100+'%'}}/>
+                    <div className="bg-yellow-300" style={{width: tierOverall.weak/totalJobs*100+'%'}}/>
+                  </div>
+                </td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+
+        {/* Top Companies */}
+        <div className="bg-white rounded-lg border p-4">
+          <h3 className="font-semibold text-gray-700 mb-4">Top Companies by Listings</h3>
+          <div className="space-y-2">
+            {topCompanies.map(([company, count]) => (
+              <div key={company} className="flex items-center gap-2">
+                <span className="text-sm text-gray-700 w-36 truncate flex-shrink-0">{company}</span>
+                <div className="flex-1 bg-gray-100 rounded-full h-4 overflow-hidden">
+                  <div className="bg-blue-400 h-4 rounded-full transition-all" style={{width: count/maxCompany*100+'%'}}/>
+                </div>
+                <span className="text-sm font-medium text-gray-600 w-8 text-right flex-shrink-0">{count}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Right column: Work Type + Score Distribution */}
+        <div className="flex flex-col gap-6">
+          <div className="bg-white rounded-lg border p-4">
+            <h3 className="font-semibold text-gray-700 mb-4">Work Type</h3>
+            <div className="space-y-2">
+              {workTypes.map(([wt, count]) => (
+                <div key={wt} className="flex items-center gap-2">
+                  <span className="text-sm text-gray-700 w-20 flex-shrink-0">{wt || 'Unknown'}</span>
+                  <div className="flex-1 bg-gray-100 rounded-full h-4 overflow-hidden">
+                    <div className="bg-purple-400 h-4 rounded-full" style={{width: count/totalJobs*100+'%'}}/>
+                  </div>
+                  <span className="text-sm text-gray-500 w-20 text-right flex-shrink-0">{count} ({Math.round(count/totalJobs*100)}%)</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="bg-white rounded-lg border p-4">
+            <h3 className="font-semibold text-gray-700 mb-1">Score Distribution</h3>
+            <p className="text-xs text-gray-400 mb-3">
+              <span className="text-yellow-600 font-medium">Yellow = Weak (0-6)</span> &nbsp;
+              <span className="text-blue-600 font-medium">Blue = Match (7-12)</span> &nbsp;
+              <span className="text-green-600 font-medium">Green = Strong (13+)</span>
+            </p>
+            <div className="flex items-end gap-px h-28">
+              {scoreHist.map(b => (
+                <div key={b.score} className="flex-1 flex flex-col items-center justify-end h-full">
+                  <div
+                    className={"w-full rounded-t " + (b.score >= 13 ? 'bg-green-400' : b.score >= 7 ? 'bg-blue-400' : 'bg-yellow-300')}
+                    style={{height: b.count > 0 ? Math.max(b.count/maxScore*100, 3)+'%' : '0'}}
+                    title={"Score " + b.score + ": " + b.count + " jobs"}
+                  />
+                </div>
+              ))}
+            </div>
+            <div className="flex justify-between text-xs text-gray-400 mt-1 px-1">
+              <span>0</span>
+              <span>6</span>
+              <span>12</span>
+              <span>18</span>
+              <span>24</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
+function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans }) {
+  const { useState, useMemo, useCallback } = React;
+  const [tierFilter, setTierFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [sortBy, setSortBy] = useState('score');
+  const [sortDir, setSortDir] = useState('desc');
+  const [expandedJobId, setExpandedJobId] = useState(null);
+  const [descCache, setDescCache] = useState({});
+  const [companyCache, setCompanyCache] = useState({});
+
+  const LINKEDIN_PROFILE = window.__APP_CONFIG.linkedin_url || '';
+
+  // Auto-refresh job data when expanded
+  const [refreshingJobId, setRefreshingJobId] = useState(null);
+  React.useEffect(() => {
+    if (!expandedJobId) return;
+    let cancelled = false;
+    setRefreshingJobId(expandedJobId);
+    fetch("/api/refresh-job/" + expandedJobId)
+      .then(r => r.json())
+      .then(data => {
+        if (cancelled || data.error) { setRefreshingJobId(null); return; }
+        if (data.applicants || data.live_status || data.status) {
+          // Update via global functions so App state stays in sync
+          if (window._updateJob) {
+            const updates = {};
+            if (data.applicants) updates.applicants = data.applicants;
+            if (data.live_status) updates.live_status = data.live_status;
+            if (data.live_status_checked) updates.live_status_checked = data.live_status_checked;
+            if (data.status) updates.status = data.status;
+            window._updateJob(expandedJobId, updates);
+          }
+        }
+        setRefreshingJobId(null);
+      })
+      .catch(() => setRefreshingJobId(null));
+    return () => { cancelled = true; };
+  }, [expandedJobId]);
+
+  const fetchDescription = (id) => {
+    if (descCache[id]) return;
+    setDescCache(prev => ({ ...prev, [id]: { loading: true } }));
+    fetch('/api/job-description/' + id)
+      .then(r => r.json())
+      .then(data => setDescCache(prev => ({ ...prev, [id]: { html: data.formatted || '', text: data.description || 'No description available.' } })))
+      .catch(() => setDescCache(prev => ({ ...prev, [id]: { error: true } })));
+  };
+
+  const fetchCompanyInfo = (companyName) => {
+    const key = companyName.trim().toLowerCase();
+    if (companyCache[key]) return;
+    setCompanyCache(prev => ({ ...prev, [key]: { loading: true } }));
+    fetch('/api/company-info/' + encodeURIComponent(companyName))
+      .then(r => r.json())
+      .then(data => setCompanyCache(prev => ({ ...prev, [key]: data })))
+      .catch(() => setCompanyCache(prev => ({ ...prev, [key]: { error: true } })));
+  };
+
+  const batchJobs = useMemo(() => jobs.filter(j => (j.import_date || 'Unknown') === batchDate), [jobs, batchDate]);
+
+  const tierCounts = useMemo(() => {
+    const c = { all: batchJobs.length, 'Strong Match': 0, 'Match': 0, 'Weak Match': 0 };
+    batchJobs.forEach(j => { if (c[j.tier] !== undefined) c[j.tier]++; });
+    return c;
+  }, [batchJobs]);
+
+  const statusCounts = useMemo(() => {
+    const c = {};
+    batchJobs.forEach(j => { const s = j.status || 'New'; c[s] = (c[s] || 0) + 1; });
+    return c;
+  }, [batchJobs]);
+
+  const filtered = useMemo(() => {
+    let result = batchJobs;
+    if (tierFilter !== 'all') result = result.filter(j => j.tier === tierFilter);
+    if (statusFilter !== 'all') result = result.filter(j => (j.status || 'New') === statusFilter);
+    if (searchTerm.length >= 2) {
+      const term = searchTerm.toLowerCase();
+      result = result.filter(j => j.company.toLowerCase().includes(term) || j.title.toLowerCase().includes(term));
+    }
+    result = [...result].sort((a, b) => {
+      let av, bv;
+      if (sortBy === 'score') { av = a.score; bv = b.score; }
+      else if (sortBy === 'company') { av = a.company.toLowerCase(); bv = b.company.toLowerCase(); }
+      else if (sortBy === 'title') { av = a.title.toLowerCase(); bv = b.title.toLowerCase(); }
+      else if (sortBy === 'tier') { const order = { 'Strong Match': 0, 'Match': 1, 'Weak Match': 2 }; av = order[a.tier]; bv = order[b.tier]; }
+      else if (sortBy === 'status') { av = (a.status || 'New').toLowerCase(); bv = (b.status || 'New').toLowerCase(); }
+      else if (sortBy === 'salary') { av = a.salary || ''; bv = b.salary || ''; }
+      else { av = a.score; bv = b.score; }
+      if (av < bv) return sortDir === 'asc' ? -1 : 1;
+      if (av > bv) return sortDir === 'asc' ? 1 : -1;
+      return 0;
+    });
+    return result;
+  }, [batchJobs, tierFilter, statusFilter, searchTerm, sortBy, sortDir]);
+
+  const toggleSort = (col) => {
+    if (sortBy === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortBy(col); setSortDir(col === 'company' || col === 'title' ? 'asc' : 'desc'); }
+  };
+
+  const sortArrow = (col) => sortBy === col ? (sortDir === 'asc' ? ' \u25B2' : ' \u25BC') : '';
+
+  const topCompanies = useMemo(() => {
+    const counts = {};
+    batchJobs.forEach(j => { counts[j.company] = (counts[j.company] || 0) + 1; });
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 10);
+  }, [batchJobs]);
+
+  return (
+    <div className="p-6">
+      {/* Header */}
+      <div className="flex items-center gap-4 mb-4">
+        <button onClick={onBack} className="px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-sm font-medium hover:bg-gray-200 border">
+          &larr; Back to Stats
+        </button>
+        <div>
+          <h2 className="text-xl font-bold text-gray-900">Batch: {batchDate}</h2>
+          <p className="text-sm text-gray-500">{batchJobs.length} jobs total</p>
+        </div>
+      </div>
+
+      {/* Summary cards */}
+      <div className="grid grid-cols-4 gap-3 mb-4">
+        <div className="bg-white border rounded-lg p-3 text-center">
+          <p className="text-2xl font-bold text-gray-900">{tierCounts.all}</p>
+          <p className="text-xs text-gray-500">Total Jobs</p>
+        </div>
+        <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-center">
+          <p className="text-2xl font-bold text-green-700">{tierCounts['Strong Match']}</p>
+          <p className="text-xs text-green-600">Strong Match</p>
+        </div>
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-center">
+          <p className="text-2xl font-bold text-blue-700">{tierCounts['Match']}</p>
+          <p className="text-xs text-blue-600">Match</p>
+        </div>
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-center">
+          <p className="text-2xl font-bold text-yellow-700">{tierCounts['Weak Match']}</p>
+          <p className="text-xs text-yellow-600">Weak Match</p>
+        </div>
+      </div>
+
+      {/* Top companies bar */}
+      {topCompanies.length > 0 && (
+        <div className="bg-white border rounded-lg p-4 mb-4">
+          <h3 className="text-sm font-semibold text-gray-700 mb-2">Top Companies in This Batch</h3>
+          <div className="flex gap-2 flex-wrap">
+            {topCompanies.map(([name, count]) => (
+              <span key={name} className="px-2 py-1 bg-gray-100 rounded text-xs text-gray-700 font-medium">{name} ({count})</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Filters row */}
+      <div className="bg-white border rounded-lg p-4 mb-4">
+        <div className="flex gap-3 flex-wrap items-center">
+          <input
+            type="text" placeholder="Search company or title..."
+            value={searchTerm} onChange={e => setSearchTerm(e.target.value)}
+            className="px-3 py-1.5 border rounded text-sm w-64"
+          />
+          <div className="flex gap-1 items-center">
+            <span className="text-xs text-gray-500 mr-1">Tier:</span>
+            {[{ key: 'all', label: 'All' }, { key: 'Strong Match', label: 'Strong' }, { key: 'Match', label: 'Match' }, { key: 'Weak Match', label: 'Weak' }].map(f => (
+              <button key={f.key}
+                onClick={() => setTierFilter(f.key)}
+                className={"px-2 py-0.5 rounded text-xs font-medium " + (tierFilter === f.key ? "bg-blue-600 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200")}>
+                {f.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex gap-1 items-center">
+            <span className="text-xs text-gray-500 mr-1">Status:</span>
+            <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
+              className="px-2 py-1 border rounded text-xs">
+              <option value="all">All Statuses</option>
+              {Object.entries(statusCounts).sort((a,b) => b[1]-a[1]).map(([s, c]) => (
+                <option key={s} value={s}>{s} ({c})</option>
+              ))}
+            </select>
+          </div>
+          <span className="text-xs text-gray-400 ml-auto">{filtered.length} of {batchJobs.length} shown</span>
+        </div>
+      </div>
+
+      {/* Job table */}
+      <div className="bg-white border rounded-lg overflow-hidden">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="bg-gray-50 border-b text-left text-xs text-gray-500">
+              <th className="py-2 px-3 cursor-pointer hover:text-gray-800" onClick={() => toggleSort('score')}>Score{sortArrow('score')}</th>
+              <th className="py-2 px-3 cursor-pointer hover:text-gray-800" onClick={() => toggleSort('tier')}>Tier{sortArrow('tier')}</th>
+              <th className="py-2 px-3 cursor-pointer hover:text-gray-800" onClick={() => toggleSort('company')}>Company{sortArrow('company')}</th>
+              <th className="py-2 px-3 cursor-pointer hover:text-gray-800" onClick={() => toggleSort('title')}>Title{sortArrow('title')}</th>
+              <th className="py-2 px-3 cursor-pointer hover:text-gray-800" onClick={() => toggleSort('salary')}>Salary{sortArrow('salary')}</th>
+              <th className="py-2 px-3 cursor-pointer hover:text-gray-800" onClick={() => toggleSort('status')}>Status{sortArrow('status')}</th>
+              <th className="py-2 px-3">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(j => {
+              const tc = j.tier === 'Strong Match' ? 'text-green-700 bg-green-50' :
+                         j.tier === 'Match' ? 'text-blue-700 bg-blue-50' : 'text-yellow-700 bg-yellow-50';
+              const isExpanded = expandedJobId === j.id;
+              return (
+                <React.Fragment key={j.id}>
+                  <tr className={"border-b cursor-pointer " + (isExpanded ? "bg-blue-50" : "hover:bg-gray-50")}
+                      onClick={() => { if (!isExpanded) { fetchDescription(j.id); fetchCompanyInfo(j.company); } setExpandedJobId(isExpanded ? null : j.id); }}>
+                    <td className="py-2 px-3 font-bold text-gray-700">{j.score}</td>
+                    <td className="py-2 px-3">
+                      <span className={"px-1.5 py-0.5 rounded text-xs font-medium " + tc}>
+                        {j.tier === 'Strong Match' ? 'Strong' : j.tier === 'Match' ? 'Match' : 'Weak'}
+                      </span>
+                    </td>
+                    <td className="py-2 px-3 font-medium text-gray-800 truncate" style={{maxWidth: '180px'}} title={j.company}>{j.company}</td>
+                    <td className="py-2 px-3 text-gray-600 truncate" style={{maxWidth: '250px'}} title={j.title}>{j.title}</td>
+                    <td className="py-2 px-3 text-gray-600 text-xs">{j.salary !== 'N/A' ? j.salary : ''}</td>
+                    <td className="py-2 px-3">
+                      <select value={j.status || 'New'}
+                        onClick={e => e.stopPropagation()}
+                        onChange={e => { e.stopPropagation(); window._changeStatus && window._changeStatus(j.id, e.target.value); }}
+                        className="text-xs border rounded px-1 py-0.5 bg-white cursor-pointer">
+                        {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+                      </select>
+                    </td>
+                    <td className="py-2 px-3">
+                      <div className="flex gap-1">
+                        <button onClick={e => { e.stopPropagation(); window._showJobDetail && window._showJobDetail(j.id); }}
+                          className="px-2 py-0.5 bg-purple-600 text-white rounded text-xs hover:bg-purple-700" title="Edit Details">Edit</button>
+                        <button onClick={e => { e.stopPropagation(); window._toggleFavorite && window._toggleFavorite(j.id); }}
+                          className="text-sm" title={j.favorited ? 'Unfavorite' : 'Favorite'}>{j.favorited ? '\u2605' : '\u2606'}</button>
+                      </div>
+                    </td>
+                  </tr>
+                  {isExpanded && (
+                    <tr>
+                      <td colSpan="7" className="p-0">
+                        <div className="bg-white border-t border-b border-blue-100 p-4">
+                          <div className="flex justify-between items-start mb-3">
+                            <div>
+                              <h4 className="font-bold text-gray-900">{j.company}</h4>
+                              <p className="text-sm text-gray-600">{j.title}</p>
+                              <div className="flex items-center gap-3 mt-1 text-xs text-gray-500">
+                                {j.location && <span>{j.location}</span>}
+                                {j.work_type && <span>{j.work_type}</span>}
+                                {j.posted_date && <span>Posted: {j.posted_date}</span>}
+                                {j.applicants && <span>Applicants: {j.applicants}{refreshingJobId === j.id && <span className="ml-1 animate-pulse">updating...</span>}</span>}
+                              </div>
+                            </div>
+                            <button onClick={(e) => { e.stopPropagation(); setExpandedJobId(null); }}
+                              className="text-gray-400 hover:text-gray-600 text-lg">&times;</button>
+                          </div>
+                          {/* Description + Company Info */}
+                          <div className="flex gap-4 mb-3">
+                            <div className="flex-1 min-w-0">
+                              {(() => {
+                                const desc = descCache[j.id];
+                                if (!desc) return null;
+                                return (
+                                  <div>
+                                    <span className="text-xs text-gray-400 block mb-1">Description</span>
+                                    {desc.loading ? (
+                                      <p className="text-xs text-gray-400">Loading...</p>
+                                    ) : desc.error ? (
+                                      <p className="text-xs text-red-400">Failed to load description.</p>
+                                    ) : desc.html ? (
+                                      <div className="bg-gray-50 border rounded p-3 max-h-96 overflow-auto max-w-3xl text-xs"
+                                        dangerouslySetInnerHTML={{ __html: desc.html }} />
+                                    ) : (
+                                      <div className="text-xs text-gray-700 bg-gray-50 border rounded p-2 max-h-96 overflow-auto whitespace-pre-wrap max-w-3xl">{desc.text}</div>
+                                    )}
+                                  </div>
+                                );
+                              })()}
+                            </div>
+                            {(() => {
+                              const key = j.company.trim().toLowerCase();
+                              const info = companyCache[key];
+                              if (!info) return null;
+                              if (info.loading) return (
+                                <div className="w-72 flex-shrink-0">
+                                  <span className="text-xs text-gray-400 block mb-1">Company</span>
+                                  <div className="bg-gray-50 border rounded p-3 text-xs text-gray-400">Loading...</div>
+                                </div>
+                              );
+                              if (info.error || !info.summary) return null;
+                              return (
+                                <div className="w-72 flex-shrink-0">
+                                  <span className="text-xs text-gray-400 block mb-1">Company</span>
+                                  <div className="bg-gray-50 border rounded p-3">
+                                    {info.logo_url && <img src={info.logo_url} alt="" className="h-8 mb-2 object-contain"
+                                      onError={e => { e.target.style.display = 'none'; }} />}
+                                    <p className="text-xs font-semibold text-gray-800">{j.company}</p>
+                                    {info.industry && <p className="text-xs text-gray-500">{info.industry}</p>}
+                                    {info.known_for && <p className="text-xs text-gray-700 mt-1">{info.known_for}</p>}
+                                    {info.summary && info.summary !== info.known_for && (
+                                      <details className="mt-1">
+                                        <summary className="text-xs text-blue-500 cursor-pointer">More about {j.company}</summary>
+                                        <p className="text-xs text-gray-600 mt-1 leading-relaxed">{info.summary.slice(info.known_for.length).trim()}</p>
+                                      </details>
+                                    )}
+                                    {info.website && (
+                                      <a href={'https://' + info.website} target="_blank" rel="noopener"
+                                        onClick={e => e.stopPropagation()}
+                                        className="text-xs text-blue-500 hover:underline mt-2 block">{info.website}</a>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })()}
+                          </div>
+                          {/* Action buttons */}
+                          <div className="flex gap-2 flex-wrap items-center">
+                            {j.apply_link && (
+                              <a href={j.apply_link} target="_blank" rel="noopener" onClick={e => e.stopPropagation()}
+                                className="px-2.5 py-1 bg-blue-600 text-white rounded text-xs font-medium hover:bg-blue-700">Apply</a>
+                            )}
+                            {j.job_link && (
+                              <a href={j.job_link} target="_blank" rel="noopener" onClick={e => e.stopPropagation()}
+                                className="px-2.5 py-1 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">LinkedIn Posting</a>
+                            )}
+                            {j.resume_path && (
+                              <button onClick={e => { e.stopPropagation(); window._showResume && window._showResume(j.resume_path, j.company, j.title); }}
+                                className="px-2.5 py-1 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">View Resume</button>
+                            )}
+                            {j.pdf_path && (
+                              <a href={'/' + j.pdf_path} target="_blank" rel="noopener" onClick={e => e.stopPropagation()}
+                                className="px-2.5 py-1 bg-green-600 text-white rounded text-xs font-medium hover:bg-green-700">View PDF Resume</a>
+                            )}
+                            <button onClick={e => {
+                                e.stopPropagation();
+                                navigator.clipboard.writeText(LINKEDIN_PROFILE).then(() => {
+                                  e.target.textContent = 'Copied!';
+                                  setTimeout(() => { e.target.textContent = 'Copy My LinkedIn'; }, 1500);
+                                });
+                              }}
+                              className="px-2.5 py-1 bg-blue-100 text-blue-700 rounded text-xs font-medium hover:bg-blue-200 border border-blue-200">Copy My LinkedIn</button>
+                            {(() => {
+                              const plans = window._getPlans ? window._getPlans() : [];
+                              if (!plans.length) return null;
+                              const currentPlan = plans.find(p => p.jobs.some(pj => pj.id === j.id));
+                              return (
+                                <select value={currentPlan ? currentPlan.id : ""} onClick={e => e.stopPropagation()}
+                                  onChange={e => {
+                                    e.stopPropagation();
+                                    if (e.target.value) {
+                                      window._addJobToPlan && window._addJobToPlan(e.target.value, j);
+                                    } else if (window._syncAppPlans && window._getPlans) {
+                                      const updated = window._getPlans().map(p => ({ ...p, jobs: p.jobs.filter(pj => pj.id !== j.id) }));
+                                      window._syncAppPlans(updated);
+                                      fetch('/api/plans', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(updated) });
+                                    }
+                                  }}
+                                  className={"px-2.5 py-1 rounded text-xs font-medium border cursor-pointer " + (currentPlan ? "bg-green-100 text-green-700 border-green-300" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}>
+                                  <option value="">Add to Plan...</option>
+                                  {plans.map(p => {
+                                    const already = p.jobs.some(pj => pj.id === j.id);
+                                    return <option key={p.id} value={p.id} >{p.title}{already ? ' ✓' : ''}</option>;
+                                  })}
+                                </select>
+                              );
+                            })()}
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+        {filtered.length === 0 && (
+          <div className="p-8 text-center text-gray-400 text-sm">No jobs match the current filters.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [jobs, setJobs] = useState(() => initJobs(null));
+  const [view, setView, batchDetailDate, setHashBatchDate, selectedId, setHashJobId] = useHashRoute();
+  const [loaded, setLoaded] = useState(!IS_SERVED);
+  const [filters, setFilters] = useState({
+    tiers: [], statuses: [], search: "", favoritesOnly: false
+  });
+  const [sortBy, setSortBy] = useState("score");
+  const [sortDir, setSortDir] = useState("desc");
+
+  // Wrappers that update both state and hash
+  const setBatchDetailDate = useCallback((date) => {
+    if (date) {
+      setHashBatchDate(date);
+      window.location.hash = '#/batch/' + encodeURIComponent(date);
+    } else {
+      setHashBatchDate(null);
+      window.location.hash = '#/stats';
+    }
+  }, []);
+
+  const setSelectedId = useCallback((id) => {
+    if (id) {
+      setHashJobId(id);
+      window.location.hash = '#/job/' + id;
+    } else {
+      setHashJobId(null);
+      window.location.hash = '#/jobs';
+    }
+  }, []);
+
+  const [updateStatus, setUpdateStatus] = useState(null);
+  const [liveCheckStatus, setLiveCheckStatus] = useState(null);
+  const [liveCheckBatch, setLiveCheckBatch] = useState("all");
+  const [showScrape, setShowScrape] = useState(false);
+  const [scrapeUrl, setScrapeUrl] = useState('');
+  const [scrapeCompany, setScrapeCompany] = useState('');
+  const [scrapeStatus, setScrapeStatus] = useState(null);
+
+  const startScrape = useCallback(() => {
+    if (!scrapeUrl.trim()) return;
+    fetch('/api/scrape-careers', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ url: scrapeUrl.trim(), company: scrapeCompany.trim() || undefined }),
+    }).then(r => r.json()).then(() => {
+      setScrapeStatus({ running: true, message: 'Starting...' });
+      const poll = setInterval(() => {
+        fetch('/api/scrape-status').then(r => r.json()).then(s => {
+          setScrapeStatus(s);
+          if (!s.running) clearInterval(poll);
+        });
+      }, 2000);
+    });
+  }, [scrapeUrl, scrapeCompany]);
+
+  const startApplicantUpdate = useCallback(async () => {
+    try {
+      const res = await fetch("/api/run-update-applicants", { method: "POST" });
+      const data = await res.json();
+      if (data.ok) {
+        setUpdateStatus({ running: true, progress: 0, total: 0, updated: 0, message: "Starting..." });
+        // Poll for progress and update table in real time
+        const poll = setInterval(async () => {
+          try {
+            const [statusRes, stateRes] = await Promise.all([
+              fetch("/api/update-status"),
+              fetch("/api/state"),
+            ]);
+            const s = await statusRes.json();
+            const serverState = await stateRes.json();
+            setUpdateStatus(s);
+            // Merge latest applicant counts into displayed jobs
+            setJobs(prev => prev.map(j => {
+              const saved = serverState[j.id];
+              if (saved?.applicants && saved.applicants !== j.applicants) {
+                return { ...j, applicants: saved.applicants };
+              }
+              return j;
+            }));
+            if (!s.running) {
+              clearInterval(poll);
+            }
+          } catch { clearInterval(poll); }
+        }, 3000);
+      }
+    } catch (e) {
+      setUpdateStatus({ running: false, message: "Error: " + e.message });
+    }
+  }, []);
+
+  const startLiveCheck = useCallback(async () => {
+    try {
+      const body = liveCheckBatch === "all" ? {} : { batch: liveCheckBatch };
+      const res = await fetch("/api/run-live-check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setLiveCheckStatus({ running: true, progress: 0, total: 0, closed: 0, live: 0, auto_updated: 0, message: "Starting..." });
+        const poll = setInterval(async () => {
+          try {
+            const [statusRes, stateRes] = await Promise.all([
+              fetch("/api/live-check-status"),
+              fetch("/api/state"),
+            ]);
+            const s = await statusRes.json();
+            const serverState = await stateRes.json();
+            setLiveCheckStatus(s);
+            setJobs(prev => prev.map(j => {
+              const saved = serverState[j.id];
+              if (saved) {
+                const updates = {};
+                if (saved.live_status && saved.live_status !== j.live_status) updates.live_status = saved.live_status;
+                if (saved.live_status_checked) updates.live_status_checked = saved.live_status_checked;
+                if (saved.status && saved.status !== j.status) updates.status = saved.status;
+                if (Object.keys(updates).length > 0) return { ...j, ...updates };
+              }
+              return j;
+            }));
+            if (!s.running) clearInterval(poll);
+          } catch { clearInterval(poll); }
+        }, 3000);
+      }
+    } catch (e) {
+      setLiveCheckStatus({ running: false, message: "Error: " + e.message });
+    }
+  }, [liveCheckBatch]);
+
+  // Load server state on mount
+  useEffect(() => {
+    if (IS_SERVED) {
+      fetchServerState().then(serverState => {
+        setJobs(initJobs(serverState));
+        setLoaded(true);
+      });
+    }
+  }, []);
+
+  const updateJob = useCallback((id, updates) => {
+    setJobs(prev => prev.map(j => {
+      if (j.id !== id) return j;
+      const updated = { ...j, ...updates };
+      saveJobState(id, {
+        status: updated.status,
+        notes: updated.notes,
+        timestamps: updated.timestamps,
+        favorited: updated.favorited,
+        pdf_path: updated.pdf_path,
+      });
+      return updated;
+    }));
+  }, []);
+
+  const changeStatus = useCallback((id, newStatus) => {
+    setJobs(prev => prev.map(j => {
+      if (j.id !== id) return j;
+      const ts = { ...j.timestamps, [newStatus]: Date.now() };
+      const updated = { ...j, status: newStatus, timestamps: ts };
+      saveJobState(id, { status: updated.status, notes: updated.notes, timestamps: ts, favorited: updated.favorited, pdf_path: updated.pdf_path, live_status: updated.live_status, live_status_checked: updated.live_status_checked });
+      return updated;
+    }));
+  }, []);
+
+  const toggleFavorite = useCallback((id, e) => {
+    if (e) e.stopPropagation();
+    setJobs(prev => prev.map(j => {
+      if (j.id !== id) return j;
+      const updated = { ...j, favorited: !j.favorited };
+      saveJobState(id, { status: updated.status, notes: updated.notes, timestamps: updated.timestamps, favorited: updated.favorited, pdf_path: updated.pdf_path, live_status: updated.live_status, live_status_checked: updated.live_status_checked });
+      return updated;
+    }));
+  }, []);
+
+  const uploadPdfFile = useCallback(async (job, file) => {
+    if (!file || !job.resume_path) return;
+    const resumeDir = job.resume_path.replace(/\/resume\.txt$/, "");
+    const encoded = btoa(resumeDir);
+    try {
+      const res = await fetch("/api/upload-resume/" + encoded, {
+        method: "POST",
+        body: file,
+      });
+      const result = await res.json();
+      if (result.ok) {
+        const pdfPath = result.path;
+        setJobs(prev => prev.map(j => {
+          if (j.id !== job.id) return j;
+          const updated = { ...j, pdf_path: pdfPath };
+          saveJobState(j.id, { status: j.status, notes: j.notes, timestamps: j.timestamps, favorited: j.favorited, pdf_path: pdfPath });
+          return updated;
+        }));
+      }
+    } catch (err) {
+      console.error("Upload failed:", err);
+    }
+  }, []);
+
+  const handlePdfUpload = useCallback((job, e) => {
+    const file = e.target.files[0];
+    uploadPdfFile(job, file);
+    e.target.value = "";
+  }, [uploadPdfFile]);
+
+  // Expose globally so StatsPanel batch detail and JobDetailModal can use them
+  useEffect(() => {
+    window._uploadPdf = uploadPdfFile;
+    window._changeStatus = changeStatus;
+    window._updateJob = updateJob;
+    window._toggleFavorite = toggleFavorite;
+    window._handlePdfUpload = handlePdfUpload;
+    window._getJobById = (id) => jobs.find(j => j.id === id) || null;
+    return () => {
+      delete window._uploadPdf;
+      delete window._changeStatus;
+      delete window._updateJob;
+      delete window._toggleFavorite;
+      delete window._handlePdfUpload;
+      delete window._getJobById;
+    };
+  }, [uploadPdfFile, changeStatus, updateJob, toggleFavorite, handlePdfUpload, jobs]);
+
+  // Plans state lifted to App so _getPlans / _addJobToPlan are available on all tabs
+  const [appPlans, setAppPlans] = useState([]);
+  useEffect(() => {
+    fetch('/api/plans').then(r => r.json()).then(data => {
+      if (Array.isArray(data)) setAppPlans(data);
+    }).catch(() => {});
+  }, []);
+
+  const saveAppPlans = useCallback((updated) => {
+    setAppPlans(updated);
+    fetch('/api/plans', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(updated),
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    window._getPlans = () => appPlans;
+    window._addJobToPlan = (planId, job) => {
+      const plan = appPlans.find(p => p.id === planId);
+      if (!plan) return;
+      if (plan.jobs.some(j => j.id === job.id)) return;
+      // Remove from any other plan first (job can only be in one plan)
+      let updated = appPlans.map(p => ({
+        ...p,
+        jobs: p.jobs.filter(j => j.id !== job.id),
+      }));
+      // Add to the target plan
+      updated = updated.map(p => p.id === planId
+        ? { ...p, jobs: [...p.jobs, { id: job.id, company: job.company, title: job.title, notes: '' }] }
+        : p
+      );
+      saveAppPlans(updated);
+    };
+    window._syncAppPlans = (updated) => setAppPlans(updated);
+    window._openBatchDetail = (date) => setBatchDetailDate(date);
+    return () => { delete window._getPlans; delete window._addJobToPlan; delete window._syncAppPlans; delete window._openBatchDetail; };
+  }, [appPlans, saveAppPlans]);
+
+  const favCount = useMemo(() => jobs.filter(j => j.favorited).length, [jobs]);
+
+  const filtered = useMemo(() => {
+    let result = jobs;
+    if (filters.favoritesOnly)
+      result = result.filter(j => j.favorited);
+    if (filters.tiers.length > 0)
+      result = result.filter(j => filters.tiers.includes(j.tier));
+    if (filters.statuses.length > 0)
+      result = result.filter(j => filters.statuses.includes(j.status));
+    if (filters.search) {
+      const s = filters.search.toLowerCase();
+      result = result.filter(j =>
+        j.company.toLowerCase().includes(s) || j.title.toLowerCase().includes(s) || j.id.toLowerCase().includes(s)
+      );
+    }
+    result = [...result].sort((a, b) => {
+      let v = 0;
+      if (sortBy === "score") v = a.score - b.score;
+      else if (sortBy === "company") v = a.company.localeCompare(b.company);
+      else if (sortBy === "salary") v = (a.salary || "").localeCompare(b.salary || "");
+      else if (sortBy === "status") v = STATUSES.indexOf(a.status) - STATUSES.indexOf(b.status);
+      else if (sortBy === "tier") {
+        const order = {"Strong Match": 0, "Match": 1, "Weak Match": 2};
+        v = order[a.tier] - order[b.tier];
+      }
+      else if (sortBy === "applicants") {
+        const parseNum = s => { const m = (s || "").match(/(\d+)/); return m ? parseInt(m[1]) : 0; };
+        v = parseNum(a.applicants) - parseNum(b.applicants);
+      }
+      return sortDir === "desc" ? -v : v;
+    });
+    return result;
+  }, [jobs, filters, sortBy, sortDir]);
+
+  const metrics = useMemo(() => calcMetrics(jobs), [jobs]);
+  const selectedJob = jobs.find(j => j.id === selectedId);
+
+  // Auto-refresh job data when selected
+  const [refreshingJob, setRefreshingJob] = useState(false);
+  useEffect(() => {
+    if (!selectedId || !IS_SERVED) return;
+    let cancelled = false;
+    setRefreshingJob(true);
+    fetch("/api/refresh-job/" + selectedId)
+      .then(r => r.json())
+      .then(data => {
+        if (cancelled || data.error) { setRefreshingJob(false); return; }
+        setJobs(prev => prev.map(j => {
+          if (j.id !== selectedId) return j;
+          const updates = {};
+          if (data.applicants && data.applicants !== j.applicants) updates.applicants = data.applicants;
+          if (data.live_status) updates.live_status = data.live_status;
+          if (data.live_status_checked) updates.live_status_checked = data.live_status_checked;
+          if (data.status && data.status !== j.status) updates.status = data.status;
+          return Object.keys(updates).length > 0 ? { ...j, ...updates } : j;
+        }));
+        setRefreshingJob(false);
+      })
+      .catch(() => setRefreshingJob(false));
+    return () => { cancelled = true; };
+  }, [selectedId]);
+
+  const toggleFilter = (key, value) => {
+    setFilters(prev => {
+      const arr = prev[key];
+      const next = arr.includes(value) ? arr.filter(v => v !== value) : [...arr, value];
+      return { ...prev, [key]: next };
+    });
+  };
+
+  const handleSort = (col) => {
+    if (sortBy === col) setSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setSortBy(col); setSortDir("desc"); }
+  };
+
+  const SortIcon = ({col}) => {
+    if (sortBy !== col) return <span className="text-gray-300 ml-1">↕</span>;
+    return <span className="ml-1">{sortDir === "desc" ? "↓" : "↑"}</span>;
+  };
+
+  return (
+    <div className="min-h-screen">
+      {/* Header */}
+      <div className="bg-white border-b px-6 py-4 flex items-center justify-between">
+        <div>
+          <div className="flex items-center gap-3">
+          <h1 className="text-xl font-bold text-gray-900">Job Search Dashboard</h1>
+          <div className="flex rounded-lg border overflow-hidden text-xs font-medium">
+            <button
+              onClick={() => setView("jobs")}
+              className={"px-3 py-1.5 " + (view === "jobs" ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50")}
+            >Jobs</button>
+            <button
+              onClick={() => setView("stats")}
+              className={"px-3 py-1.5 border-l " + (view === "stats" ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50")}
+            >&#128202; Stats</button>
+            <button
+              onClick={() => setView("pipeline")}
+              className={"px-3 py-1.5 border-l " + (view === "pipeline" ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50")}
+            >&#9654; Pipeline</button>
+            <button
+              onClick={() => setView("sankey")}
+              className={"px-3 py-1.5 border-l " + (view === "sankey" ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50")}
+            >&#128256; Sankey</button>
+            <button
+              onClick={() => setView("plans")}
+              className={"px-3 py-1.5 border-l " + (view === "plans" ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50")}
+            >&#128203; Plans</button>
+          </div>
+        </div>
+          <p className="text-sm text-gray-500">{metrics.total} positions | {metrics.applied} applied</p>
+        </div>
+        <div className="flex gap-4 text-sm items-center">
+          {["Strong Match", "Match", "Weak Match"].map(t => (
+            <span key={t} className={"px-2 py-1 rounded text-xs font-medium " + TIER_COLORS[t]}>
+              {t}: {metrics.byTier[t]}
+            </span>
+          ))}
+          {IS_SERVED && (
+            updateStatus?.running ? (
+              <span className="ml-2 text-xs text-gray-500">
+                Updating applicants: {updateStatus.progress}/{updateStatus.total} ({updateStatus.updated} done)
+              </span>
+            ) : (
+              <>
+              <button
+                onClick={startApplicantUpdate}
+                className="ml-2 px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border"
+              >
+                Update Applicants
+              </button>
+              <button
+                onClick={() => setShowScrape(!showScrape)}
+                className={"ml-2 px-3 py-1.5 rounded text-xs font-medium border " + (showScrape ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}
+              >
+                &#128279; Import URL
+              </button>
+              </>
+            )
+          )}
+          {updateStatus && !updateStatus.running && updateStatus.message && (
+            <span className="ml-2 text-xs text-green-600">{updateStatus.message}</span>
+          )}
+          {IS_SERVED && (
+            liveCheckStatus?.running ? (
+              <span className="ml-2 text-xs text-gray-500">
+                Checking live: {liveCheckStatus.progress}/{liveCheckStatus.total} ({liveCheckStatus.closed} closed, {liveCheckStatus.auto_updated} auto-updated)
+              </span>
+            ) : (
+              <span className="ml-2 inline-flex items-center gap-1">
+                <select
+                  value={liveCheckBatch}
+                  onChange={e => setLiveCheckBatch(e.target.value)}
+                  className="px-2 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium border"
+                >
+                  <option value="all">All Batches</option>
+                  {[...BATCH_STATS].sort((a, b) => b.date.localeCompare(a.date)).map(b => (
+                    <option key={b.date} value={b.date}>{b.date} ({b.total})</option>
+                  ))}
+                </select>
+                <button
+                  onClick={startLiveCheck}
+                  className="px-3 py-1.5 bg-orange-100 text-orange-700 rounded text-xs font-medium hover:bg-orange-200 border border-orange-300"
+                >
+                  Check Live Status
+                </button>
+              </span>
+            )
+          )}
+          {liveCheckStatus && !liveCheckStatus.running && liveCheckStatus.message && (
+            <span className="ml-2 text-xs text-green-600">{liveCheckStatus.message}</span>
+          )}
+        </div>
+      </div>
+
+      {showScrape && (
+        <div className="bg-indigo-50 border-b border-indigo-200 px-6 py-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className="text-sm font-medium text-indigo-700">Import from URL:</span>
+            <input
+              type="text"
+              placeholder="https://careers.company.com/jobs"
+              value={scrapeUrl}
+              onChange={e => setScrapeUrl(e.target.value)}
+              className="flex-1 min-w-64 px-3 py-1.5 border border-indigo-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+            />
+            <input
+              type="text"
+              placeholder="Company name (optional)"
+              value={scrapeCompany}
+              onChange={e => setScrapeCompany(e.target.value)}
+              className="w-48 px-3 py-1.5 border border-indigo-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+            />
+            <button
+              onClick={startScrape}
+              disabled={!scrapeUrl.trim() || (scrapeStatus && scrapeStatus.running)}
+              className="px-4 py-1.5 bg-indigo-600 text-white rounded text-sm font-medium hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {scrapeStatus && scrapeStatus.running ? 'Scraping...' : 'Scrape & Import'}
+            </button>
+          </div>
+          {scrapeStatus && (
+            <div className="mt-2">
+              <div className="flex items-center gap-2">
+                {scrapeStatus.running && (
+                  <div className="w-3 h-3 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+                )}
+                <span className={"text-xs " + (scrapeStatus.running ? "text-indigo-600" : scrapeStatus.message.startsWith("Error") ? "text-red-600" : "text-green-600")}>
+                  {scrapeStatus.message}
+                </span>
+                {scrapeStatus.running && scrapeStatus.total > 0 && (
+                  <span className="text-xs text-gray-500">({scrapeStatus.progress}/{scrapeStatus.total})</span>
+                )}
+              </div>
+              {!scrapeStatus.running && scrapeStatus.jobs_found && scrapeStatus.jobs_found.length > 0 && (
+                <div className="mt-2 max-h-40 overflow-y-auto">
+                  <table className="text-xs w-full">
+                    <thead><tr className="text-gray-500 border-b">
+                      <th className="text-left py-1 pr-2">Title</th>
+                      <th className="text-left py-1 px-2">Tier</th>
+                      <th className="text-right py-1 px-2">Score</th>
+                      <th className="text-left py-1 pl-2">Location</th>
+                    </tr></thead>
+                    <tbody>
+                      {scrapeStatus.jobs_found.map((j, i) => (
+                        <tr key={i} className="border-b border-gray-100">
+                          <td className="py-1 pr-2 text-gray-700">{j.title}</td>
+                          <td className="py-1 px-2"><span className={"px-1.5 py-0.5 rounded text-xs font-medium " +
+                            (j.tier === 'Strong Match' ? 'bg-green-100 text-green-700' :
+                             j.tier === 'Match' ? 'bg-blue-100 text-blue-700' : 'bg-yellow-100 text-yellow-700')
+                          }>{j.tier}</span></td>
+                          <td className="py-1 px-2 text-right text-gray-600">{j.score}</td>
+                          <td className="py-1 pl-2 text-gray-500">{j.location}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {!scrapeStatus.running && scrapeStatus.added > 0 && (
+                <button
+                  onClick={() => window.location.reload()}
+                  className="mt-2 px-3 py-1 bg-green-600 text-white rounded text-xs font-medium hover:bg-green-700"
+                >
+                  Reload Dashboard
+                </button>
+              )}
+            </div>
+          )}
+          <p className="text-xs text-indigo-400 mt-1">Works with Greenhouse, Lever, Ashby, and static career pages. JS-rendered pages (Workday, Eightfold) need the console script.</p>
+        </div>
+      )}
+
+      {batchDetailDate ? <BatchDetailView jobs={jobs} batchDate={batchDetailDate} onBack={() => setBatchDetailDate(null)} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "stats" ? <StatsPanel jobs={jobs} /> : view === "pipeline" ? <PipelineView jobs={jobs} changeStatus={changeStatus} /> : view === "sankey" ? <SankeyView jobs={jobs} /> : view === "plans" ? <PlansView jobs={jobs} /> : <>
+      {/* Metrics Bar */}
+      <div className="bg-white border-b px-6 py-3 flex gap-3 flex-wrap">
+        {STATUSES.filter(s => metrics.byStatus[s] > 0 || s === "Applied").map(s => (
+          <span key={s} className={"px-2 py-1 rounded text-xs font-medium " + (STATUS_COLORS[s] || "")}>
+            {s}: {metrics.byStatus[s]}
+          </span>
+        ))}
+        {Object.keys(metrics.transitions).length > 0 && (
+          <span className="text-xs text-gray-400 ml-4">
+            {Object.entries(metrics.transitions).map(([k,v]) => k + ": " + v + "d avg").join(" | ")}
+          </span>
+        )}
+      </div>
+
+      <div className="flex" style={{height: "calc(100vh - 130px)"}}>
+        {/* Sidebar Filters */}
+        <div className="w-56 bg-white border-r p-4 overflow-y-auto flex-shrink-0">
+          <div className="mb-4">
+            <input
+              type="text"
+              placeholder="Search company, title, or ID..."
+              value={filters.search}
+              onChange={e => setFilters(prev => ({...prev, search: e.target.value}))}
+              className="w-full px-3 py-2 border rounded text-sm"
+            />
+          </div>
+
+          <div className="mb-4">
+            <label className="flex items-center gap-2 text-sm cursor-pointer">
+              <input
+                type="checkbox"
+                checked={filters.favoritesOnly}
+                onChange={() => setFilters(prev => ({...prev, favoritesOnly: !prev.favoritesOnly}))}
+              />
+              <span className="text-yellow-500">&#9733;</span>
+              <span className="font-medium">Shortlist Only</span>
+              {favCount > 0 && <span className="text-xs text-gray-400">({favCount})</span>}
+            </label>
+          </div>
+
+          <div className="mb-4">
+            <h3 className="text-xs font-semibold text-gray-500 uppercase mb-2">Match Tier</h3>
+            {["Strong Match", "Match", "Weak Match"].map(t => (
+              <label key={t} className="flex items-center gap-2 text-sm mb-1 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={filters.tiers.includes(t)}
+                  onChange={() => toggleFilter("tiers", t)}
+                />
+                <span className={"px-1.5 py-0.5 rounded text-xs " + TIER_COLORS[t]}>{t}</span>
+              </label>
+            ))}
+          </div>
+
+          <div className="mb-4">
+            <h3 className="text-xs font-semibold text-gray-500 uppercase mb-2">Status</h3>
+            {STATUSES.map(s => (
+              <label key={s} className="flex items-center gap-2 text-sm mb-1 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={filters.statuses.includes(s)}
+                  onChange={() => toggleFilter("statuses", s)}
+                />
+                {s}
+              </label>
+            ))}
+          </div>
+
+          <button
+            onClick={() => setFilters({tiers: [], statuses: [], search: "", favoritesOnly: false})}
+            className="text-xs text-blue-600 hover:underline"
+          >Clear All Filters</button>
+        </div>
+
+        {/* Main Content */}
+        <div className="flex-1 flex flex-col overflow-hidden">
+          {/* Table */}
+          <div className="flex-1 overflow-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 sticky top-0 z-10">
+                <tr className="border-b">
+                  <th className="px-2 py-2 w-8"></th>
+                  {[
+                    ["company", "Company"],
+                    ["title", "Title"],
+                    ["tier", "Tier"],
+                    ["score", "Score"],
+                    ["salary", "Salary"],
+                    ["status", "Status"],
+                    ["applicants", "Applicants"],
+                    ["posted_date", "Posted"],
+                  ].map(([col, label]) => (
+                    <th
+                      key={col}
+                      onClick={() => handleSort(col)}
+                      className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase cursor-pointer hover:text-gray-700 select-none"
+                    >
+                      {label}<SortIcon col={col} />
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map(j => (
+                  <tr
+                    key={j.id}
+                    onClick={() => setSelectedId(j.id)}
+                    className={"job-row border-b cursor-pointer text-sm " + (selectedId === j.id ? "selected" : "")}
+                  >
+                    <td className="px-2 py-2 text-center" onClick={e => toggleFavorite(j.id, e)}>
+                      <span className={"text-lg " + (j.favorited ? "text-yellow-400" : "text-gray-300 hover:text-yellow-300")} style={{cursor:"pointer"}}>
+                        {j.favorited ? "\u2605" : "\u2606"}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 font-medium text-gray-900 whitespace-nowrap">{j.company}</td>
+                    <td className="px-3 py-2 text-gray-700 max-w-xs truncate">{j.title}</td>
+                    <td className="px-3 py-2">
+                      <span className={"px-1.5 py-0.5 rounded text-xs font-medium " + TIER_COLORS[j.tier]}>
+                        {j.tier === "Strong Match" ? "Strong" : j.tier === "Weak Match" ? "Weak" : "Match"}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 text-gray-600">{j.score}</td>
+                    <td className="px-3 py-2 text-gray-600 whitespace-nowrap">{j.salary !== "N/A" ? j.salary : "-"}</td>
+                    <td className="px-3 py-2">
+                      <span className={"px-2 py-0.5 rounded text-xs font-medium " + (STATUS_COLORS[j.status] || "")}>
+                        {j.status}
+                      </span>
+                      {j.live_status === "closed" && j.status !== "Applied, Closed, No Update" && j.status !== "Position Closed, No Application Submitted" && (
+                        <span className="ml-1 px-1.5 py-0.5 rounded text-xs font-medium bg-red-50 text-red-500 border border-red-200">Closed</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 text-gray-500 text-xs whitespace-nowrap">{j.applicants || "-"}</td>
+                    <td className="px-3 py-2 text-gray-500 text-xs whitespace-nowrap">{j.posted_date || "-"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {filtered.length === 0 && (
+              <div className="text-center py-12 text-gray-400">No jobs match your filters</div>
+            )}
+          </div>
+
+          <div className="text-xs text-gray-400 px-4 py-1 border-t bg-gray-50">
+            Showing {filtered.length} of {jobs.length} positions
+          </div>
+        </div>
+
+        {/* Detail Panel */}
+        {selectedJob && (
+          <div className="w-96 bg-white border-l flex-shrink-0 detail-scroll">
+            <div className="p-4 border-b bg-gray-50">
+              <div className="flex justify-between items-start">
+                <div>
+                  <h2 className="font-bold text-gray-900">{selectedJob.company}</h2>
+                  <p className="text-sm text-gray-600">{selectedJob.title}</p>
+                </div>
+                <button onClick={() => setSelectedId(null)} className="text-gray-400 hover:text-gray-600 text-lg">&times;</button>
+              </div>
+              <div className="flex items-center gap-2 mt-2">
+                <span className={"inline-block px-2 py-0.5 rounded text-xs font-medium " + TIER_COLORS[selectedJob.tier]}>
+                  {selectedJob.tier} (Score: {selectedJob.score})
+                </span>
+                <button
+                  onClick={() => toggleFavorite(selectedJob.id)}
+                  className={"text-lg " + (selectedJob.favorited ? "text-yellow-400" : "text-gray-300 hover:text-yellow-300")}
+                  title={selectedJob.favorited ? "Remove from shortlist" : "Add to shortlist"}
+                >
+                  {selectedJob.favorited ? "\u2605" : "\u2606"}
+                </button>
+              </div>
+            </div>
+
+            <div className="p-4 space-y-4">
+              {/* Metadata */}
+              <div className="grid grid-cols-2 gap-2 text-sm">
+                <div>
+                  <span className="text-gray-400 text-xs">Salary</span>
+                  <p className="font-medium">{selectedJob.salary !== "N/A" ? selectedJob.salary : "Not listed"}</p>
+                </div>
+                <div>
+                  <span className="text-gray-400 text-xs">Location</span>
+                  <p className="font-medium">{selectedJob.location || "Not listed"}</p>
+                </div>
+                <div>
+                  <span className="text-gray-400 text-xs">Work Type</span>
+                  <p className="font-medium">{selectedJob.work_type || "Not listed"}</p>
+                </div>
+                <div>
+                  <span className="text-gray-400 text-xs">Posted</span>
+                  <p className="font-medium">{selectedJob.posted_date || "Unknown"}</p>
+                </div>
+                <div className="col-span-2">
+                  <span className="text-gray-400 text-xs">Applicants</span>
+                  <p className="font-medium">
+                    {selectedJob.applicants || "Unknown"}
+                    {refreshingJob && <span className="ml-2 text-xs text-gray-400 animate-pulse">updating...</span>}
+                  </p>
+                </div>
+              </div>
+
+              {/* Status */}
+              <div>
+                <label className="text-xs text-gray-400 block mb-1">Application Status</label>
+                <select
+                  value={selectedJob.status}
+                  onChange={e => changeStatus(selectedJob.id, e.target.value)}
+                  className={"w-full px-3 py-2 border rounded text-sm font-medium " + (STATUS_COLORS[selectedJob.status] || "")}
+                >
+                  {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
+              </div>
+
+              {/* Timeline */}
+              {Object.keys(selectedJob.timestamps).length > 0 && (
+                <div>
+                  <h3 className="text-xs text-gray-400 mb-2">Status Timeline</h3>
+                  <div className="space-y-1">
+                    {STATUSES.filter(s => selectedJob.timestamps[s]).map((s, i, arr) => {
+                      const ts = selectedJob.timestamps[s];
+                      const d = new Date(ts);
+                      const dateStr = d.toLocaleDateString() + " " + d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+                      // Time since previous
+                      let diff = null;
+                      if (i > 0) {
+                        const prevTs = selectedJob.timestamps[arr[i-1]];
+                        if (prevTs) {
+                          const days = Math.round((ts - prevTs) / (1000*60*60*24) * 10) / 10;
+                          diff = days + "d";
+                        }
+                      }
+                      return (
+                        <div key={s} className="flex items-center gap-2 text-xs">
+                          <span className={"w-2 h-2 rounded-full flex-shrink-0 " + (STATUS_COLORS[s]?.split(" ")[0] || "bg-gray-300")}></span>
+                          <span className="font-medium w-24">{s}</span>
+                          <span className="text-gray-500">{dateStr}</span>
+                          {diff && <span className="text-gray-400 ml-1">({diff})</span>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Notes */}
+              <div>
+                <label className="text-xs text-gray-400 block mb-1">Notes</label>
+                <textarea
+                  value={selectedJob.notes}
+                  onChange={e => updateJob(selectedJob.id, { notes: e.target.value })}
+                  placeholder="Add notes about this position..."
+                  className="w-full px-3 py-2 border rounded text-sm h-28 resize-none"
+                />
+              </div>
+
+              {/* Links */}
+              <div className="flex gap-2 flex-wrap">
+                {selectedJob.apply_link && (
+                  <a href={selectedJob.apply_link} target="_blank" rel="noopener"
+                    className="px-3 py-1.5 bg-blue-600 text-white rounded text-xs font-medium hover:bg-blue-700">
+                    Apply
+                  </a>
+                )}
+                {selectedJob.job_link && (
+                  <a href={selectedJob.job_link} target="_blank" rel="noopener"
+                    className="px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">
+                    LinkedIn Posting
+                  </a>
+                )}
+                <button onClick={() => window._showResume && window._showResume(selectedJob.resume_path, selectedJob.company, selectedJob.title)}
+                  className="px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">
+                  View Resume
+                </button>
+                <button onClick={() => window._openAIChat && window._openAIChat(selectedJob.id, selectedJob.company + ' — ' + selectedJob.title)}
+                  className="px-3 py-1.5 bg-purple-600 text-white rounded text-xs font-medium hover:bg-purple-700">
+                  Ask AI
+                </button>
+              </div>
+
+              {/* Add to Plan */}
+              {appPlans.length > 0 && (() => {
+                const currentPlan = appPlans.find(p => p.jobs.some(pj => pj.id === selectedJob.id));
+                return (
+                  <select value={currentPlan ? currentPlan.id : ""} onClick={e => e.stopPropagation()}
+                    onChange={e => {
+                      e.stopPropagation();
+                      const targetId = e.target.value;
+                      // Remove from all plans first
+                      let updated = appPlans.map(p => ({ ...p, jobs: p.jobs.filter(pj => pj.id !== selectedJob.id) }));
+                      // If a plan was selected, add to it
+                      if (targetId) {
+                        updated = updated.map(p => p.id === targetId
+                          ? { ...p, jobs: [...p.jobs, { id: selectedJob.id, company: selectedJob.company, title: selectedJob.title, notes: '' }] }
+                          : p
+                        );
+                      }
+                      saveAppPlans(updated);
+                    }}
+                    className={"w-full px-3 py-2 rounded text-sm font-medium border cursor-pointer " + (currentPlan ? "bg-green-50 text-green-700 border-green-300" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}>
+                    <option value="">Add to Plan...</option>
+                    {appPlans.map(p => {
+                      const already = p.jobs.some(pj => pj.id === selectedJob.id);
+                      return <option key={p.id} value={p.id} >{p.title}{already ? ' ✓' : ''}</option>;
+                    })}
+                  </select>
+                );
+              })()}
+
+              {/* PDF Resume Preview & Upload */}
+              <div className="border-t pt-3">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-xs text-gray-400">PDF Resume</label>
+                  {selectedJob.pdf_path && (
+                    <a href={selectedJob.pdf_path} target="_blank" rel="noopener"
+                      className="text-xs text-blue-500 hover:text-blue-700 underline">
+                      Open in new tab
+                    </a>
+                  )}
+                </div>
+                {selectedJob.pdf_path ? (
+                  <div className="mb-2 rounded border overflow-hidden" style={{height: '400px'}}>
+                    <iframe
+                      src={selectedJob.pdf_path}
+                      className="w-full h-full"
+                      style={{border: 'none'}}
+                      title="Resume Preview"
+                    />
+                  </div>
+                ) : null}
+                <div
+                  onDragOver={e => { e.preventDefault(); e.stopPropagation(); e.currentTarget.dataset.dragging = "true"; e.currentTarget.className = e.currentTarget.className.replace('border-gray-200', 'border-blue-400').replace('text-gray-400', 'text-blue-600').replace('bg-white', 'bg-blue-50'); }}
+                  onDragLeave={e => { e.preventDefault(); e.stopPropagation(); e.currentTarget.dataset.dragging = "false"; e.currentTarget.className = e.currentTarget.className.replace('border-blue-400', 'border-gray-200').replace('text-blue-600', 'text-gray-400').replace('bg-blue-50', 'bg-white'); }}
+                  onDrop={e => {
+                    e.preventDefault(); e.stopPropagation();
+                    e.currentTarget.className = e.currentTarget.className.replace('border-blue-400', 'border-gray-200').replace('text-blue-600', 'text-gray-400').replace('bg-blue-50', 'bg-white');
+                    const file = e.dataTransfer.files[0];
+                    if (file && file.name.toLowerCase().endsWith('.pdf')) {
+                      uploadPdfFile(selectedJob, file);
+                    }
+                  }}
+                  className="rounded border-2 border-dashed border-gray-200 px-4 py-3 text-center text-xs text-gray-400 bg-white transition-colors cursor-pointer hover:border-gray-300">
+                  {selectedJob.pdf_path ? 'Drop PDF to replace' : 'Drop PDF resume here'}
+                  <label className="ml-2 text-blue-500 hover:text-blue-700 cursor-pointer underline">
+                    or browse
+                    <input type="file" accept=".pdf" className="hidden" onChange={e => handlePdfUpload(selectedJob, e)} />
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </>
+    }
+    </div>
+  );
+}
+
+// ── Job Detail Modal (global, usable from Pipeline and any component) ──
+function JobDetailModal() {
+  const [jobId, setJobId] = useState(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [descCache, setDescCache] = useState({});
+  const [companyCache, setCompanyCache] = useState({});
+  const [localNotes, setLocalNotes] = useState('');
+
+  useEffect(() => {
+    window._showJobDetail = (id) => {
+      setJobId(id);
+      setRefreshKey(k => k + 1);
+      const j = window._getJobById && window._getJobById(id);
+      setLocalNotes(j ? (j.notes || '') : '');
+      // Fetch description on demand
+      if (!descCache[id]) {
+        setDescCache(prev => ({ ...prev, [id]: { loading: true } }));
+        fetch('/api/job-description/' + id)
+          .then(r => r.json())
+          .then(data => setDescCache(prev => ({ ...prev, [id]: { html: data.formatted || '', text: data.description || 'No description available.' } })))
+          .catch(() => setDescCache(prev => ({ ...prev, [id]: { error: true } })));
+      }
+    };
+    return () => { delete window._showJobDetail; };
+  }, [descCache]);
+
+  // Fetch company info when jobId changes
+  useEffect(() => {
+    if (!jobId) return;
+    const job = window._getJobById && window._getJobById(jobId);
+    if (!job) return;
+    const key = job.company.trim().toLowerCase();
+    if (companyCache[key]) return;
+    setCompanyCache(prev => ({ ...prev, [key]: { loading: true } }));
+    fetch('/api/company-info/' + encodeURIComponent(job.company))
+      .then(r => r.json())
+      .then(data => setCompanyCache(prev => ({ ...prev, [key]: data })))
+      .catch(() => setCompanyCache(prev => ({ ...prev, [key]: { error: true } })));
+  }, [jobId, refreshKey]);
+
+  if (!jobId) return null;
+  const job = window._getJobById && window._getJobById(jobId);
+  if (!job) return null;
+
+  const desc = descCache[jobId];
+  const companyKey = job.company.trim().toLowerCase();
+  const companyInfo = companyCache[companyKey];
+
+  const close = () => setJobId(null);
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
+         onClick={close}>
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-4xl flex flex-col"
+           style={{maxHeight: '90vh'}}
+           onClick={e => e.stopPropagation()}>
+        {/* Header */}
+        <div className="p-4 border-b bg-gray-50 rounded-t-lg">
+          <div className="flex justify-between items-start">
+            <div>
+              <h2 className="font-bold text-gray-900">{job.company}</h2>
+              <p className="text-sm text-gray-600">{job.title}</p>
+            </div>
+            <button onClick={close} className="text-gray-400 hover:text-gray-600 text-xl leading-none">&times;</button>
+          </div>
+          <div className="flex items-center gap-2 mt-2">
+            <span className={"inline-block px-2 py-0.5 rounded text-xs font-medium " + TIER_COLORS[job.tier]}>
+              {job.tier} (Score: {job.score})
+            </span>
+            <button
+              onClick={() => { window._toggleFavorite && window._toggleFavorite(job.id); setRefreshKey(k => k + 1); }}
+              className={"text-lg " + (job.favorited ? "text-yellow-400" : "text-gray-300 hover:text-yellow-300")}
+              title={job.favorited ? "Remove from shortlist" : "Add to shortlist"}
+            >
+              {job.favorited ? "\u2605" : "\u2606"}
+            </button>
+          </div>
+        </div>
+
+        {/* Scrollable body */}
+        <div className="flex-1 overflow-auto p-4 space-y-4" style={{minHeight: 0}}>
+          {/* Metadata */}
+          <div className="grid grid-cols-3 gap-3 text-sm">
+            <div>
+              <span className="text-gray-400 text-xs">Salary</span>
+              <p className="font-medium">{job.salary !== "N/A" ? job.salary : "Not listed"}</p>
+            </div>
+            <div>
+              <span className="text-gray-400 text-xs">Location</span>
+              <p className="font-medium">{job.location || "Not listed"}</p>
+            </div>
+            <div>
+              <span className="text-gray-400 text-xs">Work Type</span>
+              <p className="font-medium">{job.work_type || "Not listed"}</p>
+            </div>
+            <div>
+              <span className="text-gray-400 text-xs">Posted</span>
+              <p className="font-medium">{job.posted_date || "Unknown"}</p>
+            </div>
+            <div>
+              <span className="text-gray-400 text-xs">Applicants</span>
+              <p className="font-medium">{job.applicants || "Unknown"}</p>
+            </div>
+            <div>
+              <span className="text-gray-400 text-xs">ID</span>
+              <p className="font-medium text-gray-400">{job.id.slice(0, 12)}</p>
+            </div>
+          </div>
+
+          {/* Status */}
+          <div>
+            <label className="text-xs text-gray-400 block mb-1">Application Status</label>
+            <select
+              value={job.status}
+              onChange={e => { window._changeStatus && window._changeStatus(job.id, e.target.value); setRefreshKey(k => k + 1); }}
+              className={"w-full px-3 py-2 border rounded text-sm font-medium " + (STATUS_COLORS[job.status] || "")}
+            >
+              {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+
+          {/* Timeline */}
+          {Object.keys(job.timestamps).length > 0 && (
+            <div>
+              <h3 className="text-xs text-gray-400 mb-2">Status Timeline</h3>
+              <div className="space-y-1">
+                {STATUSES.filter(s => job.timestamps[s]).map((s, i, arr) => {
+                  const ts = job.timestamps[s];
+                  const d = new Date(ts);
+                  const dateStr = d.toLocaleDateString() + " " + d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+                  let diff = null;
+                  if (i > 0) {
+                    const prevTs = job.timestamps[arr[i-1]];
+                    if (prevTs) {
+                      const days = Math.round((ts - prevTs) / (1000*60*60*24) * 10) / 10;
+                      diff = days + "d";
+                    }
+                  }
+                  return (
+                    <div key={s} className="flex items-center gap-2 text-xs">
+                      <span className={"w-2 h-2 rounded-full flex-shrink-0 " + (STATUS_COLORS[s]?.split(" ")[0] || "bg-gray-300")}></span>
+                      <span className="font-medium w-24">{s}</span>
+                      <span className="text-gray-500">{dateStr}</span>
+                      {diff && <span className="text-gray-400 ml-1">({diff})</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Notes */}
+          <div>
+            <label className="text-xs text-gray-400 block mb-1">Notes</label>
+            <textarea
+              value={localNotes}
+              onChange={e => setLocalNotes(e.target.value)}
+              onBlur={() => { window._updateJob && window._updateJob(job.id, { notes: localNotes }); }}
+              placeholder="Add notes about this position..."
+              className="w-full px-3 py-2 border rounded text-sm h-28 resize-none"
+            />
+          </div>
+
+          {/* Description + Company Info side by side */}
+          <div className="flex gap-4">
+            <div className="flex-1 min-w-0">
+              <span className="text-xs text-gray-400 block mb-1">Description</span>
+              {desc ? (
+                desc.loading ? (
+                  <p className="text-xs text-gray-400">Loading...</p>
+                ) : desc.error ? (
+                  <p className="text-xs text-red-400">Failed to load description.</p>
+                ) : desc.html ? (
+                  <div className="bg-gray-50 border rounded p-3 max-h-64 overflow-auto max-w-2xl text-xs"
+                    dangerouslySetInnerHTML={{ __html: desc.html }} />
+                ) : (
+                  <div className="text-xs text-gray-700 bg-gray-50 border rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap max-w-2xl">{desc.text}</div>
+                )
+              ) : (
+                <p className="text-xs text-gray-400">Click to load description</p>
+              )}
+            </div>
+            {companyInfo && !companyInfo.loading && !companyInfo.error && (
+              <div className="w-64 flex-shrink-0">
+                <span className="text-xs text-gray-400 block mb-1">Company</span>
+                <div className="bg-gray-50 border rounded p-3 max-h-64 overflow-auto">
+                  <div className="flex items-center gap-2 mb-2">
+                    <img src={companyInfo.logo_url} alt={companyInfo.name + ' logo'}
+                      className="w-10 h-10 rounded bg-white border object-contain"
+                      onError={(e) => { e.target.style.display = 'none'; }} />
+                    <div>
+                      <p className="font-semibold text-sm text-gray-900">{companyInfo.name}</p>
+                      {companyInfo.industry && <p className="text-xs text-blue-600">{companyInfo.industry}</p>}
+                    </div>
+                  </div>
+                  {companyInfo.known_for && (
+                    <p className="text-xs text-gray-700 mb-2 leading-relaxed">{companyInfo.known_for}</p>
+                  )}
+                  {companyInfo.website && (
+                    <a href={'https://' + companyInfo.website} target="_blank" rel="noopener"
+                      className="text-xs text-blue-500 hover:underline mt-1 block">{companyInfo.website}</a>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Links */}
+          <div className="flex gap-2 flex-wrap items-center">
+            {job.apply_link && (
+              <a href={job.apply_link} target="_blank" rel="noopener"
+                className="px-3 py-1.5 bg-blue-600 text-white rounded text-xs font-medium hover:bg-blue-700">
+                Apply
+              </a>
+            )}
+            {job.job_link && (
+              <a href={job.job_link} target="_blank" rel="noopener"
+                className="px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">
+                LinkedIn Posting
+              </a>
+            )}
+            {job.resume_path && (
+              <button onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title)}
+                className="px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">
+                View Resume
+              </button>
+            )}
+            <button
+              onClick={e => {
+                navigator.clipboard.writeText(window.__APP_CONFIG.linkedin_url || '').then(() => {
+                  e.target.textContent = 'Copied!';
+                  setTimeout(() => { e.target.textContent = 'Copy My LinkedIn'; }, 1500);
+                });
+              }}
+              className="px-2.5 py-1 bg-blue-100 text-blue-700 rounded text-xs font-medium hover:bg-blue-200 border border-blue-200">
+              Copy My LinkedIn
+            </button>
+          </div>
+
+          {/* PDF Resume */}
+          <div className="border-t pt-3">
+            <label className="text-xs text-gray-400 block mb-2">PDF Resume</label>
+            {job.pdf_path ? (
+              <div className="flex gap-2 items-center">
+                <a href={'/' + job.pdf_path} target="_blank" rel="noopener"
+                  className="px-3 py-1.5 bg-green-600 text-white rounded text-xs font-medium hover:bg-green-700">
+                  View PDF Resume
+                </a>
+                <label className="px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border cursor-pointer">
+                  Replace
+                  <input type="file" accept=".pdf" className="hidden" onChange={e => { window._handlePdfUpload && window._handlePdfUpload(job, e); setRefreshKey(k => k + 1); }} />
+                </label>
+              </div>
+            ) : (
+              <label className="inline-block px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border cursor-pointer">
+                Upload PDF
+                <input type="file" accept=".pdf" className="hidden" onChange={e => { window._handlePdfUpload && window._handlePdfUpload(job, e); setRefreshKey(k => k + 1); }} />
+              </label>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Resume Preview Modal (global, usable from any component) ─────────
+function ResumePreviewModal() {
+  const [data, setData] = useState(null);
+  const [copiedIdx, setCopiedIdx] = useState(null);
+
+  React.useEffect(() => {
+    window._showResume = (path, company, title) => {
+      setCopiedIdx(null);
+      setData({ path, company, title, text: null, loading: true, error: null });
+      fetch('/' + path)
+        .then(r => { if (!r.ok) throw new Error('Failed to load'); return r.text(); })
+        .then(text => setData(prev => ({ ...prev, text, loading: false })))
+        .catch(err => setData(prev => ({ ...prev, error: err.message, loading: false })));
+    };
+    return () => { delete window._showResume; };
+  }, []);
+
+  // Parse resume text into named sections
+  // Format: "SECTION NAME\n------ (or ======)\ncontent..."
+  const sections = useMemo(() => {
+    if (!data?.text) return [];
+    const lines = data.text.split('\n');
+    const secs = [];
+    let currentName = null;
+    let currentLines = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      // Detect separator line (all dashes or equals, at least 10 chars)
+      if (/^[-=]{10,}$/.test(line.trim()) && i > 0) {
+        // The line immediately before the separator is the section name
+        const headerLine = currentLines.pop();
+        // Save accumulated content (minus the header line) as the previous section
+        const content = currentLines.join('\n').trim();
+        if (currentName !== null && content) {
+          secs.push({ name: currentName, content });
+        }
+        currentName = headerLine?.trim() || 'Section';
+        currentLines = [];
+        continue;
+      }
+      currentLines.push(line);
+    }
+    // Push last section
+    const lastContent = currentLines.join('\n').trim();
+    if (lastContent) secs.push({ name: currentName || 'Content', content: lastContent });
+
+    return secs;
+  }, [data?.text]);
+
+  const copyToClipboard = (text, idx) => {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopiedIdx(idx);
+      setTimeout(() => setCopiedIdx(null), 1500);
+    });
+  };
+
+  if (!data) return null;
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
+         onClick={() => setData(null)}>
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-5xl flex flex-col"
+           style={{maxHeight: '90vh'}}
+           onClick={e => e.stopPropagation()}>
+        <div className="flex justify-between items-center p-4 border-b bg-gray-50 rounded-t-lg">
+          <div>
+            <h3 className="font-bold text-gray-900 text-sm">{data.company}</h3>
+            <p className="text-xs text-gray-500">{data.title}</p>
+          </div>
+          <button onClick={() => setData(null)}
+            className="text-gray-400 hover:text-gray-600 text-xl leading-none">&times;</button>
+        </div>
+        <div className="flex-1 overflow-auto p-4 space-y-3" style={{minHeight: 0}}>
+          {data.loading && <p className="text-sm text-gray-400 text-center py-8">Loading resume...</p>}
+          {data.error && <p className="text-sm text-red-500 text-center py-8">{data.error}</p>}
+          {data.text && sections.map((sec, idx) => {
+            const lineCount = sec.content.split('\n').length;
+            const rows = Math.min(Math.max(lineCount + 1, 3), 14);
+            return (
+              <div key={idx} className="border rounded-lg overflow-hidden">
+                <div className="flex justify-between items-center px-3 py-2 bg-gray-100 border-b">
+                  <span className="text-xs font-semibold text-gray-700 uppercase tracking-wide">{sec.name}</span>
+                  <button onClick={() => copyToClipboard(sec.content, idx)}
+                    className={'text-xs px-2 py-1 rounded ' + (copiedIdx === idx
+                      ? 'bg-green-100 text-green-700'
+                      : 'bg-white text-gray-600 hover:bg-gray-200 border')}>
+                    {copiedIdx === idx ? 'Copied!' : 'Copy'}
+                  </button>
+                </div>
+                <textarea readOnly value={sec.content} rows={rows}
+                  className="w-full text-sm text-gray-800 font-mono bg-gray-50 p-3 resize-none focus:outline-none"
+                  style={{cursor: 'default'}} />
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── AI Chat Panel (Ollama-powered local assistant) ──
+function AIChatPanel() {
+  const [open, setOpen] = useState(false);
+  const [jobId, setJobId] = useState(null);
+  const [jobLabel, setJobLabel] = useState('');
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const [thinking, setThinking] = useState(false);
+  const [model, setModel] = useState('qwen2.5:7b');
+  const [minimized, setMinimized] = useState(false);
+  const messagesEndRef = useRef(null);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    window._openAIChat = (id, label) => {
+      setJobId(id || null);
+      setJobLabel(label || '');
+      setOpen(true);
+      setMessages([]);
+      setTimeout(() => inputRef.current?.focus(), 100);
+    };
+    return () => { delete window._openAIChat; };
+  }, []);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, thinking]);
+
+  const sendMessage = useCallback(async (text) => {
+    if (!text.trim() || thinking) return;
+    const userMsg = { role: 'user', content: text.trim() };
+    const newMessages = [...messages, userMsg];
+    setMessages(newMessages);
+    setInput('');
+    setThinking(true);
+    try {
+      const res = await fetch('/api/ai-chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: userMsg.content,
+          job_id: jobId,
+          history: messages,
+          model: model,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setMessages(prev => [...prev, { role: 'assistant', content: 'Error: ' + data.error }]);
+      } else {
+        setMessages(prev => [...prev, { role: 'assistant', content: data.response }]);
+      }
+    } catch (err) {
+      setMessages(prev => [...prev, { role: 'assistant', content: 'Error: Could not connect to AI. Is Ollama running?' }]);
+    }
+    setThinking(false);
+  }, [messages, jobId, thinking, model]);
+
+  const quickPrompts = [
+    { label: 'Analyze Job', prompt: 'Analyze this job posting. What are the key requirements, and how well does my background fit? Highlight any gaps.' },
+    { label: 'Tailor Resume', prompt: 'How should I tailor my resume for this specific role? Give me specific bullet point suggestions.' },
+    { label: 'Interview Prep', prompt: 'What technical and behavioral interview questions should I expect for this role? Give me 5 of each.' },
+    { label: 'Cover Letter', prompt: 'Draft a concise cover letter for this position that highlights my most relevant experience.' },
+  ];
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => { setOpen(true); setMinimized(false); setTimeout(() => inputRef.current?.focus(), 100); }}
+        className="fixed bottom-6 right-6 w-14 h-14 bg-purple-600 text-white rounded-full shadow-lg hover:bg-purple-700 flex items-center justify-center text-2xl z-40"
+        title="AI Assistant">
+        AI
+      </button>
+    );
+  }
+
+  if (minimized) {
+    return (
+      <div className="fixed bottom-6 right-6 bg-purple-600 text-white rounded-lg shadow-lg z-50 flex items-center gap-2 px-4 py-2 cursor-pointer hover:bg-purple-700"
+        onClick={() => { setMinimized(false); setTimeout(() => inputRef.current?.focus(), 100); }}>
+        <span className="font-bold text-sm">AI Assistant</span>
+        {jobLabel && <span className="text-xs text-purple-200 truncate" style={{maxWidth:'150px'}}>— {jobLabel}</span>}
+        {thinking && <span className="text-xs text-purple-200 animate-pulse">thinking...</span>}
+        {messages.length > 0 && <span className="bg-purple-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">{messages.length}</span>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="fixed bottom-0 right-0 w-full sm:w-[32rem] h-full sm:h-3/4 bg-white border-l sm:border shadow-2xl flex flex-col z-50 sm:rounded-tl-lg sm:bottom-0 sm:right-0" style={{maxHeight: '85vh'}}>
+      {/* Header */}
+      <div className="p-3 bg-purple-600 text-white flex items-center justify-between sm:rounded-tl-lg flex-shrink-0">
+        <div>
+          <h3 className="font-bold text-sm">AI Assistant</h3>
+          {jobLabel && <p className="text-xs text-purple-200 truncate" style={{maxWidth:'200px'}}>{jobLabel}</p>}
+          {!jobLabel && <p className="text-xs text-purple-200">General mode — select a job for context</p>}
+        </div>
+        <div className="flex gap-2 items-center">
+          <select value={model} onChange={e => setModel(e.target.value)}
+            className="text-xs bg-purple-500 text-white px-1 py-1 rounded border-purple-400 border">
+            <option value="qwen2.5:7b">7B Fast</option>
+            <option value="qwen2.5:14b">14B Quality</option>
+          </select>
+          {jobId && (
+            <button onClick={() => { setJobId(null); setJobLabel(''); }}
+              className="text-xs bg-purple-500 hover:bg-purple-400 px-2 py-1 rounded">Clear context</button>
+          )}
+          <button onClick={() => setMinimized(true)} className="text-purple-200 hover:text-white text-xl leading-none" title="Minimize">&minus;</button>
+          <button onClick={() => setOpen(false)} className="text-purple-200 hover:text-white text-xl leading-none" title="Close">&times;</button>
+        </div>
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto p-3 space-y-3" style={{minHeight: 0}}>
+        {messages.length === 0 && !thinking && (
+          <div className="text-center text-gray-400 text-sm mt-8">
+            <p className="mb-4">{jobId ? 'Ask me about this position' : 'Ask me anything about your job search'}</p>
+            {jobId && (
+              <div className="flex flex-wrap gap-2 justify-center">
+                {quickPrompts.map((qp, i) => (
+                  <button key={i} onClick={() => sendMessage(qp.prompt)}
+                    className="px-3 py-1.5 bg-purple-50 text-purple-700 rounded-full text-xs font-medium hover:bg-purple-100 border border-purple-200">
+                    {qp.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {messages.map((msg, i) => (
+          <div key={i} className={msg.role === 'user' ? 'flex justify-end' : 'flex justify-start'}>
+            {msg.role === 'user' ? (
+              <div className="bg-purple-600 text-white rounded-lg px-3 py-2 max-w-sm sm:max-w-md text-sm whitespace-pre-wrap">
+                {msg.content}
+              </div>
+            ) : (
+              <div className="bg-gray-100 text-gray-800 rounded-lg px-3 py-2 max-w-sm sm:max-w-md text-sm ai-response"
+                dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+            )}
+          </div>
+        ))}
+
+        {thinking && (
+          <div className="flex justify-start">
+            <div className="bg-gray-100 text-gray-500 rounded-lg px-3 py-2 text-sm animate-pulse">
+              Thinking...
+            </div>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Quick prompts row (shown after conversation starts, when job context exists) */}
+      {messages.length > 0 && jobId && (
+        <div className="px-3 py-1 border-t flex gap-1 flex-wrap flex-shrink-0">
+          {quickPrompts.map((qp, i) => (
+            <button key={i} onClick={() => sendMessage(qp.prompt)} disabled={thinking}
+              className="px-2 py-1 bg-purple-50 text-purple-600 rounded text-xs hover:bg-purple-100 disabled:opacity-50">
+              {qp.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Input */}
+      <div className="p-3 border-t flex gap-2 flex-shrink-0">
+        <input
+          ref={inputRef}
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input); } }}
+          placeholder={thinking ? 'Waiting for response...' : 'Ask about this job...'}
+          disabled={thinking}
+          className="flex-1 px-3 py-2 border rounded text-sm disabled:bg-gray-50"
+        />
+        <button
+          onClick={() => sendMessage(input)}
+          disabled={thinking || !input.trim()}
+          className="px-4 py-2 bg-purple-600 text-white rounded text-sm font-medium hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed">
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.render(<><App /><JobDetailModal /><ResumePreviewModal /><AIChatPanel /></>, document.getElementById("root"));
+</script>
+</body>
+</html>

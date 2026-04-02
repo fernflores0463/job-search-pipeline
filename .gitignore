@@ -1,0 +1,11 @@
+config.json
+resumes/
+dashboard/dashboard_state.json
+dashboard/application_plans.json
+dashboard/company_cache.json
+job_postings_dump/
+__pycache__/
+*.pyc
+.DS_Store
+*.pages
+historical_resumes/

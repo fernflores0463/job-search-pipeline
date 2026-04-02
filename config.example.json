@@ -1,0 +1,68 @@
+{
+  "candidate": {
+    "name": "Your Name",
+    "linkedin_url": "https://www.linkedin.com/in/your-profile/",
+    "summary": "A software engineer with experience at Company A and Company B",
+    "skills": "Go, Java, JavaScript, Python, SQL, Spring Boot, React, Docker, Kubernetes"
+  },
+  "experience": {
+    "COMPANY_A": {
+      "display_name": "Company A",
+      "context": "Company A (Go, React, Microservices)",
+      "bullet_limit": 5,
+      "bullets": [
+        "Built backend services using Go for a SaaS platform serving thousands of users",
+        "Led migration of gRPC services to a new authorization model across distributed teams"
+      ]
+    },
+    "COMPANY_B": {
+      "display_name": "Company B",
+      "context": "Company B (Java, Spring Boot, Kafka)",
+      "bullet_limit": 4,
+      "bullets": [
+        "Developed Java microservices with Spring Boot and Kafka for event-driven systems",
+        "Increased test coverage to 80% across multiple repositories using JUnit"
+      ]
+    }
+  },
+  "skills_template": {
+    "languages": "Go, Java, JavaScript, TypeScript, Python, SQL",
+    "frameworks": "Spring Boot, JUnit, React, Angular, Flask",
+    "misc": "Git, Docker, Kubernetes, Jenkins, AWS, Bash"
+  },
+  "scoring": {
+    "tech_keywords": {
+      "\\bgo\\b|golang": 3,
+      "react": 2,
+      "java\\b": 2,
+      "spring": 2,
+      "kafka": 2,
+      "kubernetes|k8s": 1,
+      "docker": 1,
+      "aws": 1,
+      "microservice": 2,
+      "grpc": 1,
+      "sql|postgres": 1,
+      "rest.*api|api.*rest": 2
+    },
+    "level_keywords": ["II", "III", "Senior", "Sr\\."],
+    "tier_thresholds": { "strong": 13, "match": 7 },
+    "top_companies": ["google", "meta", "amazon", "microsoft", "apple", "stripe", "netflix"]
+  },
+  "filters": {
+    "exclude_companies_containing": ["staffing", "recruiting", "consulting"],
+    "exclude_title_keywords": ["principal", "director", "intern", "staff "],
+    "exclude_role_keywords": ["mobile", "ios ", "android", "devops", "sre"]
+  },
+  "bullet_keyword_pairs": [
+    ["\\bgo\\b|golang", "go "],
+    ["react", "react"],
+    ["spring", "spring"],
+    ["kafka", "kafka"],
+    ["kubernetes|k8s", "kubernetes"],
+    ["docker", "docker"],
+    ["aws", "aws"],
+    ["grpc", "grpc"],
+    ["sql|postgres", "sql"]
+  ]
+}
