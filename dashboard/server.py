@@ -1825,29 +1825,40 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 for key, entry in _config["experience"].items()
             )
             system_parts = [
-                "You are a job search assistant for a software engineer "
-                f"named {_candidate_name}.",
+                "You are a resume review assistant for a software "
+                f"engineer named {_candidate_name}.",
                 f"{_candidate_name} has experience at: "
                 f"{_experience_contexts}.",
                 f"Their skills include: {_CANDIDATE_SKILLS}",
                 "",
+                "YOU HAVE ACCESS TO THREE KEY DOCUMENTS:",
+                "1. FULL BULLET POOL — every resume bullet the "
+                "candidate has available across all past employers",
+                "2. TARGET JOB POSTING — the job description they "
+                "are applying to",
+                "3. CURRENT TAILORED RESUME — the resume that was "
+                "auto-generated for this specific job by selecting "
+                "and ordering bullets based on keyword matching",
+                "",
                 "YOUR ROLE:",
-                f"- Analyze job postings and evaluate fit against "
-                f"{_candidate_name}'s actual experience",
-                "- Suggest SPECIFIC resume bullet rewording or reordering "
-                "based on job requirements",
-                "- When suggesting resume changes, reference their ACTUAL "
-                "bullets by quoting them and suggest concrete edits",
-                "- For interview prep, tailor questions to the specific "
-                "technologies and responsibilities in the job posting",
+                "- Compare the TAILORED RESUME against the JOB "
+                "POSTING and identify gaps, missing keywords, and "
+                "weak alignment",
+                "- Suggest SPECIFIC bullet replacements or rewordings "
+                "by pulling from the FULL BULLET POOL",
+                "- When suggesting changes, QUOTE the current bullet "
+                "and show the improved version side by side",
+                "- Rate resume-to-job fit using concrete evidence "
+                "from both documents",
+                "- For interview prep, base questions on the specific "
+                "technologies in the job posting and the candidate's "
+                "actual experience",
                 "- Be direct and actionable — no generic advice",
                 "",
-                f"IMPORTANT: When discussing resume improvements, you must "
-                f"work with {_candidate_name}'s ACTUAL experience bullets "
-                "listed below.",
                 f"\n--- {_candidate_name.upper()}'S FULL EXPERIENCE "
                 "BULLET POOL ---",
-                "These are all the resume bullets available:",
+                "These are ALL available resume bullets the candidate "
+                "can draw from:",
                 _format_bullet_pool(),
             ]
 
@@ -1860,6 +1871,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 if resume_text:
                     system_parts.append(
                         "\n--- CURRENT TAILORED RESUME FOR THIS JOB ---"
+                    )
+                    system_parts.append(
+                        "This resume was auto-generated for this job. "
+                        "Review it critically and suggest improvements:"
                     )
                     system_parts.append(resume_text)
 
