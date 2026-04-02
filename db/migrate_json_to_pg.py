@@ -15,6 +15,7 @@ Source files (read-only, never modified):
 import json
 import os
 import sys
+import uuid
 import logging
 from datetime import datetime
 
@@ -99,10 +100,18 @@ def migrate_jobs(cursor, jobs_meta, state_map):
     logger.info("Jobs: %d inserted, %d skipped (already existed)", inserted, skipped)
 
 
+def _to_uuid(val):
+    """Convert any string to a valid UUID, using uuid5 if it's not already a UUID."""
+    try:
+        return str(uuid.UUID(str(val)))
+    except (ValueError, AttributeError):
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, str(val)))
+
+
 def migrate_plans(cursor, plans):
     inserted = 0
     for plan in plans:
-        pid = plan.get("id")
+        pid = _to_uuid(plan.get("id"))
         cursor.execute("""
             INSERT INTO application_plans (id, title, date)
             VALUES (%s::uuid,%s,%s)

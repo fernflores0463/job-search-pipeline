@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Job Search Dashboard Server
-Serves the dashboard and auto-saves state to a JSON file on disk.
+Serves the dashboard and persists state to PostgreSQL (Aurora/RDS).
 
 Usage:
-    python server.py
+    Local:      DB_HOST=localhost DB_PASSWORD=localdev python3 server.py
+    Production: Reads DB credentials from AWS Parameter Store automatically.
     Then open http://localhost:8080 in your browser.
 """
 
@@ -16,15 +17,17 @@ import re
 import subprocess
 import sys
 import threading
+import uuid
 import urllib.request
 import urllib.parse
 
 PORT = 8080
 DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(DIR)
-STATE_FILE = os.path.join(DIR, "dashboard_state.json")
-PLANS_FILE = os.path.join(DIR, "application_plans.json")
-METADATA_FILE = os.path.join(PARENT_DIR, "resumes", "all_jobs_metadata.json")
+
+# Allow importing db module from repo root
+sys.path.insert(0, PARENT_DIR)
+from db.db import Db, init_pool
 
 # ─────────────────────────────────────────────────────────
 # CONFIG LOADING
@@ -42,41 +45,298 @@ def _load_config():
 
 _config = _load_config()
 
-# Applicant update state
+# Initialize DB connection pool at startup
+try:
+    init_pool()
+    print("Database connection pool initialized.")
+except Exception as e:
+    print(f"Warning: Could not connect to database: {e}")
+    print("Some features may not work. Check DB_HOST and DB_PASSWORD env vars.")
+
+# Background task state (in-memory only)
 _update_lock = threading.Lock()
 _update_status = {"running": False, "progress": 0, "total": 0, "updated": 0, "failed": 0, "message": ""}
 
-# Scrape careers state
 _scrape_lock = threading.Lock()
 _scrape_status = {"running": False, "progress": 0, "total": 0, "added": 0, "message": "", "jobs_found": []}
 
-# Live check state
 _live_check_lock = threading.Lock()
 _live_check_status = {"running": False, "progress": 0, "total": 0, "closed": 0, "live": 0, "inconclusive": 0, "auto_updated": 0, "message": ""}
 
-# Company info cache (in-memory, persists for server lifetime)
+# Company info cache (in-memory, warmed from DB at startup)
 _company_cache = {}
 _company_cache_lock = threading.Lock()
-COMPANY_CACHE_FILE = os.path.join(DIR, "company_cache.json")
 
-def _load_company_cache():
-    global _company_cache
-    if os.path.exists(COMPANY_CACHE_FILE):
-        try:
-            with open(COMPANY_CACHE_FILE) as f:
-                _company_cache = json.load(f)
-        except Exception:
-            _company_cache = {}
 
-def _save_company_cache():
+# ─────────────────────────────────────────────────────────
+# DATABASE HELPERS
+# ─────────────────────────────────────────────────────────
+
+def _to_uuid(val):
+    """Convert any string to a valid UUID — uses uuid5 for non-UUID strings."""
     try:
-        with open(COMPANY_CACHE_FILE, "w") as f:
-            json.dump(_company_cache, f, indent=2)
-    except Exception:
-        pass
+        return str(uuid.UUID(str(val)))
+    except (ValueError, AttributeError):
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, str(val)))
 
-_load_company_cache()
 
+def _row_to_dict(cursor, row):
+    """Convert a DB row to a dict using cursor column names."""
+    cols = [d[0] for d in cursor.description]
+    return dict(zip(cols, row))
+
+
+def _serialize(obj):
+    """Make a DB row dict JSON-serializable (handles datetime, UUID)."""
+    import datetime
+    result = {}
+    for k, v in obj.items():
+        if isinstance(v, datetime.datetime):
+            result[k] = v.isoformat()
+        elif isinstance(v, uuid.UUID):
+            result[k] = str(v)
+        else:
+            result[k] = v
+    return result
+
+
+# ── Jobs ──────────────────────────────────────────────────
+
+def load_jobs():
+    """Return all jobs from DB as a list of dicts (no description — use load_job for that)."""
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, company, title, location, work_type, salary,
+                       posted_date, import_date, score, tier, job_link, apply_link
+                FROM jobs
+                ORDER BY import_date DESC, score DESC
+            """)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+    except Exception as e:
+        print(f"Error loading jobs: {e}")
+        return []
+
+
+def load_job(job_id):
+    """Return a single job dict including description and resume_text."""
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, company, title, location, work_type, salary,
+                       posted_date, import_date, description, score, tier,
+                       job_link, apply_link, resume_text
+                FROM jobs WHERE id = %s
+            """, (job_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return _row_to_dict(cur, row)
+    except Exception as e:
+        print(f"Error loading job {job_id}: {e}")
+        return None
+
+
+# ── State ─────────────────────────────────────────────────
+
+def load_state():
+    """Return all job state from DB as a dict keyed by job_id."""
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT job_id, status, notes, applicants,
+                       live_status, live_status_checked, timestamps
+                FROM job_state
+            """)
+            result = {}
+            for row in cur.fetchall():
+                job_id, status, notes, applicants, live_status, live_status_checked, timestamps = row
+                result[job_id] = {
+                    "status": status,
+                    "notes": notes,
+                    "applicants": applicants,
+                    "live_status": live_status,
+                    "live_status_checked": live_status_checked.isoformat() if live_status_checked else None,
+                    "timestamps": timestamps if isinstance(timestamps, dict) else {},
+                }
+            return result
+    except Exception as e:
+        print(f"Error loading state: {e}")
+        return {}
+
+
+def save_job_state(job_id, state):
+    """Upsert a single job's state to DB. Used by background threads and API."""
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO job_state
+                    (job_id, status, notes, applicants, live_status, live_status_checked, timestamps, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (job_id) DO UPDATE SET
+                    status               = EXCLUDED.status,
+                    notes                = EXCLUDED.notes,
+                    applicants           = EXCLUDED.applicants,
+                    live_status          = EXCLUDED.live_status,
+                    live_status_checked  = EXCLUDED.live_status_checked,
+                    timestamps           = EXCLUDED.timestamps,
+                    updated_at           = NOW()
+            """, (
+                job_id,
+                state.get("status", "New"),
+                state.get("notes"),
+                state.get("applicants"),
+                state.get("live_status"),
+                state.get("live_status_checked"),
+                json.dumps(state.get("timestamps", {})),
+            ))
+    except Exception as e:
+        print(f"Error saving state for {job_id}: {e}")
+
+
+def save_state(state_dict):
+    """Batch upsert a full state dict to DB (used by background threads after each batch)."""
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            for job_id, state in state_dict.items():
+                cur.execute("""
+                    INSERT INTO job_state
+                        (job_id, status, notes, applicants, live_status, live_status_checked, timestamps, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (job_id) DO UPDATE SET
+                        status               = EXCLUDED.status,
+                        notes                = EXCLUDED.notes,
+                        applicants           = EXCLUDED.applicants,
+                        live_status          = EXCLUDED.live_status,
+                        live_status_checked  = EXCLUDED.live_status_checked,
+                        timestamps           = EXCLUDED.timestamps,
+                        updated_at           = NOW()
+                """, (
+                    job_id,
+                    state.get("status", "New"),
+                    state.get("notes"),
+                    state.get("applicants"),
+                    state.get("live_status"),
+                    state.get("live_status_checked"),
+                    json.dumps(state.get("timestamps", {})),
+                ))
+    except Exception as e:
+        print(f"Error batch saving state: {e}")
+
+
+# ── Plans ─────────────────────────────────────────────────
+
+def load_plans():
+    """Return all application plans from DB."""
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT p.id, p.title, p.date,
+                       pj.job_id, pj.notes AS job_notes,
+                       j.company, j.title AS job_title
+                FROM application_plans p
+                LEFT JOIN application_plan_jobs pj ON p.id = pj.plan_id
+                LEFT JOIN jobs j ON pj.job_id = j.id
+                ORDER BY p.date DESC, p.created_at DESC
+            """)
+            plans = {}
+            for row in cur.fetchall():
+                plan_id, plan_title, plan_date, job_id, job_notes, company, job_title = row
+                pid = str(plan_id)
+                if pid not in plans:
+                    plans[pid] = {"id": pid, "title": plan_title, "date": plan_date, "jobs": []}
+                if job_id:
+                    plans[pid]["jobs"].append({
+                        "id": job_id,
+                        "notes": job_notes or "",
+                        "company": company or "",
+                        "title": job_title or "",
+                    })
+            return list(plans.values())
+    except Exception as e:
+        print(f"Error loading plans: {e}")
+        return []
+
+
+def save_plans(plans):
+    """Replace all plans in DB with the given list."""
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM application_plans")
+            for plan in plans:
+                pid = _to_uuid(plan.get("id", ""))
+                cur.execute("""
+                    INSERT INTO application_plans (id, title, date)
+                    VALUES (%s::uuid, %s, %s)
+                """, (pid, plan.get("title"), plan.get("date")))
+                for job in plan.get("jobs", []):
+                    # Verify the job exists before inserting
+                    cur.execute("SELECT 1 FROM jobs WHERE id = %s", (job.get("id"),))
+                    if cur.fetchone():
+                        cur.execute("""
+                            INSERT INTO application_plan_jobs (plan_id, job_id, notes)
+                            VALUES (%s::uuid, %s, %s)
+                            ON CONFLICT DO NOTHING
+                        """, (pid, job.get("id"), job.get("notes", "")))
+    except Exception as e:
+        print(f"Error saving plans: {e}")
+
+
+# ── Company Cache ──────────────────────────────────────────
+
+def _load_company_cache_from_db():
+    """Warm the in-memory company cache from DB at startup."""
+    global _company_cache
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT company_name, summary, logo_url, industry FROM company_cache")
+            for name, summary, logo_url, industry in cur.fetchall():
+                _company_cache[name.lower()] = {
+                    "name": name,
+                    "summary": summary or "",
+                    "logo_url": logo_url or "",
+                    "industry": industry or "",
+                    "known_for": "",
+                    "website": "",
+                }
+    except Exception as e:
+        print(f"Warning: could not load company cache from DB: {e}")
+
+
+def _save_company_cache_entry(key, info):
+    """Upsert a single company cache entry to DB."""
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO company_cache (company_name, summary, logo_url, industry)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (company_name) DO UPDATE SET
+                    summary   = EXCLUDED.summary,
+                    logo_url  = EXCLUDED.logo_url,
+                    industry  = EXCLUDED.industry,
+                    cached_at = NOW()
+            """, (key, info.get("summary"), info.get("logo_url"), info.get("industry")))
+    except Exception as e:
+        print(f"Warning: could not save company cache entry: {e}")
+
+
+# Warm cache at startup
+_load_company_cache_from_db()
+
+
+# ─────────────────────────────────────────────────────────
+# COMPANY INFO (Wikipedia + Clearbit)
+# ─────────────────────────────────────────────────────────
 
 def _fetch_company_info(company_name):
     """Fetch company summary from Wikipedia and logo from Clearbit."""
@@ -87,14 +347,10 @@ def _fetch_company_info(company_name):
 
     result = {"name": company_name, "summary": "", "logo_url": "", "known_for": "", "industry": "", "website": ""}
 
-    # --- Wikipedia summary ---
     try:
         search_url = "https://en.wikipedia.org/w/api.php?" + urllib.parse.urlencode({
-            "action": "query",
-            "list": "search",
-            "srsearch": company_name + " company",
-            "srlimit": 1,
-            "format": "json"
+            "action": "query", "list": "search",
+            "srsearch": company_name + " company", "srlimit": 1, "format": "json"
         })
         req = urllib.request.Request(search_url, headers={"User-Agent": "JobDashboard/1.0"})
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -103,13 +359,8 @@ def _fetch_company_info(company_name):
         if results:
             title = results[0]["title"]
             summary_url = "https://en.wikipedia.org/w/api.php?" + urllib.parse.urlencode({
-                "action": "query",
-                "prop": "extracts",
-                "exintro": True,
-                "explaintext": True,
-                "exsentences": 4,
-                "titles": title,
-                "format": "json"
+                "action": "query", "prop": "extracts", "exintro": True,
+                "explaintext": True, "exsentences": 4, "titles": title, "format": "json"
             })
             req2 = urllib.request.Request(summary_url, headers={"User-Agent": "JobDashboard/1.0"})
             with urllib.request.urlopen(req2, timeout=8) as resp2:
@@ -123,13 +374,10 @@ def _fetch_company_info(company_name):
     except Exception:
         pass
 
-    # --- Derive "known for" and industry from the summary ---
     if result["summary"]:
         sentences = result["summary"].split(". ")
-        # First sentence usually says what the company does
         if sentences:
             result["known_for"] = sentences[0].rstrip(".") + "."
-        # Try to detect industry keywords
         text_lower = result["summary"].lower()
         industries = []
         industry_kw = {
@@ -151,22 +399,21 @@ def _fetch_company_info(company_name):
                 industries.append(industry)
         result["industry"] = ", ".join(industries[:2]) if industries else ""
 
-    # --- Website guess for logo ---
-    # Try common patterns
     clean = re.sub(r'[^a-zA-Z0-9]', '', company_name.lower().strip())
     result["website"] = clean + ".com"
-
-    # Clearbit logo API (free, no auth)
     result["logo_url"] = f"https://logo.clearbit.com/{result['website']}"
 
     with _company_cache_lock:
         _company_cache[key] = result
-    _save_company_cache()
+    _save_company_cache_entry(key, result)
     return result
 
 
+# ─────────────────────────────────────────────────────────
+# LINKEDIN / LIVE CHECK
+# ─────────────────────────────────────────────────────────
+
 def _fetch_applicants_curl(linkedin_job_id):
-    """Fetch applicant count from public LinkedIn job page."""
     url = f"https://www.linkedin.com/jobs/view/{linkedin_job_id}/"
     try:
         result = subprocess.run(
@@ -185,24 +432,19 @@ def _fetch_applicants_curl(linkedin_job_id):
 
 
 def _run_applicant_update():
-    """Background thread: curl each job's public page for applicant counts."""
-    global _update_status
+    """Background thread: curl each job's LinkedIn page for updated applicant counts."""
     import time
     from concurrent.futures import ThreadPoolExecutor
 
-    with open(METADATA_FILE) as f:
-        jobs = json.load(f)
-
+    jobs = load_jobs()
     state = load_state()
 
-    def _parse_applicant_count(s):
-        """Extract numeric count from strings like '142 applicants', 'Over 200 applicants'."""
+    def _parse_count(s):
         if not s:
             return 0
-        m2 = re.search(r'([\d,]+)', str(s))
-        return int(m2.group(1).replace(',', '')) if m2 else 0
+        m = re.search(r'([\d,]+)', str(s))
+        return int(m.group(1).replace(',', '')) if m else 0
 
-    # Only update jobs with < 500 applicants or no count at all
     pairs = []
     skipped = 0
     for j in jobs:
@@ -210,137 +452,54 @@ def _run_applicant_update():
         if not m or not j.get('id'):
             continue
         job_id = j['id']
-        # Check current count from state first, then from metadata
         current = state.get(job_id, {}).get('applicants') or j.get('applicants', '')
-        count = _parse_applicant_count(current)
-        if count >= 500:
+        if _parse_count(current) >= 500:
             skipped += 1
             continue
         pairs.append((job_id, m.group(1)))
 
     with _update_lock:
-        _update_status = {"running": True, "progress": 0, "total": len(pairs), "updated": 0, "failed": 0, "message": f"Running... ({skipped} skipped with 500+ applicants)"}
+        _update_status.update({"running": True, "progress": 0, "total": len(pairs),
+                                "updated": 0, "failed": 0,
+                                "message": f"Running... ({skipped} skipped with 500+ applicants)"})
 
-    batch_size = 15
-    delay = 0.5
-
-    for i in range(0, len(pairs), batch_size):
+    for i in range(0, len(pairs), 15):
         if not _update_status["running"]:
-            break  # cancelled
+            break
+        batch = pairs[i:i + 15]
 
-        batch = pairs[i:i + batch_size]
-
-        # Run curl requests in parallel within the batch
         def fetch_one(pair):
             job_id, linkedin_id = pair
-            applicants = _fetch_applicants_curl(linkedin_id)
-            return job_id, applicants
+            return job_id, _fetch_applicants_curl(linkedin_id)
 
-        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+        with ThreadPoolExecutor(max_workers=15) as executor:
             results = list(executor.map(fetch_one, batch))
 
         for job_id, applicants in results:
             with _update_lock:
                 _update_status["progress"] += 1
-                if applicants:
-                    if job_id not in state:
-                        state[job_id] = {}
-                    state[job_id]["applicants"] = applicants
+            if applicants:
+                if job_id not in state:
+                    state[job_id] = {}
+                state[job_id]["applicants"] = applicants
+                save_job_state(job_id, state[job_id])
+                with _update_lock:
                     _update_status["updated"] += 1
-                else:
+            else:
+                with _update_lock:
                     _update_status["failed"] += 1
 
-        # Save after every batch so dashboard can pick up changes in real time
-        save_state(state)
+        if i + 15 < len(pairs):
+            time.sleep(0.5)
 
-        if i + batch_size < len(pairs):
-            time.sleep(delay)
-
-    save_state(state)
     with _update_lock:
         _update_status["running"] = False
-        _update_status["message"] = f"Done! {_update_status['updated']} updated, {_update_status['failed']} failed."
-
-
-def _call_ollama(messages, model="qwen2.5:14b"):
-    """Call Ollama's local API for chat completions."""
-    payload = json.dumps({
-        "model": model,
-        "messages": messages,
-        "stream": False,
-    }).encode()
-    req = urllib.request.Request(
-        "http://localhost:11434/api/chat",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        result = json.loads(resp.read())
-    return result.get("message", {}).get("content", "")
-
-
-_BULLET_POOL = {
-    key: entry["bullets"]
-    for key, entry in _config["experience"].items()
-}
-
-_CANDIDATE_SKILLS = _config["candidate"]["skills"]
-
-
-def _build_job_context(job_id):
-    """Build context string for a job: metadata + description + resume + bullet pool."""
-    try:
-        with open(METADATA_FILE, "r") as f:
-            meta = json.load(f)
-        job = next((j for j in meta if j.get("id") == job_id), None)
-        if not job:
-            return None, None
-
-        parts = []
-        parts.append(f"Company: {job.get('company', 'Unknown')}")
-        parts.append(f"Title: {job.get('title', 'Unknown')}")
-        parts.append(f"Location: {job.get('location', 'Unknown')}")
-        parts.append(f"Work Type: {job.get('work_type', 'Unknown')}")
-        parts.append(f"Salary: {job.get('salary', 'N/A')}")
-        parts.append(f"Score: {job.get('score', 0)} | Tier: {job.get('tier', 'Unknown')}")
-        desc = job.get("description", "")
-        if desc:
-            parts.append(f"\nJOB DESCRIPTION:\n{desc}")
-
-        # Load tailored resume for this specific job
-        resume_text = None
-        resume_path = job.get("resume_path")
-        if resume_path:
-            full_path = os.path.join(PARENT_DIR, resume_path)
-            if os.path.isfile(full_path):
-                try:
-                    with open(full_path, "r") as f:
-                        resume_text = f.read()
-                except Exception:
-                    pass
-
-        return "\n".join(parts), resume_text
-    except Exception:
-        return None, None
-
-
-def _format_bullet_pool():
-    """Format the full bullet pool for the AI system prompt."""
-    lines = []
-    for company, bullets in _BULLET_POOL.items():
-        lines.append(f"\n{company}:")
-        for i, b in enumerate(bullets, 1):
-            lines.append(f"  {i}. {b}")
-    return "\n".join(lines)
+        _update_status["message"] = (
+            f"Done! {_update_status['updated']} updated, {_update_status['failed']} failed."
+        )
 
 
 def _check_job_live_linkedin(job_link):
-    """Check if a LinkedIn job posting is still live. Returns 'closed', 'live', or 'inconclusive'.
-
-    LinkedIn returns inconsistent responses to unauthenticated curl (tiny JS redirects vs full pages).
-    We only trust 'closed' when we get a full page (>10KB) with explicit closed language.
-    Short/empty responses are always 'inconclusive'.
-    """
     m = re.search(r'/view/(\d+)', job_link)
     if not m:
         return "inconclusive"
@@ -351,11 +510,9 @@ def _check_job_live_linkedin(job_link):
             capture_output=True, text=True, timeout=15
         )
         body = result.stdout
-        # LinkedIn often returns tiny JS redirect stubs (<5KB) — can't trust those
         if not body or len(body) < 10000:
             return "inconclusive"
         body_lower = body.lower()
-        # Only mark closed with explicit text on a full page
         if "no longer accepting applications" in body_lower or "this job is no longer available" in body_lower:
             return "closed"
         if re.search(r'\d+\s+applicants?', body, re.IGNORECASE) or "Easy Apply" in body:
@@ -368,11 +525,6 @@ def _check_job_live_linkedin(job_link):
 
 
 def _check_apply_link(apply_link):
-    """Check if a company apply link is still live. Returns 'closed', 'live', or 'inconclusive'.
-
-    Only marks 'closed' on definitive HTTP 404/410 responses.
-    HTTP 200 = live. Everything else = inconclusive.
-    """
     if not apply_link:
         return "inconclusive"
     try:
@@ -380,10 +532,10 @@ def _check_apply_link(apply_link):
             ["curl", "-s", "-L", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "10", apply_link],
             capture_output=True, text=True, timeout=15
         )
-        http_code = result.stdout.strip()
-        if http_code in ("404", "410"):
+        code = result.stdout.strip()
+        if code in ("404", "410"):
             return "closed"
-        if http_code == "200":
+        if code == "200":
             return "live"
         return "inconclusive"
     except Exception:
@@ -392,21 +544,17 @@ def _check_apply_link(apply_link):
 
 INTERVIEW_STAGES = {"1st Interview", "2nd Interview", "Final", "Verbal Offer", "Offer", "Accepted"}
 
+
 def _run_live_check(batch_filter=None):
-    """Background thread: check if jobs are still live on LinkedIn and company portals."""
-    global _live_check_status
+    """Background thread: check if jobs are still live on LinkedIn."""
     import time
     from datetime import datetime, timezone
     from concurrent.futures import ThreadPoolExecutor
 
-    with open(METADATA_FILE) as f:
-        jobs = json.load(f)
-
+    jobs = load_jobs()
     state = load_state()
 
-    # Sort by import_date ascending (oldest first)
     jobs.sort(key=lambda j: j.get("import_date", ""))
-
     if batch_filter:
         jobs = [j for j in jobs if j.get("import_date") == batch_filter]
 
@@ -417,43 +565,34 @@ def _run_live_check(batch_filter=None):
         apply_link = j.get("apply_link", "")
         if not job_id or not job_link:
             continue
-        current_status = state.get(job_id, {}).get("status")
-        pairs.append((job_id, job_link, apply_link, current_status, state.get(job_id, {}).get("timestamps", {})))
+        js = state.get(job_id, {})
+        pairs.append((job_id, job_link, apply_link, js.get("status"), js.get("timestamps", {})))
 
     with _live_check_lock:
-        _live_check_status = {
+        _live_check_status.update({
             "running": True, "progress": 0, "total": len(pairs),
             "closed": 0, "live": 0, "inconclusive": 0, "auto_updated": 0,
             "message": f"Checking {len(pairs)} jobs..."
-        }
+        })
 
-    batch_size = 10
-    delay = 1.5
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    for i in range(0, len(pairs), batch_size):
+    for i in range(0, len(pairs), 10):
         if not _live_check_status["running"]:
             break
-
-        batch = pairs[i:i + batch_size]
+        batch = pairs[i:i + 10]
 
         def check_one(pair):
             job_id, job_link, apply_link, current_status, timestamps = pair
             is_linkedin = "/linkedin.com/" in job_link
-            if is_linkedin:
-                result = _check_job_live_linkedin(job_link)
-            else:
-                # Non-LinkedIn job link: check it as an apply link directly
-                result = _check_apply_link(job_link)
+            result = _check_job_live_linkedin(job_link) if is_linkedin else _check_apply_link(job_link)
             if result == "inconclusive" and apply_link and apply_link != job_link:
-                apply_result = _check_apply_link(apply_link)
-                if apply_result == "closed":
-                    result = "closed"
-                elif apply_result == "live":
-                    result = "live"
+                r2 = _check_apply_link(apply_link)
+                if r2 in ("closed", "live"):
+                    result = r2
             return job_id, result, current_status, timestamps
 
-        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+        with ThreadPoolExecutor(max_workers=10) as executor:
             results = list(executor.map(check_one, batch))
 
         for job_id, result, current_status, timestamps in results:
@@ -472,81 +611,103 @@ def _run_live_check(batch_filter=None):
                     state[job_id]["status"] = "Position Closed, No Application Submitted"
                     auto_updated = True
 
+            save_job_state(job_id, state[job_id])
+
             with _live_check_lock:
                 _live_check_status["progress"] += 1
-                if result == "closed":
-                    _live_check_status["closed"] += 1
-                elif result == "live":
-                    _live_check_status["live"] += 1
-                else:
-                    _live_check_status["inconclusive"] += 1
+                _live_check_status[result if result in ("closed", "live") else "inconclusive"] += 1
                 if auto_updated:
                     _live_check_status["auto_updated"] += 1
 
-        save_state(state)
+        if i + 10 < len(pairs):
+            time.sleep(1.5)
 
-        if i + batch_size < len(pairs):
-            time.sleep(delay)
-
-    save_state(state)
     with _live_check_lock:
         _live_check_status["running"] = False
         s = _live_check_status
-        _live_check_status["message"] = f"Done! {s['closed']} closed, {s['live']} live, {s['inconclusive']} inconclusive. {s['auto_updated']} auto-updated."
+        _live_check_status["message"] = (
+            f"Done! {s['closed']} closed, {s['live']} live, {s['inconclusive']} inconclusive. "
+            f"{s['auto_updated']} auto-updated."
+        )
 
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return {}
+# ─────────────────────────────────────────────────────────
+# AI ASSISTANT
+# ─────────────────────────────────────────────────────────
+
+_BULLET_POOL = {key: entry["bullets"] for key, entry in _config["experience"].items()}
+_CANDIDATE_SKILLS = _config["candidate"]["skills"]
 
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+def _build_job_context(job_id):
+    """Build AI context string from DB for a given job."""
+    job = load_job(job_id)
+    if not job:
+        return None, None
+
+    parts = [
+        f"Company: {job.get('company', 'Unknown')}",
+        f"Title: {job.get('title', 'Unknown')}",
+        f"Location: {job.get('location', 'Unknown')}",
+        f"Work Type: {job.get('work_type', 'Unknown')}",
+        f"Salary: {job.get('salary', 'N/A')}",
+        f"Score: {job.get('score', 0)} | Tier: {job.get('tier', 'Unknown')}",
+    ]
+    if job.get("description"):
+        parts.append(f"\nJOB DESCRIPTION:\n{job['description']}")
+
+    return "\n".join(parts), job.get("resume_text")
 
 
-def load_plans():
-    if os.path.exists(PLANS_FILE):
-        with open(PLANS_FILE, "r") as f:
-            return json.load(f)
-    return []
+def _format_bullet_pool():
+    lines = []
+    for company, bullets in _BULLET_POOL.items():
+        lines.append(f"\n{company}:")
+        for i, b in enumerate(bullets, 1):
+            lines.append(f"  {i}. {b}")
+    return "\n".join(lines)
 
 
-def save_plans(plans):
-    with open(PLANS_FILE, "w") as f:
-        json.dump(plans, f, indent=2)
+def _call_ollama(messages, model="qwen2.5:14b"):
+    payload = json.dumps({"model": model, "messages": messages, "stream": False}).encode()
+    req = urllib.request.Request(
+        "http://localhost:11434/api/chat", data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        result = json.loads(resp.read())
+    return result.get("message", {}).get("content", "")
 
+
+# ─────────────────────────────────────────────────────────
+# CAREERS PAGE SCRAPER
+# ─────────────────────────────────────────────────────────
 
 def _run_scrape_careers(url, company_override=None):
-    """Background thread: scrape a careers page and import jobs."""
-    global _scrape_status
+    """Background thread: scrape a careers page and import new jobs."""
     import time as _time
-
-    # Import pipeline functions
     sys.path.insert(0, PARENT_DIR)
-    from process_new_postings import (
-        is_excluded_title, is_excluded_role, is_swe_role,
-        calc_tech_score, calc_level_bonus, calc_company_bonus, assign_tier,
-        make_job_id, generate_resume_files, rebuild_dashboard,
-    )
-    from scrape_careers_page import (
-        fetch_page, detect_platform, extract_greenhouse, extract_lever,
-        extract_ashby, extract_generic, fetch_description,
-    )
-    from datetime import date as _date
-    from urllib.parse import urlparse as _urlparse
 
     try:
+        from process_new_postings import (
+            is_excluded_title, is_excluded_role, is_swe_role,
+            calc_tech_score, calc_level_bonus, calc_company_bonus, assign_tier,
+            make_job_id, generate_resume_files,
+        )
+        from scrape_careers_page import (
+            fetch_page, detect_platform, extract_greenhouse, extract_lever,
+            extract_ashby, extract_generic, fetch_description,
+        )
+        from datetime import date as _date
+        from urllib.parse import urlparse as _urlparse
+
         with _scrape_lock:
-            _scrape_status = {"running": True, "progress": 0, "total": 0, "added": 0,
-                              "message": "Fetching careers page...", "jobs_found": []}
+            _scrape_status.update({"running": True, "progress": 0, "total": 0,
+                                   "added": 0, "message": "Fetching careers page...", "jobs_found": []})
 
         soup, final_url = fetch_page(url)
         platform = detect_platform(final_url, soup)
 
-        # Detect company name
         company = company_override
         if not company:
             og_site = soup.find('meta', property='og:site_name')
@@ -554,12 +715,10 @@ def _run_scrape_careers(url, company_override=None):
             if og_site and og_site.get('content'):
                 company = og_site['content'].strip()
             elif title_tag:
-                import re as _re
                 t = title_tag.get_text(strip=True)
                 for pat in [r'(?:jobs?\s+at|careers?\s+at)\s+(.+?)(?:\s*[-|]|$)',
-                            r'^(.+?)\s+(?:careers?|jobs?|openings?)',
-                            r'^(.+?)\s*[-|]']:
-                    m = _re.search(pat, t, _re.I)
+                            r'^(.+?)\s+(?:careers?|jobs?|openings?)', r'^(.+?)\s*[-|]']:
+                    m = re.search(pat, t, re.I)
                     if m:
                         company = m.group(1).strip()
                         break
@@ -569,32 +728,23 @@ def _run_scrape_careers(url, company_override=None):
         with _scrape_lock:
             _scrape_status["message"] = f"Detected {platform} — extracting jobs from {company}..."
 
-        extractors = {
-            'greenhouse': extract_greenhouse,
-            'lever': extract_lever,
-            'ashby': extract_ashby,
-        }
-        extractor = extractors.get(platform, extract_generic)
+        extractor = {"greenhouse": extract_greenhouse, "lever": extract_lever,
+                     "ashby": extract_ashby}.get(platform, extract_generic)
         raw_jobs = extractor(soup, final_url)
 
         # Deduplicate
-        seen = set()
-        unique = []
+        seen, unique = set(), []
         for j in raw_jobs:
             if j['url'] not in seen:
                 seen.add(j['url'])
                 unique.append(j)
         raw_jobs = unique
 
-        # Filter for SWE roles
-        swe_jobs = []
-        for j in raw_jobs:
-            tl = j['title'].lower()
-            if is_swe_role(tl) and not is_excluded_title(tl) and not is_excluded_role(tl):
-                swe_jobs.append(j)
-
+        swe_jobs = [j for j in raw_jobs
+                    if is_swe_role(j['title'].lower())
+                    and not is_excluded_title(j['title'].lower())
+                    and not is_excluded_role(j['title'].lower())]
         if not swe_jobs:
-            # If no SWE roles, include all
             swe_jobs = raw_jobs
 
         with _scrape_lock:
@@ -603,107 +753,84 @@ def _run_scrape_careers(url, company_override=None):
 
         if not swe_jobs:
             with _scrape_lock:
-                _scrape_status["running"] = False
-                _scrape_status["message"] = f"No jobs found. The page may use JavaScript rendering. Try the console script instead."
+                _scrape_status.update({"running": False, "message": "No jobs found."})
             return
 
-        # Fetch descriptions and score
+        # Load existing job links from DB to deduplicate
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT job_link FROM jobs")
+            existing_links = {row[0] for row in cur.fetchall()}
+
         processed_jobs = []
         for i, j in enumerate(swe_jobs):
             desc = fetch_description(j['url'])
-            dl = desc.lower()
-            tl = j['title'].lower()
-            tech_score = calc_tech_score(dl)
-            level_bonus = calc_level_bonus(tl)
-            company_bonus = calc_company_bonus(company)
-            total = tech_score + level_bonus + company_bonus
+            dl, tl = desc.lower(), j['title'].lower()
+            total = calc_tech_score(dl) + calc_level_bonus(tl) + calc_company_bonus(company)
             tier = assign_tier(total)
-
             processed_jobs.append({
                 'id': make_job_id(company, j['title'], j['url']),
-                'company': company,
-                'title': j['title'],
-                'salary': 'N/A',
-                'description': desc,
-                'apply_link': j['url'],
-                'job_link': j['url'],
-                'posted_date': '',
-                'location': j.get('location', ''),
-                'work_type': '',
-                'applicants': '',
-                'score': total,
-                'tier': tier,
+                'company': company, 'title': j['title'], 'salary': 'N/A',
+                'description': desc, 'apply_link': j['url'], 'job_link': j['url'],
+                'posted_date': '', 'location': j.get('location', ''), 'work_type': '',
+                'applicants': '', 'score': total, 'tier': tier,
                 'import_date': _date.today().isoformat(),
             })
-
             with _scrape_lock:
                 _scrape_status["progress"] = i + 1
                 _scrape_status["message"] = f"Scoring [{i+1}/{len(swe_jobs)}]: {j['title'][:50]}"
-
             if i < len(swe_jobs) - 1:
                 _time.sleep(0.3)
 
-        # Merge with existing metadata
-        existing = []
-        if os.path.exists(METADATA_FILE):
-            with open(METADATA_FILE) as f:
-                existing = json.load(f)
-
-        existing_keys = set()
-        for j in existing:
-            if j.get('job_link'):
-                existing_keys.add(j['job_link'])
-            else:
-                existing_keys.add(j.get('id', ''))
-
-        added = [j for j in processed_jobs if (j.get('job_link') or j.get('id', '')) not in existing_keys]
-        all_jobs = existing + added
-
+        # Insert new jobs into DB
+        added = [j for j in processed_jobs if j.get('job_link') not in existing_links]
         if added:
-            # Generate resumes
+            with Db() as conn:
+                cur = conn.cursor()
+                for j in added:
+                    cur.execute("""
+                        INSERT INTO jobs (id, company, title, location, work_type, salary,
+                                         posted_date, import_date, description, score, tier,
+                                         job_link, apply_link)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (id) DO NOTHING
+                    """, (j['id'], j['company'], j['title'], j['location'], j['work_type'],
+                          j['salary'], j['posted_date'], j['import_date'], j['description'],
+                          j['score'], j['tier'], j['job_link'], j['apply_link']))
+                    cur.execute("""
+                        INSERT INTO job_state (job_id) VALUES (%s)
+                        ON CONFLICT DO NOTHING
+                    """, (j['id'],))
             generate_resume_files(added)
-
-            # Save metadata
-            with open(METADATA_FILE, 'w') as f:
-                json.dump(all_jobs, f, indent=2)
-
-            # Rebuild dashboard
-            rebuild_dashboard(all_jobs)
 
         tiers = {}
         for j in processed_jobs:
             tiers.setdefault(j['tier'], []).append(j['title'])
-
         tier_summary = ", ".join(f"{t}: {len(v)}" for t, v in sorted(tiers.items()))
 
         with _scrape_lock:
-            _scrape_status["running"] = False
-            _scrape_status["added"] = len(added)
-            _scrape_status["jobs_found"] = [
-                {"title": j["title"], "tier": j["tier"], "score": j["score"], "location": j.get("location", "")}
-                for j in sorted(processed_jobs, key=lambda x: -x["score"])[:20]
-            ]
-            _scrape_status["message"] = (
-                f"Done! {len(processed_jobs)} positions found, {len(added)} new added. {tier_summary}. "
-                f"Reload the page to see them."
-            )
+            _scrape_status.update({
+                "running": False, "added": len(added),
+                "jobs_found": [
+                    {"title": j["title"], "tier": j["tier"], "score": j["score"],
+                     "location": j.get("location", "")}
+                    for j in sorted(processed_jobs, key=lambda x: -x["score"])[:20]
+                ],
+                "message": f"Done! {len(processed_jobs)} found, {len(added)} new added. {tier_summary}.",
+            })
 
     except Exception as e:
         with _scrape_lock:
-            _scrape_status["running"] = False
-            _scrape_status["message"] = f"Error: {str(e)}"
+            _scrape_status.update({"running": False, "message": f"Error: {str(e)}"})
 
+
+# ─────────────────────────────────────────────────────────
+# JOB DESCRIPTION FORMATTER
+# ─────────────────────────────────────────────────────────
 
 def _extract_relevant_description(description, max_chars=800):
-    """Extract the most relevant parts of a job description, skipping company boilerplate.
-
-    Keeps: responsibilities, requirements, qualifications, skills, team info, role details.
-    Skips: company overview, benefits, EEO statements, salary disclaimers, legal boilerplate.
-    """
     if not description:
         return ''
-
-    # Patterns that mark the START of relevant content
     relevant_pattern = re.compile(
         r'(what you\'?ll do|what you\'?ll work on|what you will do|your role|the role'
         r'|responsibilities|key responsibilities|primary responsibilities|core responsibilities'
@@ -718,8 +845,6 @@ def _extract_relevant_description(description, max_chars=800):
         r'|nice to have|preferred qualifications)',
         re.IGNORECASE
     )
-
-    # Patterns that mark the END / irrelevant sections
     skip_pattern = re.compile(
         r'(about us|about the company|who we are|our mission'
         r'|benefits|total rewards|compensation|salary range|pay range|pay transparency'
@@ -729,279 +854,51 @@ def _extract_relevant_description(description, max_chars=800):
         r'|please note that|note:)',
         re.IGNORECASE
     )
-
-    # Find the first relevant section marker
     match = relevant_pattern.search(description)
     if match:
-        # Start from this marker
-        start = match.start()
-        relevant_text = description[start:]
-
-        # Now find where irrelevant content begins and cut it off
+        relevant_text = description[match.start():]
         skip_match = skip_pattern.search(relevant_text)
-        if skip_match:
-            # Only cut if the skip marker is after some content
-            if skip_match.start() > 100:
-                relevant_text = relevant_text[:skip_match.start()]
+        if skip_match and skip_match.start() > 100:
+            relevant_text = relevant_text[:skip_match.start()]
     else:
-        # No clear section headers found - skip first ~30% as company overview
         total = len(description)
         start = min(total // 3, 500)
-        # Try to start at a sentence boundary
         boundary = description.find('.  ', start)
-        if boundary > 0 and boundary < start + 200:
+        if 0 < boundary < start + 200:
             relevant_text = description[boundary + 3:]
         else:
             relevant_text = description[start:]
 
-    # Clean up whitespace
     relevant_text = re.sub(r'\s{2,}', '  ', relevant_text).strip()
-
-    # Truncate to max_chars at a word boundary
     if len(relevant_text) > max_chars:
         relevant_text = relevant_text[:max_chars].rsplit(' ', 1)[0] + '...'
-
     return relevant_text
 
 
-def generate_plan_pdf(plan, jobs_lookup):
-    """Generate a color-coded PDF for an application plan."""
-    from reportlab.lib.pagesizes import letter
-    from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import inch
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
-    )
-
-    pdf_path = os.path.join(DIR, f"plan_{plan['id']}.pdf")
-
-    doc = SimpleDocTemplate(
-        pdf_path, pagesize=letter,
-        topMargin=0.6 * inch, bottomMargin=0.6 * inch,
-        leftMargin=0.7 * inch, rightMargin=0.7 * inch,
-    )
-
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(
-        'PlanTitle', parent=styles['Title'],
-        fontSize=22, spaceAfter=4, textColor=colors.HexColor('#1e3a5f'),
-    ))
-    styles.add(ParagraphStyle(
-        'PlanSubtitle', parent=styles['Normal'],
-        fontSize=11, textColor=colors.HexColor('#64748b'), spaceAfter=16,
-    ))
-    styles.add(ParagraphStyle(
-        'JobTitle', parent=styles['Normal'],
-        fontSize=11, textColor=colors.HexColor('#1e293b'), leading=14,
-    ))
-    styles.add(ParagraphStyle(
-        'JobDetail', parent=styles['Normal'],
-        fontSize=9, textColor=colors.HexColor('#475569'), leading=12,
-    ))
-    styles.add(ParagraphStyle(
-        'Notes', parent=styles['Normal'],
-        fontSize=9, textColor=colors.HexColor('#6b21a8'), leading=12,
-        fontName='Helvetica-Oblique',
-    ))
-    styles.add(ParagraphStyle(
-        'JobID', parent=styles['Normal'],
-        fontSize=8, textColor=colors.HexColor('#94a3b8'), leading=10,
-    ))
-    styles.add(ParagraphStyle(
-        'Description', parent=styles['Normal'],
-        fontSize=8, textColor=colors.HexColor('#334155'), leading=11,
-    ))
-
-    TIER_COLORS = {
-        'Strong Match': colors.HexColor('#16a34a'),
-        'Match': colors.HexColor('#2563eb'),
-        'Weak Match': colors.HexColor('#d97706'),
-    }
-    TIER_BG = {
-        'Strong Match': colors.HexColor('#f0fdf4'),
-        'Match': colors.HexColor('#eff6ff'),
-        'Weak Match': colors.HexColor('#fffbeb'),
-    }
-
-    story = []
-
-    # Title
-    story.append(Paragraph(f"Application Plan", styles['PlanTitle']))
-    job_count = len(plan.get('jobs', []))
-    story.append(Paragraph(
-        f"Date: <b>{plan['date']}</b>  &bull;  {job_count} position{'s' if job_count != 1 else ''}",
-        styles['PlanSubtitle'],
-    ))
-    if plan.get('title'):
-        story.append(Paragraph(plan['title'], styles['Heading2']))
-        story.append(Spacer(1, 6))
-
-    story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor('#e2e8f0')))
-    story.append(Spacer(1, 12))
-
-    # Job cards
-    for idx, plan_job in enumerate(plan.get('jobs', [])):
-        job_id = plan_job.get('id', '')
-        job = jobs_lookup.get(job_id, {})
-        tier = job.get('tier', 'Weak Match')
-        tier_color = TIER_COLORS.get(tier, colors.gray)
-        tier_bg = TIER_BG.get(tier, colors.HexColor('#f8fafc'))
-
-        # Checkbox + number
-        num = f"<b>{idx + 1}.</b>"
-
-        company = job.get('company', plan_job.get('company', 'Unknown'))
-        title = job.get('title', plan_job.get('title', 'Unknown'))
-        score = job.get('score', 0)
-        salary = job.get('salary', 'N/A')
-        location = job.get('location', '')
-        work_type = job.get('work_type', '')
-        apply_link = job.get('apply_link', '')
-        job_link = job.get('job_link', '')
-        resume_path = job.get('resume_path', '')
-        notes = plan_job.get('notes', '')
-
-        # Build table rows for this job card
-        card_data = []
-
-        # Row 1: Number, Company + Title, Tier badge
-        header_text = f"{num} <b>{company}</b> - {title}"
-        tier_text = f"<font color='white'><b> {tier} (Score: {score}) </b></font>"
-
-        card_data.append([
-            Paragraph(header_text, styles['JobTitle']),
-            Paragraph(tier_text, ParagraphStyle('tier_badge', parent=styles['Normal'],
-                fontSize=8, alignment=2, textColor=colors.white)),
-        ])
-
-        # Row 2: Job ID (for quick dashboard search)
-        if job_id:
-            card_data.append([Paragraph(f"ID: <b>{job_id}</b>  (search this in the Jobs tab)", styles['JobID']), ''])
-
-        # Row 3: Details
-        details = []
-        if salary and salary != 'N/A':
-            details.append(f"Salary: {salary}")
-        if location:
-            details.append(f"Location: {location}")
-        if work_type:
-            details.append(f"Type: {work_type}")
-        detail_str = "  |  ".join(details) if details else "No details available"
-        card_data.append([Paragraph(detail_str, styles['JobDetail']), ''])
-
-        # Row 4: Description (relevant parts only - responsibilities, requirements, skills)
-        raw_description = job.get('description', '')
-        description = _extract_relevant_description(raw_description, max_chars=800)
-        if description:
-            # Escape XML special chars for reportlab
-            description = description.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            card_data.append([Paragraph(f"<b>Role Details:</b> {description}", styles['Description']), ''])
-
-        # Row 5: Links
-        links = []
-        if apply_link:
-            links.append(f'<link href="{apply_link}"><u>Apply</u></link>')
-        if job_link:
-            links.append(f'<link href="{job_link}"><u>LinkedIn</u></link>')
-        if resume_path:
-            links.append(f"Resume: {resume_path}")
-        if links:
-            card_data.append([Paragraph("  |  ".join(links), styles['JobDetail']), ''])
-
-        # Row 6: Notes
-        if notes:
-            card_data.append([Paragraph(f"Notes: {notes}", styles['Notes']), ''])
-
-        # Row 5: Checkbox
-        card_data.append([Paragraph("[ ] Applied", styles['JobDetail']), ''])
-
-        col_widths = [5.4 * inch, 1.7 * inch]
-        t = Table(card_data, colWidths=col_widths)
-        style_cmds = [
-            ('BACKGROUND', (0, 0), (-1, 0), tier_bg),
-            ('BACKGROUND', (1, 0), (1, 0), tier_color),
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-            ('TOPPADDING', (0, 0), (-1, -1), 4),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-            ('LEFTPADDING', (0, 0), (-1, -1), 8),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 8),
-            ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#cbd5e1')),
-            ('LINEBELOW', (0, 0), (-1, 0), 0.5, colors.HexColor('#e2e8f0')),
-        ]
-        # Span all rows after the header across both columns
-        for r in range(1, len(card_data)):
-            style_cmds.append(('SPAN', (0, r), (1, r)))
-        t.setStyle(TableStyle(style_cmds))
-
-        story.append(t)
-        story.append(Spacer(1, 10))
-
-    # Summary footer
-    story.append(Spacer(1, 10))
-    story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#e2e8f0')))
-    story.append(Spacer(1, 8))
-
-    tier_counts = {}
-    for pj in plan.get('jobs', []):
-        j = jobs_lookup.get(pj.get('id', ''), {})
-        t = j.get('tier', 'Unknown')
-        tier_counts[t] = tier_counts.get(t, 0) + 1
-
-    summary_parts = [f"<b>Summary:</b> {job_count} positions"]
-    for t_name in ['Strong Match', 'Match', 'Weak Match']:
-        if tier_counts.get(t_name, 0) > 0:
-            hex_color = '#16a34a' if t_name == 'Strong Match' else '#2563eb' if t_name == 'Match' else '#d97706'
-            summary_parts.append(f"<font color='{hex_color}'>{t_name}: {tier_counts[t_name]}</font>")
-    story.append(Paragraph("  |  ".join(summary_parts), styles['JobDetail']))
-
-    doc.build(story)
-    return pdf_path
-
-
 def format_job_description(raw):
-    """Format a raw LinkedIn job description into readable HTML.
-
-    LinkedIn's Voyager API strips newlines, leaving double-space as the
-    only separator between sections. This function reconstructs structure
-    by detecting section headers and bullet-like patterns.
-    """
     import html as html_mod
     if not raw or not raw.strip():
         return "<p>No description available.</p>"
 
-    # Normalize curly quotes/apostrophes to ASCII
     raw = raw.replace('\u2018', "'").replace('\u2019', "'")
     raw = raw.replace('\u201c', '"').replace('\u201d', '"')
-
-    # Split on double-space boundaries (LinkedIn's section separator)
     chunks = re.split(r'  +', raw.strip())
 
-    # Common section header patterns
     header_re = re.compile(
         r"^(?:about (?:the |this )?(?:role|position|team|company|job|us|you)|"
-        r"what you'?ll (?:do|bring|need|work on)|"
-        r"who you are|who we are|"
+        r"what you'?ll (?:do|bring|need|work on)|who you are|who we are|"
         r"(?:key |core |your )?responsibilities|"
         r"(?:minimum |preferred |basic |required |desired )?(?:qualifications|requirements|skills|experience)|"
-        r"nice to have|bonus points|preferred skills|"
-        r"(?:what )?we (?:offer|provide|'re looking for)|"
-        r"benefits(?: and perks)?|compensation|perks|"
-        r"why (?:join|work)|our (?:team|culture|mission)|"
-        r"tech(?:nology)? stack|tools we use|"
-        r"job (?:description|details|summary|category)|"
+        r"nice to have|bonus points|preferred skills|(?:what )?we (?:offer|provide|'re looking for)|"
+        r"benefits(?: and perks)?|compensation|perks|why (?:join|work)|our (?:team|culture|mission)|"
+        r"tech(?:nology)? stack|tools we use|job (?:description|details|summary|category)|"
         r"equal opportunity|eeo|diversity|"
         r"(?:location|pay|salary|base|total) (?:requirement|range|details)?|"
-        r"how to apply|additional information|"
-        r"the (?:role|team|opportunity|impact)|"
+        r"how to apply|additional information|the (?:role|team|opportunity|impact)|"
         r"you(?:'ll| will) (?:have|be)|in this role)s?\s*:?\s*$",
         re.IGNORECASE
     )
-
-    # Detect bullet-like items (start with •, -, *, or numbered)
     bullet_re = re.compile(r'^(?:[•\-\*]|\d+[.)]\s)\s*')
-
-    # Common sentence-starting verbs for detecting run-together bullets
     _verbs = ('Design|Build|Develop|Create|Implement|Ensure|Collaborate|Leverage|'
               'Maintain|Lead|Drive|Work|Manage|Write|Test|Deploy|Configure|Monitor|'
               'Support|Architect|Define|Integrate|Evaluate|Establish|Own|Partner|'
@@ -1019,15 +916,12 @@ def format_job_description(raw):
         chunk = chunk.strip()
         if not chunk:
             continue
-
-        # Check bullets first (before header, since "• Python" could match title-case heuristic)
         if bullet_re.match(chunk):
             lines.append(('bullet', bullet_re.sub('', chunk)))
-        # Then check if this chunk is a section header
-        elif header_re.match(chunk) or (len(chunk) < 60 and chunk.endswith(':')) or (len(chunk) < 50 and chunk == chunk.title() and not chunk.endswith('.')):
+        elif (header_re.match(chunk) or (len(chunk) < 60 and chunk.endswith(':'))
+              or (len(chunk) < 50 and chunk == chunk.title() and not chunk.endswith('.'))):
             lines.append(('header', chunk.rstrip(':')))
         else:
-            # Try to detect run-together bullet items within a chunk
             split_bullets = run_together_re.split(chunk)
             if len(split_bullets) > 2 and all(len(s.strip()) > 15 for s in split_bullets):
                 for b in split_bullets:
@@ -1035,9 +929,7 @@ def format_job_description(raw):
             else:
                 lines.append(('text', chunk))
 
-    # Build HTML
-    parts = []
-    in_list = False
+    parts, in_list = [], False
     for kind, content in lines:
         escaped = html_mod.escape(content)
         if kind == 'header':
@@ -1057,8 +949,130 @@ def format_job_description(raw):
             parts.append(f'<p style="font-size:0.75rem;color:#4b5563;margin:0.35rem 0;">{escaped}</p>')
     if in_list:
         parts.append('</ul>')
-
     return '\n'.join(parts)
+
+
+# ─────────────────────────────────────────────────────────
+# PDF PLAN GENERATOR
+# ─────────────────────────────────────────────────────────
+
+def generate_plan_pdf(plan, jobs_lookup):
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+
+    pdf_path = os.path.join(DIR, f"plan_{plan['id']}.pdf")
+    doc = SimpleDocTemplate(pdf_path, pagesize=letter,
+                            topMargin=0.6*inch, bottomMargin=0.6*inch,
+                            leftMargin=0.7*inch, rightMargin=0.7*inch)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle('PlanTitle', parent=styles['Title'], fontSize=22, spaceAfter=4, textColor=colors.HexColor('#1e3a5f')))
+    styles.add(ParagraphStyle('PlanSubtitle', parent=styles['Normal'], fontSize=11, textColor=colors.HexColor('#64748b'), spaceAfter=16))
+    styles.add(ParagraphStyle('JobTitle', parent=styles['Normal'], fontSize=11, textColor=colors.HexColor('#1e293b'), leading=14))
+    styles.add(ParagraphStyle('JobDetail', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor('#475569'), leading=12))
+    styles.add(ParagraphStyle('Notes', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor('#6b21a8'), leading=12, fontName='Helvetica-Oblique'))
+    styles.add(ParagraphStyle('JobID', parent=styles['Normal'], fontSize=8, textColor=colors.HexColor('#94a3b8'), leading=10))
+    styles.add(ParagraphStyle('Description', parent=styles['Normal'], fontSize=8, textColor=colors.HexColor('#334155'), leading=11))
+
+    TIER_COLORS = {'Strong Match': colors.HexColor('#16a34a'), 'Match': colors.HexColor('#2563eb'), 'Weak Match': colors.HexColor('#d97706')}
+    TIER_BG = {'Strong Match': colors.HexColor('#f0fdf4'), 'Match': colors.HexColor('#eff6ff'), 'Weak Match': colors.HexColor('#fffbeb')}
+
+    story = [Paragraph("Application Plan", styles['PlanTitle'])]
+    job_count = len(plan.get('jobs', []))
+    story.append(Paragraph(f"Date: <b>{plan['date']}</b>  &bull;  {job_count} position{'s' if job_count != 1 else ''}", styles['PlanSubtitle']))
+    if plan.get('title'):
+        story.append(Paragraph(plan['title'], styles['Heading2']))
+        story.append(Spacer(1, 6))
+    story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor('#e2e8f0')))
+    story.append(Spacer(1, 12))
+
+    for idx, plan_job in enumerate(plan.get('jobs', [])):
+        job_id = plan_job.get('id', '')
+        job = jobs_lookup.get(job_id, {})
+        tier = job.get('tier', 'Weak Match')
+        tier_color = TIER_COLORS.get(tier, colors.gray)
+        tier_bg = TIER_BG.get(tier, colors.HexColor('#f8fafc'))
+        company = job.get('company', plan_job.get('company', 'Unknown'))
+        title = job.get('title', plan_job.get('title', 'Unknown'))
+        score = job.get('score', 0)
+        notes = plan_job.get('notes', '')
+
+        card_data = [[
+            Paragraph(f"<b>{idx+1}.</b> <b>{company}</b> - {title}", styles['JobTitle']),
+            Paragraph(f"<font color='white'><b> {tier} (Score: {score}) </b></font>",
+                      ParagraphStyle('tb', parent=styles['Normal'], fontSize=8, alignment=2, textColor=colors.white)),
+        ]]
+        if job_id:
+            card_data.append([Paragraph(f"ID: <b>{job_id}</b>", styles['JobID']), ''])
+        details = " | ".join(filter(None, [
+            f"Salary: {job.get('salary')}" if job.get('salary') and job.get('salary') != 'N/A' else None,
+            f"Location: {job.get('location')}" if job.get('location') else None,
+            f"Type: {job.get('work_type')}" if job.get('work_type') else None,
+        ])) or "No details"
+        card_data.append([Paragraph(details, styles['JobDetail']), ''])
+        desc = _extract_relevant_description(job.get('description', ''), 800)
+        if desc:
+            desc = desc.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            card_data.append([Paragraph(f"<b>Role Details:</b> {desc}", styles['Description']), ''])
+        links = " | ".join(filter(None, [
+            f'<link href="{job.get("apply_link")}"><u>Apply</u></link>' if job.get('apply_link') else None,
+            f'<link href="{job.get("job_link")}"><u>LinkedIn</u></link>' if job.get('job_link') else None,
+        ]))
+        if links:
+            card_data.append([Paragraph(links, styles['JobDetail']), ''])
+        if notes:
+            card_data.append([Paragraph(f"Notes: {notes}", styles['Notes']), ''])
+        card_data.append([Paragraph("[ ] Applied", styles['JobDetail']), ''])
+
+        col_widths = [5.4*inch, 1.7*inch]
+        t = Table(card_data, colWidths=col_widths)
+        style_cmds = [
+            ('BACKGROUND', (0, 0), (-1, 0), tier_bg),
+            ('BACKGROUND', (1, 0), (1, 0), tier_color),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+            ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#cbd5e1')),
+            ('LINEBELOW', (0, 0), (-1, 0), 0.5, colors.HexColor('#e2e8f0')),
+        ]
+        for r in range(1, len(card_data)):
+            style_cmds.append(('SPAN', (0, r), (1, r)))
+        t.setStyle(TableStyle(style_cmds))
+        story.append(t)
+        story.append(Spacer(1, 10))
+
+    story.append(Spacer(1, 10))
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#e2e8f0')))
+    story.append(Spacer(1, 8))
+    tier_counts = {}
+    for pj in plan.get('jobs', []):
+        t = jobs_lookup.get(pj.get('id', ''), {}).get('tier', 'Unknown')
+        tier_counts[t] = tier_counts.get(t, 0) + 1
+    summary_parts = [f"<b>Summary:</b> {job_count} positions"]
+    for t_name, hex_color in [('Strong Match', '#16a34a'), ('Match', '#2563eb'), ('Weak Match', '#d97706')]:
+        if tier_counts.get(t_name, 0) > 0:
+            summary_parts.append(f"<font color='{hex_color}'>{t_name}: {tier_counts[t_name]}</font>")
+    story.append(Paragraph("  |  ".join(summary_parts), styles['JobDetail']))
+
+    doc.build(story)
+    return pdf_path
+
+
+# ─────────────────────────────────────────────────────────
+# HTTP REQUEST HANDLER
+# ─────────────────────────────────────────────────────────
+
+def _json_response(handler, data, status=200):
+    body = json.dumps(data).encode()
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    handler.wfile.write(body)
 
 
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):
@@ -1068,80 +1082,113 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             self.path = "/dashboard.html"
+
+        # ── /api/config ──────────────────────────────────
         if self.path == "/api/config":
-            payload = {
+            _json_response(self, {
                 "name": _config["candidate"]["name"],
                 "linkedin_url": _config["candidate"]["linkedin_url"],
-            }
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(json.dumps(payload).encode())
+            })
             return
+
+        # ── /api/state — all job state ───────────────────
         if self.path == "/api/state":
-            state = load_state()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(json.dumps(state).encode())
+            _json_response(self, load_state())
             return
+
+        # ── /api/jobs-data — full job list + state merged ─
+        if self.path == "/api/jobs-data":
+            try:
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT j.id, j.company, j.title, j.location, j.work_type, j.salary,
+                               j.posted_date, j.import_date, j.score, j.tier,
+                               j.job_link, j.apply_link,
+                               js.status, js.notes, js.applicants,
+                               js.live_status, js.live_status_checked, js.timestamps
+                        FROM jobs j
+                        LEFT JOIN job_state js ON j.id = js.job_id
+                        ORDER BY j.import_date DESC, j.score DESC
+                    """)
+                    cols = [d[0] for d in cur.description]
+                    rows = cur.fetchall()
+                jobs = [_serialize(dict(zip(cols, row))) for row in rows]
+                _json_response(self, jobs)
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── /api/batch-stats ─────────────────────────────
+        if self.path == "/api/batch-stats":
+            try:
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT import_date, tier, COUNT(*) as count
+                        FROM jobs GROUP BY import_date, tier
+                        ORDER BY import_date DESC
+                    """)
+                    rows = cur.fetchall()
+                batches = {}
+                for import_date, tier, count in rows:
+                    if import_date not in batches:
+                        batches[import_date] = {"date": import_date, "tiers": {}}
+                    batches[import_date]["tiers"][tier] = count
+                _json_response(self, list(batches.values()))
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── /api/jobs — job IDs + links (for update scripts) ─
+        if self.path == "/api/jobs":
+            try:
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT id, job_link FROM jobs WHERE job_link IS NOT NULL")
+                    jobs = [{"id": row[0], "job_link": row[1]} for row in cur.fetchall()]
+                _json_response(self, jobs)
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── /api/plans ───────────────────────────────────
+        if self.path == "/api/plans":
+            _json_response(self, load_plans())
+            return
+
+        # ── /api/update-status ───────────────────────────
         if self.path == "/api/update-status":
             with _update_lock:
-                status = dict(_update_status)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(status).encode())
+                _json_response(self, dict(_update_status))
             return
+
+        # ── /api/live-check-status ───────────────────────
         if self.path == "/api/live-check-status":
             with _live_check_lock:
-                status = dict(_live_check_status)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(status).encode())
+                _json_response(self, dict(_live_check_status))
             return
-        if self.path == "/api/jobs":
-            # Return job IDs and their LinkedIn job links for the applicant update script
-            try:
-                with open(METADATA_FILE, "r") as f:
-                    meta = json.load(f)
-                jobs = [{"id": j.get("id", ""), "job_link": j.get("job_link", "")} for j in meta if j.get("job_link")]
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(json.dumps(jobs).encode())
-            except Exception as e:
-                self.send_response(500)
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+
+        # ── /api/scrape-status ───────────────────────────
+        if self.path == "/api/scrape-status":
+            with _scrape_lock:
+                _json_response(self, dict(_scrape_status))
             return
+
+        # ── /api/refresh-job/<id> ────────────────────────
         if self.path.startswith("/api/refresh-job/"):
             job_id = self.path[len("/api/refresh-job/"):].strip()
             if not job_id:
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"error":"Missing job ID"}')
+                _json_response(self, {"error": "Missing job ID"}, 400)
                 return
             try:
-                with open(METADATA_FILE, "r") as f:
-                    meta = json.load(f)
-                job = next((j for j in meta if j.get("id") == job_id), None)
+                job = load_job(job_id)
                 if not job:
-                    self.send_response(404)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"error":"Job not found"}')
+                    _json_response(self, {"error": "Job not found"}, 404)
                     return
                 state = load_state()
-                saved = state.get(job_id, {})
-                result = dict(saved)
-                # Fetch latest applicant count from LinkedIn
+                result = dict(state.get(job_id, {}))
+
                 job_link = job.get("job_link", "")
                 m = re.search(r'/view/(\d+)', job_link)
                 if m:
@@ -1151,107 +1198,64 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         if job_id not in state:
                             state[job_id] = {}
                         state[job_id]["applicants"] = applicants
-                        save_state(state)
-                # Also check live status
+                        save_job_state(job_id, state[job_id])
+
                 is_linkedin = "/linkedin.com/" in job_link
-                if is_linkedin:
-                    live_result = _check_job_live_linkedin(job_link)
-                else:
-                    live_result = _check_apply_link(job_link)
+                live_result = _check_job_live_linkedin(job_link) if is_linkedin else _check_apply_link(job_link)
                 if live_result != "inconclusive":
-                    result["live_status"] = live_result
-                    state[job_id]["live_status"] = live_result
                     import datetime
-                    state[job_id]["live_status_checked"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    result["live_status_checked"] = state[job_id]["live_status_checked"]
-                    save_state(state)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(result).encode())
+                    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    result["live_status"] = live_result
+                    result["live_status_checked"] = now_iso
+                    if job_id not in state:
+                        state[job_id] = {}
+                    state[job_id]["live_status"] = live_result
+                    state[job_id]["live_status_checked"] = now_iso
+                    save_job_state(job_id, state[job_id])
+
+                _json_response(self, result)
             except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                _json_response(self, {"error": str(e)}, 500)
             return
+
+        # ── /api/company-info/<name> ─────────────────────
         if self.path.startswith("/api/company-info/"):
             from urllib.parse import unquote
             company_name = unquote(self.path[len("/api/company-info/"):]).strip()
             if not company_name:
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"error":"Missing company name"}')
+                _json_response(self, {"error": "Missing company name"}, 400)
                 return
             try:
-                info = _fetch_company_info(company_name)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(json.dumps(info).encode())
+                _json_response(self, _fetch_company_info(company_name))
             except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                _json_response(self, {"error": str(e)}, 500)
             return
-        if self.path == "/api/scrape-status":
-            with _scrape_lock:
-                status = dict(_scrape_status)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(status).encode())
-            return
-        if self.path == "/api/plans":
-            plans = load_plans()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(plans).encode())
-            return
+
+        # ── /api/job-description/<id> ────────────────────
         if self.path.startswith("/api/job-description/"):
             job_id = self.path[len("/api/job-description/"):]
             try:
-                with open(METADATA_FILE, "r") as f:
-                    meta = json.load(f)
-                job = next((j for j in meta if j.get("id") == job_id), None)
+                job = load_job(job_id)
                 if not job:
-                    self.send_response(404)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"error":"Job not found"}')
+                    _json_response(self, {"error": "Job not found"}, 404)
                     return
                 raw = job.get("description", "")
-                formatted = format_job_description(raw)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(json.dumps({"description": raw, "formatted": formatted}).encode())
+                _json_response(self, {"description": raw, "formatted": format_job_description(raw)})
             except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                _json_response(self, {"error": str(e)}, 500)
             return
+
+        # ── /api/plan-pdf/<id> ───────────────────────────
         if self.path.startswith("/api/plan-pdf/"):
             plan_id = self.path[len("/api/plan-pdf/"):]
             plans = load_plans()
             plan = next((p for p in plans if p['id'] == plan_id), None)
             if not plan:
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write(b'{"error":"Plan not found"}')
+                _json_response(self, {"error": "Plan not found"}, 404)
                 return
             try:
-                with open(METADATA_FILE) as f:
-                    meta = json.load(f)
-                jobs_lookup = {}
-                for j in meta:
-                    if j.get('id'):
-                        jobs_lookup[j['id']] = j
+                jobs = load_jobs()
+                jobs_lookup = {j['id']: j for j in jobs}
                 pdf_path = generate_plan_pdf(plan, jobs_lookup)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/pdf")
@@ -1261,72 +1265,57 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     self.wfile.write(f.read())
                 os.remove(pdf_path)
             except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                _json_response(self, {"error": str(e)}, 500)
             return
-        # Serve resume files from the parent directory
+
+        # ── /resumes/* — serve resume files ─────────────
         if self.path.startswith("/resumes/"):
             from urllib.parse import unquote
-            rel = unquote(self.path[1:])  # strip leading /
+            rel = unquote(self.path[1:])
             file_path = os.path.normpath(os.path.join(PARENT_DIR, rel))
-            # Security: ensure path stays within PARENT_DIR
             if not file_path.startswith(PARENT_DIR):
                 self.send_response(403)
                 self.end_headers()
                 return
             if os.path.isfile(file_path):
                 self.send_response(200)
-                if file_path.endswith(".pdf"):
-                    self.send_header("Content-Type", "application/pdf")
-                else:
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Type", "application/pdf" if file_path.endswith(".pdf") else "text/plain; charset=utf-8")
                 self.end_headers()
                 with open(file_path, "rb") as f:
                     self.wfile.write(f.read())
-                return
             else:
                 self.send_response(404)
                 self.end_headers()
                 self.wfile.write(b"File not found")
-                return
+            return
+
         return super().do_GET()
 
     def do_POST(self):
+        # ── /api/upload-resume/<path> ────────────────────
         if self.path.startswith("/api/upload-resume/"):
-            # Upload a PDF resume for a specific job
-            # Path format: /api/upload-resume/{resume_path_base64}
-            # The resume_path is the relative path to the resume directory (e.g. resumes/Google/SWE_III)
             from urllib.parse import unquote
             import base64
             try:
                 encoded_path = self.path[len("/api/upload-resume/"):]
                 resume_dir = base64.urlsafe_b64decode(encoded_path).decode("utf-8")
                 full_dir = os.path.normpath(os.path.join(PARENT_DIR, resume_dir))
-                # Security check
                 if not full_dir.startswith(PARENT_DIR):
                     self.send_response(403)
                     self.end_headers()
                     return
-
                 content_length = int(self.headers.get("Content-Length", 0))
                 file_data = self.rfile.read(content_length)
-
                 os.makedirs(full_dir, exist_ok=True)
                 pdf_path = os.path.join(full_dir, "resume.pdf")
                 with open(pdf_path, "wb") as f:
                     f.write(file_data)
-
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"ok": True, "path": resume_dir + "/resume.pdf"}).encode())
+                _json_response(self, {"ok": True, "path": resume_dir + "/resume.pdf"})
             except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                _json_response(self, {"error": str(e)}, 500)
             return
 
+        # ── POST /api/state — save single job state ──────
         if self.path == "/api/state":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
@@ -1334,40 +1323,28 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 data = json.loads(body)
                 job_id = data.get("id")
                 job_state = data.get("state")
-                if job_id and job_state:
-                    all_state = load_state()
-                    all_state[job_id] = job_state
-                    save_state(all_state)
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"ok":true}')
+                if job_id and job_state is not None:
+                    save_job_state(job_id, job_state)
+                    _json_response(self, {"ok": True})
                 else:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(b'{"error":"missing id or state"}')
+                    _json_response(self, {"error": "missing id or state"}, 400)
             except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                _json_response(self, {"error": str(e)}, 500)
             return
 
+        # ── POST /api/plans — save all plans ────────────
         if self.path == "/api/plans":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             try:
                 plans = json.loads(body)
                 save_plans(plans)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"ok":true}')
+                _json_response(self, {"ok": True})
             except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                _json_response(self, {"error": str(e)}, 500)
             return
 
+        # ── POST /api/scrape-careers ─────────────────────
         if self.path == "/api/scrape-careers":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
@@ -1376,30 +1353,18 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 url = data.get("url", "").strip()
                 company = data.get("company", "").strip() or None
                 if not url:
-                    self.send_response(400)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"error":"URL is required"}')
+                    _json_response(self, {"error": "URL is required"}, 400)
                     return
                 if _scrape_status.get("running"):
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"ok":true,"message":"Already running"}')
+                    _json_response(self, {"ok": True, "message": "Already running"})
                 else:
-                    t = threading.Thread(target=_run_scrape_careers, args=(url, company), daemon=True)
-                    t.start()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"ok":true,"message":"Started"}')
+                    threading.Thread(target=_run_scrape_careers, args=(url, company), daemon=True).start()
+                    _json_response(self, {"ok": True, "message": "Started"})
             except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                _json_response(self, {"error": str(e)}, 500)
             return
 
+        # ── POST /api/ai-chat ────────────────────────────
         if self.path == "/api/ai-chat":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length > 0 else {}
@@ -1409,18 +1374,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             model = body.get("model", "qwen2.5:14b")
 
             if not user_message:
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"error":"No message provided"}')
+                _json_response(self, {"error": "No message provided"}, 400)
                 return
 
-            # Build rich system prompt with job context, resume, and bullet pool
             _candidate_name = _config["candidate"]["name"]
-            _candidate_summary = _config["candidate"].get("summary", "")
             _experience_contexts = ", ".join(
-                entry.get("context", key)
-                for key, entry in _config["experience"].items()
+                entry.get("context", key) for key, entry in _config["experience"].items()
             )
             system_parts = [
                 f"You are a job search assistant for a software engineer named {_candidate_name}.",
@@ -1434,13 +1393,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 "- For interview prep, tailor questions to the specific technologies and responsibilities in the job posting",
                 "- Be direct and actionable — no generic advice",
                 "",
-                f"IMPORTANT: When discussing resume improvements, you must work with {_candidate_name}'s ACTUAL experience bullets listed below. You can suggest rephrasing them to better match a job, reordering them, or highlighting specific ones — but do NOT invent experience they don't have.",
+                f"IMPORTANT: When discussing resume improvements, you must work with {_candidate_name}'s ACTUAL experience bullets listed below.",
+                f"\n--- {_candidate_name.upper()}'S FULL EXPERIENCE BULLET POOL ---",
+                "These are all the resume bullets available:",
+                _format_bullet_pool(),
             ]
-
-            # Always include the bullet pool so the AI knows what's available
-            system_parts.append(f"\n--- {_candidate_name.upper()}'S FULL EXPERIENCE BULLET POOL ---")
-            system_parts.append("These are all the resume bullets available. The resume for each job is built by selecting and ordering from this pool:")
-            system_parts.append(_format_bullet_pool())
 
             if job_id:
                 job_context, resume_text = _build_job_context(job_id)
@@ -1448,7 +1405,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     system_parts.append("\n--- TARGET JOB POSTING ---\n" + job_context)
                 if resume_text:
                     system_parts.append("\n--- CURRENT TAILORED RESUME FOR THIS JOB ---")
-                    system_parts.append("This is the resume that was auto-generated for this specific job. Suggest improvements:")
                     system_parts.append(resume_text)
 
             messages = [{"role": "system", "content": "\n".join(system_parts)}]
@@ -1457,84 +1413,53 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
             try:
                 response = _call_ollama(messages, model=model)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(json.dumps({"response": response, "model": model}).encode())
+                _json_response(self, {"response": response, "model": model})
             except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                _json_response(self, {"error": str(e)}, 500)
             return
 
+        # ── POST /api/run-live-check ─────────────────────
         if self.path == "/api/run-live-check":
             if _live_check_status["running"]:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"ok":true,"message":"Already running"}')
+                _json_response(self, {"ok": True, "message": "Already running"})
             else:
                 batch_filter = None
                 length = int(self.headers.get("Content-Length", 0))
                 if length > 0:
                     try:
-                        body = json.loads(self.rfile.read(length))
-                        batch_filter = body.get("batch")
+                        batch_filter = json.loads(self.rfile.read(length)).get("batch")
                     except Exception:
                         pass
-                t = threading.Thread(target=_run_live_check, args=(batch_filter,), daemon=True)
-                t.start()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"ok":true,"message":"Started"}')
+                threading.Thread(target=_run_live_check, args=(batch_filter,), daemon=True).start()
+                _json_response(self, {"ok": True, "message": "Started"})
             return
 
+        # ── POST /api/run-update-applicants ─────────────
         if self.path == "/api/run-update-applicants":
             if _update_status["running"]:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"ok":true,"message":"Already running"}')
+                _json_response(self, {"ok": True, "message": "Already running"})
             else:
-                t = threading.Thread(target=_run_applicant_update, daemon=True)
-                t.start()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"ok":true,"message":"Started"}')
+                threading.Thread(target=_run_applicant_update, daemon=True).start()
+                _json_response(self, {"ok": True, "message": "Started"})
             return
 
+        # ── POST /api/update-applicants ──────────────────
         if self.path == "/api/update-applicants":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             try:
                 data = json.loads(body)
-                # Expects: {"updates": [{"id": "abc123", "applicants": "142 applicants"}, ...]}
                 updates = data.get("updates", [])
-                all_state = load_state()
                 count = 0
                 for u in updates:
                     job_id = u.get("id")
                     applicants = u.get("applicants")
                     if job_id and applicants is not None:
-                        if job_id not in all_state:
-                            all_state[job_id] = {}
-                        all_state[job_id]["applicants"] = applicants
+                        save_job_state(job_id, {"applicants": applicants})
                         count += 1
-                save_state(all_state)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(json.dumps({"ok": True, "updated": count}).encode())
+                _json_response(self, {"ok": True, "updated": count})
             except Exception as e:
-                self.send_response(500)
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                _json_response(self, {"error": str(e)}, 500)
             return
 
         self.send_response(404)
@@ -1548,7 +1473,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format, *args):
-        # Only log API calls, not static file serving
         try:
             if args and "/api/" in str(args[0]):
                 super().log_message(format, *args)
@@ -1557,11 +1481,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"Starting Job Dashboard server...")
-    print(f"State file: {STATE_FILE}")
+    print(f"Starting Job Dashboard server on port {PORT}...")
     print(f"Open http://localhost:{PORT} in your browser")
     print(f"Press Ctrl+C to stop\n")
-
     server = http.server.HTTPServer(("", PORT), DashboardHandler)
     try:
         server.serve_forever()
