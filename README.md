@@ -311,7 +311,12 @@ aws ssm put-parameter \
 ssh -i <key.pem> <ec2-user>@<EC2-IP> "docker compose restart server"
 ```
 
-For local dev, set the `DASHBOARD_PASSWORD` environment variable instead. If neither is set, auth is bypassed entirely (open access).
+Password resolution order at startup:
+1. `DASHBOARD_PASSWORD` env var — if explicitly set (even to empty string), use it; empty = auth bypassed
+2. AWS Parameter Store `/job-search/dashboard-password` — used automatically in production via EC2 instance role
+3. If neither resolves, auth is bypassed (open access)
+
+The dev container sets `DASHBOARD_PASSWORD=""` explicitly so it never picks up the production password from Parameter Store.
 
 ### Deploy nginx config changes
 After editing `infra/nginx.conf`, copy it to the server and reload:
