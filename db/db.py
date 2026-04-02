@@ -7,7 +7,6 @@ Credential resolution order:
 """
 
 import os
-import json
 import logging
 from psycopg2 import pool
 
@@ -29,21 +28,21 @@ def _load_credentials():
     host = os.environ.get("DB_HOST")
     if host:
         return {
-            "host":     host,
-            "dbname":   os.environ.get("DB_NAME", "jobsearch"),
-            "user":     os.environ.get("DB_USER", "jobsearch"),
+            "host": host,
+            "dbname": os.environ.get("DB_NAME", "jobsearch"),
+            "user": os.environ.get("DB_USER", "jobsearch"),
             "password": os.environ.get("DB_PASSWORD", ""),
-            "port":     int(os.environ.get("DB_PORT", 5432)),
+            "port": int(os.environ.get("DB_PORT", 5432)),
         }
 
     # Fall back to Parameter Store (production)
     logger.info("DB_HOST not set — loading credentials from Parameter Store")
     return {
-        "host":     _get_param("/job-search/db-host"),
-        "dbname":   _get_param("/job-search/db-name"),
-        "user":     _get_param("/job-search/db-user"),
+        "host": _get_param("/job-search/db-host"),
+        "dbname": _get_param("/job-search/db-name"),
+        "user": _get_param("/job-search/db-user"),
         "password": _get_param("/job-search/db-password"),
-        "port":     5432,
+        "port": 5432,
     }
 
 

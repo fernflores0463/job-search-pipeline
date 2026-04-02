@@ -22,7 +22,7 @@ import json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from db.db import init_pool, get_conn, put_conn
+from db.db import init_pool, get_conn, put_conn  # noqa: E402
 
 
 def load_exclusion_lists():

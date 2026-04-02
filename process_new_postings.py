@@ -20,7 +20,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sys
 from datetime import date
 
@@ -64,15 +63,15 @@ TECH_COMBO_SCORES = {
 
 # Role-type bonuses (from description text)
 ROLE_SCORES = {
-    r'backend|back-end':                    1,
-    r'full-stack|fullstack|full stack':     1,
+    r'backend|back-end': 1,
+    r'full-stack|fullstack|full stack': 1,
 }
 
 TOP_COMPANIES = _config["scoring"]["top_companies"]
 
 _tier_thresholds = _config["scoring"]["tier_thresholds"]
 TIER_STRONG = _tier_thresholds["strong"]
-TIER_MATCH  = _tier_thresholds["match"]
+TIER_MATCH = _tier_thresholds["match"]
 
 # Build BULLETS dict from config experience entries
 BULLETS = {

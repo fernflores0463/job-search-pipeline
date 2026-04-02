@@ -16,7 +16,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -78,7 +77,6 @@ def main():
 
     updated = 0
     failed = 0
-    skipped = 0
 
     for i in range(0, total, BATCH_SIZE):
         batch = job_pairs[i:i + BATCH_SIZE]
@@ -100,7 +98,7 @@ def main():
         if updated > 0 and processed % 50 == 0:
             with open(STATE_FILE, 'w') as f:
                 json.dump(state, f, indent=2)
-            print(f"  Saved checkpoint.")
+            print("  Saved checkpoint.")
 
         # Delay between batches to avoid rate limiting
         if i + BATCH_SIZE < total:
