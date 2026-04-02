@@ -23,7 +23,6 @@ Supports common patterns: Lever, Greenhouse, Workday, Ashby, custom HTML pages.
 """
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -37,13 +36,13 @@ from bs4 import BeautifulSoup
 # Import shared pipeline functions from process_new_postings.py
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
-from process_new_postings import (
+from process_new_postings import (  # noqa: E402
     is_excluded_company, is_excluded_title, is_excluded_role, is_swe_role,
     calc_tech_score, calc_level_bonus, calc_company_bonus, assign_tier,
     make_job_id, generate_resume_files, rebuild_dashboard,
     METADATA_FILE,
 )
-from datetime import date
+from datetime import date  # noqa: E402
 
 RESUMES_DIR = os.path.join(BASE_DIR, "resumes")
 
@@ -366,7 +365,7 @@ def scrape_careers_page(url, company_override=None):
     print(f"\nFetching descriptions for {len(swe_jobs)} jobs...")
     processed_jobs = []
     for i, j in enumerate(swe_jobs):
-        print(f"  [{i+1}/{len(swe_jobs)}] {j['title']}", end='', flush=True)
+        print(f"  [{i + 1}/{len(swe_jobs)}] {j['title']}", end='', flush=True)
         desc = fetch_description(j['url'])
         if desc:
             print(f" — {len(desc)} chars")
@@ -435,9 +434,9 @@ def main():
         sys.exit(0)
 
     # Print summary
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"SCRAPE RESULTS: {len(jobs)} positions from {jobs[0]['company']}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     tiers = {}
     for j in jobs:
         tiers.setdefault(j['tier'], []).append(j)
@@ -500,7 +499,7 @@ def main():
 
     # Rebuild dashboard
     rebuild_dashboard(all_jobs)
-    print(f"Dashboard rebuilt!")
+    print("Dashboard rebuilt!")
     print()
     print("Done! Restart the dashboard server to see the new jobs.")
     print("  cd 'Job Dashboard' && ./start_dashboard.sh")

@@ -17,11 +17,10 @@ import os
 import sys
 import uuid
 import logging
-from datetime import datetime
 
 # Allow running from repo root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from db.db import Db, init_pool
+from db.db import Db, init_pool  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -150,10 +149,10 @@ def main():
     logger.info("Starting JSON → PostgreSQL migration")
     init_pool()
 
-    jobs_meta   = load_json("resumes/all_jobs_metadata.json") or []
-    state_raw   = load_json("dashboard/dashboard_state.json") or {}
-    plans_raw   = load_json("dashboard/application_plans.json") or []
-    cache_raw   = load_json("dashboard/company_cache.json") or {}
+    jobs_meta = load_json("resumes/all_jobs_metadata.json") or []
+    state_raw = load_json("dashboard/dashboard_state.json") or {}
+    plans_raw = load_json("dashboard/application_plans.json") or []
+    cache_raw = load_json("dashboard/company_cache.json") or {}
 
     logger.info("Loaded: %d jobs, %d state entries, %d plans, %d cached companies",
                 len(jobs_meta), len(state_raw), len(plans_raw), len(cache_raw))

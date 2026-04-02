@@ -10,7 +10,7 @@ Usage:
 """
 
 import http.server
-import html as html_module
+
 import json
 import os
 import re
@@ -28,11 +28,12 @@ PARENT_DIR = os.path.dirname(DIR)
 
 # Allow importing db module from repo root
 sys.path.insert(0, PARENT_DIR)
-from db.db import Db, init_pool
+from db.db import Db, init_pool  # noqa: E402
 
 # ─────────────────────────────────────────────────────────
 # CONFIG LOADING
 # ─────────────────────────────────────────────────────────
+
 
 def _load_config():
     config_path = os.path.join(PARENT_DIR, "config.json")
@@ -44,11 +45,13 @@ def _load_config():
     with open(config_path) as f:
         return json.load(f)
 
+
 _config = _load_config()
 
 # ─────────────────────────────────────────────────────────
 # AUTH
 # ─────────────────────────────────────────────────────────
+
 
 def _load_auth_password():
     """
@@ -67,6 +70,7 @@ def _load_auth_password():
     except Exception:
         pass
     return ""
+
 
 _AUTH_PASSWORD = _load_auth_password()
 _SESSIONS: set = set()   # In-memory active session tokens; cleared on restart
@@ -386,7 +390,6 @@ def save_plans(plans):
 
 def _load_company_cache_from_db():
     """Warm the in-memory company cache from DB at startup."""
-    global _company_cache
     try:
         with Db() as conn:
             cur = conn.cursor()
@@ -552,8 +555,8 @@ def _run_applicant_update():
 
     with _update_lock:
         _update_status.update({"running": True, "progress": 0, "total": len(pairs),
-                                "updated": 0, "failed": 0,
-                                "message": f"Running... ({skipped} skipped with 500+ applicants)"})
+                               "updated": 0, "failed": 0,
+                               "message": f"Running... ({skipped} skipped with 500+ applicants)"})
 
     for i in range(0, len(pairs), 15):
         if not _update_status["running"]:
@@ -782,6 +785,7 @@ def _run_scrape_careers(url, company_override=None):
 
     try:
         from process_new_postings import (
+            is_excluded_company, is_excluded_description,
             is_excluded_title, is_excluded_role, is_swe_role,
             calc_tech_score, calc_level_bonus, calc_company_bonus, assign_tier,
             make_job_id, generate_resume_files,
@@ -816,6 +820,14 @@ def _run_scrape_careers(url, company_override=None):
                         break
             if not company:
                 company = _urlparse(final_url).hostname.split('.')[0].title()
+
+        if is_excluded_company(company):
+            with _scrape_lock:
+                _scrape_status.update({
+                    "running": False,
+                    "message": f"Skipped: '{company}' matches a staffing firm exclusion pattern."
+                })
+            return
 
         with _scrape_lock:
             _scrape_status["message"] = f"Detected {platform} — extracting jobs from {company}..."
@@ -858,6 +870,10 @@ def _run_scrape_careers(url, company_override=None):
         for i, j in enumerate(swe_jobs):
             desc = fetch_description(j['url'])
             dl, tl = desc.lower(), j['title'].lower()
+            if is_excluded_description(dl):
+                with _scrape_lock:
+                    _scrape_status["progress"] = i + 1
+                continue
             total = calc_tech_score(dl) + calc_level_bonus(tl) + calc_company_bonus(company)
             tier = assign_tier(total)
             processed_jobs.append({
@@ -870,7 +886,7 @@ def _run_scrape_careers(url, company_override=None):
             })
             with _scrape_lock:
                 _scrape_status["progress"] = i + 1
-                _scrape_status["message"] = f"Scoring [{i+1}/{len(swe_jobs)}]: {j['title'][:50]}"
+                _scrape_status["message"] = f"Scoring [{i + 1}/{len(swe_jobs)}]: {j['title'][:50]}"
             if i < len(swe_jobs) - 1:
                 _time.sleep(0.3)
 
@@ -919,10 +935,12 @@ def _run_scrape_careers(url, company_override=None):
 def _run_import_csv(csv_bytes, location):
     """Background thread: parse a LinkedIn CSV export and import new jobs into PostgreSQL."""
     try:
-        import csv as _csv, io
+        import csv as _csv
+        import io
         from datetime import date as _date
         from process_new_postings import (
-            is_excluded_company, is_excluded_title, is_excluded_role, is_swe_role,
+            is_excluded_company, is_excluded_description,
+            is_excluded_title, is_excluded_role, is_swe_role,
             calc_tech_score, calc_level_bonus, calc_company_bonus, assign_tier,
             make_job_id, pick_bullets, customize_skills, generate_resume_txt,
         )
@@ -949,8 +967,8 @@ def _run_import_csv(csv_bytes, location):
         seen, processed = set(), []
         for r in rows:
             company = (r.get("Company") or "").strip()
-            title   = (r.get("Job Title") or "").strip()
-            link    = (r.get("Job Link") or "").strip()
+            title = (r.get("Job Title") or "").strip()
+            link = (r.get("Job Link") or "").strip()
             key = link if link else (company, title)
             if key in seen:
                 continue
@@ -959,24 +977,26 @@ def _run_import_csv(csv_bytes, location):
                 continue
             tl = title.lower()
             desc = r.get("Description") or ""
-            dl   = desc.lower()
+            dl = desc.lower()
             if is_excluded_title(tl) or is_excluded_role(tl) or not is_swe_role(tl):
+                continue
+            if is_excluded_description(dl):
                 continue
             score = calc_tech_score(dl) + calc_level_bonus(tl) + calc_company_bonus(company)
             processed.append({
-                "id":          make_job_id(company, title, link),
-                "company":     company,
-                "title":       title,
-                "location":    (r.get("Location") or "").strip(),
-                "work_type":   (r.get("Work Type") or "").strip(),
-                "salary":      (r.get("Salary") or "N/A").strip(),
+                "id": make_job_id(company, title, link),
+                "company": company,
+                "title": title,
+                "location": (r.get("Location") or "").strip(),
+                "work_type": (r.get("Work Type") or "").strip(),
+                "salary": (r.get("Salary") or "N/A").strip(),
                 "posted_date": (r.get("Posted Date") or "").strip(),
                 "import_date": batch_label,
                 "description": desc,
-                "score":       score,
-                "tier":        assign_tier(score),
-                "job_link":    link,
-                "apply_link":  (r.get("Application Link") or "").strip(),
+                "score": score,
+                "tier": assign_tier(score),
+                "job_link": link,
+                "apply_link": (r.get("Application Link") or "").strip(),
             })
 
         with _import_lock:
@@ -1018,7 +1038,7 @@ def _run_import_csv(csv_bytes, location):
                     (j["id"],))
                 with _import_lock:
                     _import_status["progress"] = i + 1
-                    _import_status["message"] = f"Inserting {i+1}/{len(new_jobs)}: {j['title'][:50]}"
+                    _import_status["message"] = f"Inserting {i + 1}/{len(new_jobs)}: {j['title'][:50]}"
 
         tiers = {}
         for j in processed:
@@ -1027,7 +1047,7 @@ def _run_import_csv(csv_bytes, location):
         with _import_lock:
             _import_status.update({
                 "running": False,
-                "added":   len(new_jobs),
+                "added": len(new_jobs),
                 "message": f"Done! {len(processed)} found, {len(new_jobs)} new. {summary}.",
                 "jobs_found": [
                     {"title": j["title"], "tier": j["tier"],
@@ -1182,8 +1202,8 @@ def generate_plan_pdf(plan, jobs_lookup):
 
     pdf_path = os.path.join(DIR, f"plan_{plan['id']}.pdf")
     doc = SimpleDocTemplate(pdf_path, pagesize=letter,
-                            topMargin=0.6*inch, bottomMargin=0.6*inch,
-                            leftMargin=0.7*inch, rightMargin=0.7*inch)
+                            topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+                            leftMargin=0.7 * inch, rightMargin=0.7 * inch)
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle('PlanTitle', parent=styles['Title'], fontSize=22, spaceAfter=4, textColor=colors.HexColor('#1e3a5f')))
     styles.add(ParagraphStyle('PlanSubtitle', parent=styles['Normal'], fontSize=11, textColor=colors.HexColor('#64748b'), spaceAfter=16))
@@ -1217,7 +1237,7 @@ def generate_plan_pdf(plan, jobs_lookup):
         notes = plan_job.get('notes', '')
 
         card_data = [[
-            Paragraph(f"<b>{idx+1}.</b> <b>{company}</b> - {title}", styles['JobTitle']),
+            Paragraph(f"<b>{idx + 1}.</b> <b>{company}</b> - {title}", styles['JobTitle']),
             Paragraph(f"<font color='white'><b> {tier} (Score: {score}) </b></font>",
                       ParagraphStyle('tb', parent=styles['Normal'], fontSize=8, alignment=2, textColor=colors.white)),
         ]]
@@ -1243,7 +1263,7 @@ def generate_plan_pdf(plan, jobs_lookup):
             card_data.append([Paragraph(f"Notes: {notes}", styles['Notes']), ''])
         card_data.append([Paragraph("[ ] Applied", styles['JobDetail']), ''])
 
-        col_widths = [5.4*inch, 1.7*inch]
+        col_widths = [5.4 * inch, 1.7 * inch]
         t = Table(card_data, colWidths=col_widths)
         style_cmds = [
             ('BACKGROUND', (0, 0), (-1, 0), tier_bg),
@@ -1581,7 +1601,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
         # ── /api/upload-resume/<path> ────────────────────
         if self.path.startswith("/api/upload-resume/"):
-            from urllib.parse import unquote
             import base64
             try:
                 encoded_path = self.path[len("/api/upload-resume/"):]
@@ -1657,7 +1676,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 _json_response(self, {"ok": True, "message": "Already running"})
                 return
             try:
-                qs  = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 loc = (qs.get("location", [""])[0] or "").strip() or None
                 length = int(self.headers.get("Content-Length", 0))
                 csv_bytes = self.rfile.read(length)
@@ -1789,7 +1808,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     print(f"Starting Job Dashboard server on port {PORT}...")
     print(f"Open http://localhost:{PORT} in your browser")
-    print(f"Press Ctrl+C to stop\n")
+    print("Press Ctrl+C to stop\n")
     server = http.server.HTTPServer(("", PORT), DashboardHandler)
     try:
         server.serve_forever()

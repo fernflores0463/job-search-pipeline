@@ -50,7 +50,39 @@
     "top_companies": ["google", "meta", "amazon", "microsoft", "apple", "stripe", "netflix"]
   },
   "filters": {
-    "exclude_companies_containing": ["staffing", "recruiting", "consulting"],
+    "exclude_companies_containing": [
+      "accenture", "deloitte", "pwc", "capgemini", "infosys", "wipro",
+      "tata consultancy", "robert half", "randstad", "manpower",
+      "kelly services", "kellyocg", "kforce", "apex systems", "insight global",
+      "cybercoders", "jobot", "actalent", "hays ", "dexian", "akkodis",
+      "spectraforce", "bayone", "marlabs", "ascendion",
+      "ark solutions", "acestack", "activesoft", "agility partners", "alignerr",
+      "ampstek", "arkhya tech", "aspiringit", "avesta computer", "blankfactor",
+      "brandt information", "career soft", "catapult solutions", "centific",
+      "centraprise", "crossing hurdles", "cube hub", "dewinter group",
+      "delta system", "emonics", "envision technology", "eton solution",
+      "fueled", "gac solutions", "get offers", "helic & co", "holistic partners",
+      "indus group", "infostride", "infoway software", "inherent technologies",
+      "jpc techno", "jobgether", "lensa", "lumenalta", "lynn rodens",
+      "matlen silver", "missionhires", "nasscomm", "nexwave", "okaya infocom",
+      "pacer group", "pdssoft", "people in ai", "precision technologies",
+      "programmers.io", "protingent", "radixsoft", "rand worldwide",
+      "storm2", "storm3", "tailored management", "the ash group",
+      "the planet group", "themesoft", "tundra technical", "us tech solutions",
+      "vysystems", "waferwise", "waferwire", "workerbee", "x4 life sciences",
+      "zillion technologies", "zodiac internet", "hackajob", "inspyr solutions",
+      "mount indie", "pri global", "ptr global", "robots & pencils", "wayup",
+      "mygwork", "catworkx", "andiamo", "envive ai", "glover labs", "aquent",
+      "cognitiv", "handshake", "epitec", "acceler8", "chatgpt jobs", "clearly ai",
+      "staffing", "recruiting", "consulting", "solutions llc", "placement",
+      "talent", "jobs via"
+    ],
+    "exclude_description_patterns": [
+      "jobs via", "staffing firm", "staffing agency", "staffing company",
+      "on behalf of our client", "our client is looking", "our client is seeking",
+      "contract to hire", "contract-to-hire", "c2h",
+      "w2 contract", "w2 only", "w-2 contract"
+    ],
     "exclude_title_keywords": ["principal", "director", "intern", "staff "],
     "exclude_role_keywords": ["mobile", "ios ", "android", "devops", "sre"]
   },

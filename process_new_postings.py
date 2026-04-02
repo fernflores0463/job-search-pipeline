@@ -20,7 +20,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sys
 from datetime import date
 
@@ -51,6 +50,7 @@ def load_config():
 _config = load_config()
 
 EXCLUDE_COMPANIES = _config["filters"]["exclude_companies_containing"]
+EXCLUDE_DESCRIPTION_PATTERNS = _config["filters"].get("exclude_description_patterns", [])
 EXCLUDE_TITLE_KEYWORDS = _config["filters"]["exclude_title_keywords"]
 EXCLUDE_ROLE_KEYWORDS = _config["filters"]["exclude_role_keywords"]
 
@@ -63,15 +63,15 @@ TECH_COMBO_SCORES = {
 
 # Role-type bonuses (from description text)
 ROLE_SCORES = {
-    r'backend|back-end':                    1,
-    r'full-stack|fullstack|full stack':     1,
+    r'backend|back-end': 1,
+    r'full-stack|fullstack|full stack': 1,
 }
 
 TOP_COMPANIES = _config["scoring"]["top_companies"]
 
 _tier_thresholds = _config["scoring"]["tier_thresholds"]
 TIER_STRONG = _tier_thresholds["strong"]
-TIER_MATCH  = _tier_thresholds["match"]
+TIER_MATCH = _tier_thresholds["match"]
 
 # Build BULLETS dict from config experience entries
 BULLETS = {
@@ -98,6 +98,11 @@ BULLET_KEYWORD_PAIRS = [
 def is_excluded_company(company):
     cl = company.lower().strip()
     return any(ex in cl for ex in EXCLUDE_COMPANIES)
+
+
+def is_excluded_description(desc_lower):
+    """Return True if the description contains staffing-related phrases."""
+    return any(pat in desc_lower for pat in EXCLUDE_DESCRIPTION_PATTERNS)
 
 
 def is_excluded_title(title_lower):
@@ -296,6 +301,9 @@ def process_csv(csv_path, location=None):
 
         desc = r.get('Description', '') or ''
         dl = desc.lower()
+
+        if is_excluded_description(dl):
+            continue
 
         tech_score = calc_tech_score(dl)
         level_bonus = calc_level_bonus(tl)
