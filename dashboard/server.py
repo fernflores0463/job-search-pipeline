@@ -150,6 +150,9 @@ _update_status = {"running": False, "progress": 0, "total": 0, "updated": 0, "fa
 _scrape_lock = threading.Lock()
 _scrape_status = {"running": False, "progress": 0, "total": 0, "added": 0, "message": "", "jobs_found": []}
 
+_import_lock = threading.Lock()
+_import_status = {"running": False, "progress": 0, "total": 0, "added": 0, "message": "", "jobs_found": []}
+
 _live_check_lock = threading.Lock()
 _live_check_status = {"running": False, "progress": 0, "total": 0, "closed": 0, "live": 0, "inconclusive": 0, "auto_updated": 0, "message": ""}
 
@@ -914,6 +917,131 @@ def _run_scrape_careers(url, company_override=None):
             _scrape_status.update({"running": False, "message": f"Error: {str(e)}"})
 
 
+def _run_import_csv(csv_bytes, location):
+    """Background thread: parse a LinkedIn CSV export and import new jobs into PostgreSQL."""
+    try:
+        import csv as _csv, io
+        from datetime import date as _date
+        from process_new_postings import (
+            is_excluded_company, is_excluded_title, is_excluded_role, is_swe_role,
+            calc_tech_score, calc_level_bonus, calc_company_bonus, assign_tier,
+            make_job_id, pick_bullets, customize_skills, generate_resume_txt,
+        )
+
+        with _import_lock:
+            _import_status.update({"running": True, "progress": 0, "total": 0,
+                                   "added": 0, "message": "Parsing CSV…", "jobs_found": []})
+
+        # utf-8-sig strips BOM that LinkedIn sometimes includes
+        text = csv_bytes.decode("utf-8-sig")
+        rows = list(_csv.DictReader(io.StringIO(text)))
+
+        # Location priority: explicit arg → CSV's Search Location column → omit
+        if not location and rows:
+            location = (rows[0].get("Search Location") or "").strip() or None
+
+        # Batch label — matches format used by process_new_postings.py:
+        # "YYYY-MM-DD" or "YYYY-MM-DD — Location"
+        batch_label = _date.today().isoformat()
+        if location:
+            batch_label += f" \u2014 {location}"
+
+        # Filter & score — same logic as process_new_postings.py
+        seen, processed = set(), []
+        for r in rows:
+            company = (r.get("Company") or "").strip()
+            title   = (r.get("Job Title") or "").strip()
+            link    = (r.get("Job Link") or "").strip()
+            key = link if link else (company, title)
+            if key in seen:
+                continue
+            seen.add(key)
+            if is_excluded_company(company):
+                continue
+            tl = title.lower()
+            desc = r.get("Description") or ""
+            dl   = desc.lower()
+            if is_excluded_title(tl) or is_excluded_role(tl) or not is_swe_role(tl):
+                continue
+            score = calc_tech_score(dl) + calc_level_bonus(tl) + calc_company_bonus(company)
+            processed.append({
+                "id":          make_job_id(company, title, link),
+                "company":     company,
+                "title":       title,
+                "location":    (r.get("Location") or "").strip(),
+                "work_type":   (r.get("Work Type") or "").strip(),
+                "salary":      (r.get("Salary") or "N/A").strip(),
+                "posted_date": (r.get("Posted Date") or "").strip(),
+                "import_date": batch_label,
+                "description": desc,
+                "score":       score,
+                "tier":        assign_tier(score),
+                "job_link":    link,
+                "apply_link":  (r.get("Application Link") or "").strip(),
+            })
+
+        with _import_lock:
+            _import_status["total"] = len(processed)
+            _import_status["message"] = f"Found {len(processed)} qualifying jobs. Checking DB…"
+
+        if not processed:
+            with _import_lock:
+                _import_status.update({"running": False,
+                                       "message": "No qualifying SWE jobs found in CSV."})
+            return
+
+        # Dedup against existing DB rows by job_link
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT job_link FROM jobs WHERE job_link IS NOT NULL")
+            existing = {row[0] for row in cur.fetchall()}
+
+        new_jobs = [j for j in processed if j["job_link"] not in existing]
+
+        # Insert new jobs + initial job_state rows
+        with Db() as conn:
+            cur = conn.cursor()
+            for i, j in enumerate(new_jobs):
+                bullets = pick_bullets(j["description"], j["title"])
+                langs, frameworks, misc = customize_skills(j["description"])
+                resume_text = generate_resume_txt(j, bullets, langs, frameworks, misc)
+                cur.execute("""
+                    INSERT INTO jobs (id, company, title, location, work_type, salary,
+                                     posted_date, import_date, description, score, tier,
+                                     job_link, apply_link, resume_text)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (id) DO NOTHING
+                """, (j["id"], j["company"], j["title"], j["location"], j["work_type"],
+                      j["salary"], j["posted_date"], j["import_date"], j["description"],
+                      j["score"], j["tier"], j["job_link"], j["apply_link"], resume_text))
+                cur.execute(
+                    "INSERT INTO job_state (job_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                    (j["id"],))
+                with _import_lock:
+                    _import_status["progress"] = i + 1
+                    _import_status["message"] = f"Inserting {i+1}/{len(new_jobs)}: {j['title'][:50]}"
+
+        tiers = {}
+        for j in processed:
+            tiers.setdefault(j["tier"], []).append(j["title"])
+        summary = ", ".join(f"{t}: {len(v)}" for t, v in sorted(tiers.items()))
+        with _import_lock:
+            _import_status.update({
+                "running": False,
+                "added":   len(new_jobs),
+                "message": f"Done! {len(processed)} found, {len(new_jobs)} new. {summary}.",
+                "jobs_found": [
+                    {"title": j["title"], "tier": j["tier"],
+                     "score": j["score"], "location": j["location"]}
+                    for j in sorted(processed, key=lambda x: -x["score"])[:20]
+                ],
+            })
+
+    except Exception as e:
+        with _import_lock:
+            _import_status.update({"running": False, "message": f"Error: {str(e)}"})
+
+
 # ─────────────────────────────────────────────────────────
 # JOB DESCRIPTION FORMATTER
 # ─────────────────────────────────────────────────────────
@@ -1300,6 +1428,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 _json_response(self, dict(_scrape_status))
             return
 
+        # ── /api/import-status ───────────────────────────
+        if self.path == "/api/import-status":
+            with _import_lock:
+                _json_response(self, dict(_import_status))
+            return
+
         # ── /api/refresh-job/<id> ────────────────────────
         if self.path.startswith("/api/refresh-job/"):
             job_id = self.path[len("/api/refresh-job/"):].strip()
@@ -1514,6 +1648,25 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 else:
                     threading.Thread(target=_run_scrape_careers, args=(url, company), daemon=True).start()
                     _json_response(self, {"ok": True, "message": "Started"})
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── POST /api/import-csv — LinkedIn CSV upload ───
+        if self.path.startswith("/api/import-csv"):
+            if _import_status.get("running"):
+                _json_response(self, {"ok": True, "message": "Already running"})
+                return
+            try:
+                qs  = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                loc = (qs.get("location", [""])[0] or "").strip() or None
+                length = int(self.headers.get("Content-Length", 0))
+                csv_bytes = self.rfile.read(length)
+                if not csv_bytes:
+                    _json_response(self, {"error": "Empty body"}, 400)
+                    return
+                threading.Thread(target=_run_import_csv, args=(csv_bytes, loc), daemon=True).start()
+                _json_response(self, {"ok": True})
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
             return
