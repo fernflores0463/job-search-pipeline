@@ -51,6 +51,7 @@ def load_config():
 _config = load_config()
 
 EXCLUDE_COMPANIES = _config["filters"]["exclude_companies_containing"]
+EXCLUDE_DESCRIPTION_PATTERNS = _config["filters"].get("exclude_description_patterns", [])
 EXCLUDE_TITLE_KEYWORDS = _config["filters"]["exclude_title_keywords"]
 EXCLUDE_ROLE_KEYWORDS = _config["filters"]["exclude_role_keywords"]
 
@@ -98,6 +99,11 @@ BULLET_KEYWORD_PAIRS = [
 def is_excluded_company(company):
     cl = company.lower().strip()
     return any(ex in cl for ex in EXCLUDE_COMPANIES)
+
+
+def is_excluded_description(desc_lower):
+    """Return True if the description contains staffing-related phrases."""
+    return any(pat in desc_lower for pat in EXCLUDE_DESCRIPTION_PATTERNS)
 
 
 def is_excluded_title(title_lower):
@@ -296,6 +302,9 @@ def process_csv(csv_path, location=None):
 
         desc = r.get('Description', '') or ''
         dl = desc.lower()
+
+        if is_excluded_description(dl):
+            continue
 
         tech_score = calc_tech_score(dl)
         level_bonus = calc_level_bonus(tl)

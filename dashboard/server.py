@@ -782,6 +782,7 @@ def _run_scrape_careers(url, company_override=None):
 
     try:
         from process_new_postings import (
+            is_excluded_company, is_excluded_description,
             is_excluded_title, is_excluded_role, is_swe_role,
             calc_tech_score, calc_level_bonus, calc_company_bonus, assign_tier,
             make_job_id, generate_resume_files,
@@ -816,6 +817,12 @@ def _run_scrape_careers(url, company_override=None):
                         break
             if not company:
                 company = _urlparse(final_url).hostname.split('.')[0].title()
+
+        if is_excluded_company(company):
+            with _scrape_lock:
+                _scrape_status.update({"running": False,
+                    "message": f"Skipped: '{company}' matches a staffing firm exclusion pattern."})
+            return
 
         with _scrape_lock:
             _scrape_status["message"] = f"Detected {platform} — extracting jobs from {company}..."
@@ -858,6 +865,10 @@ def _run_scrape_careers(url, company_override=None):
         for i, j in enumerate(swe_jobs):
             desc = fetch_description(j['url'])
             dl, tl = desc.lower(), j['title'].lower()
+            if is_excluded_description(dl):
+                with _scrape_lock:
+                    _scrape_status["progress"] = i + 1
+                continue
             total = calc_tech_score(dl) + calc_level_bonus(tl) + calc_company_bonus(company)
             tier = assign_tier(total)
             processed_jobs.append({
@@ -922,7 +933,8 @@ def _run_import_csv(csv_bytes, location):
         import csv as _csv, io
         from datetime import date as _date
         from process_new_postings import (
-            is_excluded_company, is_excluded_title, is_excluded_role, is_swe_role,
+            is_excluded_company, is_excluded_description,
+            is_excluded_title, is_excluded_role, is_swe_role,
             calc_tech_score, calc_level_bonus, calc_company_bonus, assign_tier,
             make_job_id, pick_bullets, customize_skills, generate_resume_txt,
         )
@@ -961,6 +973,8 @@ def _run_import_csv(csv_bytes, location):
             desc = r.get("Description") or ""
             dl   = desc.lower()
             if is_excluded_title(tl) or is_excluded_role(tl) or not is_swe_role(tl):
+                continue
+            if is_excluded_description(dl):
                 continue
             score = calc_tech_score(dl) + calc_level_bonus(tl) + calc_company_bonus(company)
             processed.append({
