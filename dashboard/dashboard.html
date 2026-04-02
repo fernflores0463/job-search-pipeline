@@ -191,6 +191,21 @@ function initJobs(serverState) {
   });
 }
 
+function initJobsFromApi(apiJobs) {
+  // jobs-data API returns jobs with state already merged — just normalize fields
+  return apiJobs.map(j => ({
+    ...j,
+    status: j.status || "Not Applied",
+    notes: j.notes || "",
+    timestamps: j.timestamps || {},
+    favorited: false,
+    applicants: j.applicants || "Unknown",
+    pdf_path: null,
+    live_status: j.live_status || null,
+    live_status_checked: j.live_status_checked || null,
+  }));
+}
+
 // Metrics
 function calcMetrics(jobs) {
   const byStatus = {};
@@ -2128,7 +2143,8 @@ function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans 
 }
 
 function App() {
-  const [jobs, setJobs] = useState(() => initJobs(null));
+  const [jobs, setJobs] = useState([]);
+  const [batchStats, setBatchStats] = useState([]);
   const [view, setView, batchDetailDate, setHashBatchDate, selectedId, setHashJobId] = useHashRoute();
   const [loaded, setLoaded] = useState(!IS_SERVED);
   const [filters, setFilters] = useState({
@@ -2258,14 +2274,17 @@ function App() {
     }
   }, [liveCheckBatch]);
 
-  // Load server state on mount
+  // Load jobs + batch stats from API on mount
   useEffect(() => {
-    if (IS_SERVED) {
-      fetchServerState().then(serverState => {
-        setJobs(initJobs(serverState));
-        setLoaded(true);
-      });
-    }
+    if (!IS_SERVED) return;
+    Promise.all([
+      fetch('/api/jobs-data').then(r => r.json()),
+      fetch('/api/batch-stats').then(r => r.json()),
+    ]).then(([apiJobs, apiStats]) => {
+      setJobs(initJobsFromApi(Array.isArray(apiJobs) ? apiJobs : []));
+      setBatchStats(Array.isArray(apiStats) ? apiStats : []);
+      setLoaded(true);
+    }).catch(() => setLoaded(true));
   }, []);
 
   const updateJob = useCallback((id, updates) => {
@@ -2548,8 +2567,8 @@ function App() {
                   className="px-2 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium border"
                 >
                   <option value="all">All Batches</option>
-                  {[...BATCH_STATS].sort((a, b) => b.date.localeCompare(a.date)).map(b => (
-                    <option key={b.date} value={b.date}>{b.date} ({b.total})</option>
+                  {[...batchStats].sort((a, b) => b.date.localeCompare(a.date)).map(b => (
+                    <option key={b.date} value={b.date}>{b.date}</option>
                   ))}
                 </select>
                 <button
