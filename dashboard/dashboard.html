@@ -72,19 +72,23 @@ function parseHash() {
   const raw = decodeURIComponent(window.location.hash.replace(/^#\/?/, ''));
   // Check for batch route: #/batch/<date>
   const batchMatch = raw.match(/^batch\/(.+)$/i);
-  if (batchMatch) return { view: 'stats', batchDate: batchMatch[1], jobId: null };
+  if (batchMatch) return { view: 'stats', batchDate: batchMatch[1], jobId: null, jobDetailId: null };
+  // Check for job-detail route: #/job-detail/<id>
+  const detailMatch = raw.match(/^job-detail\/(.+)$/i);
+  if (detailMatch) return { view: 'jobs', batchDate: null, jobId: null, jobDetailId: detailMatch[1] };
   // Check for job route: #/job/<id>
   const jobMatch = raw.match(/^job\/(.+)$/i);
-  if (jobMatch) return { view: 'jobs', batchDate: null, jobId: jobMatch[1] };
+  if (jobMatch) return { view: 'jobs', batchDate: null, jobId: jobMatch[1], jobDetailId: null };
   // Standard route
   const v = raw.toLowerCase();
-  return { view: VALID_ROUTES.includes(v) ? v : 'jobs', batchDate: null, jobId: null };
+  return { view: VALID_ROUTES.includes(v) ? v : 'jobs', batchDate: null, jobId: null, jobDetailId: null };
 }
 function useHashRoute() {
   const initial = parseHash();
   const [view, setViewState] = useState(initial.view);
   const [hashBatchDate, setHashBatchDate] = useState(initial.batchDate);
   const [hashJobId, setHashJobId] = useState(initial.jobId);
+  const [hashJobDetailId, setHashJobDetailId] = useState(initial.jobDetailId);
   const suppressHash = useRef(false);
 
   useEffect(() => {
@@ -94,6 +98,7 @@ function useHashRoute() {
       setViewState(parsed.view);
       setHashBatchDate(parsed.batchDate);
       setHashJobId(parsed.jobId);
+      setHashJobDetailId(parsed.jobDetailId);
     };
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
@@ -103,11 +108,12 @@ function useHashRoute() {
     setViewState(v);
     setHashBatchDate(null);
     setHashJobId(null);
+    setHashJobDetailId(null);
     suppressHash.current = true;
     window.location.hash = '#/' + v;
   }, []);
 
-  return [view, setView, hashBatchDate, setHashBatchDate, hashJobId, setHashJobId];
+  return [view, setView, hashBatchDate, setHashBatchDate, hashJobId, setHashJobId, hashJobDetailId, setHashJobDetailId];
 }
 
 const STATUSES = [
@@ -1621,6 +1627,11 @@ function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
                                                       className="px-2.5 py-1 bg-purple-500 text-white rounded text-xs font-medium hover:bg-purple-600">
                                                       Ask AI
                                                     </button>
+                                                    <button
+                                                      onClick={e => { e.stopPropagation(); window._openJobDetail && window._openJobDetail(j.id); }}
+                                                      className="px-2.5 py-1 bg-gray-800 text-white rounded text-xs font-medium hover:bg-gray-900">
+                                                      Full Page &#8599;
+                                                    </button>
                                                     {appPlans.length > 0 && (() => {
                                                       const currentPlan = appPlans.find(p => p.jobs.some(pj => pj.id === j.id));
                                                       return (
@@ -1759,6 +1770,299 @@ function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
     </div>
   );
 }
+
+function JobDetailPage({ job, appPlans = [], saveAppPlans, changeStatus, onBack }) {
+  const { useState, useEffect, useCallback } = React;
+  const [description, setDescription] = useState(null);
+  const [companyInfo, setCompanyInfo] = useState(null);
+  const [localNotes, setLocalNotes] = useState(job ? job.notes || '' : '');
+  const [refreshing, setRefreshing] = useState(false);
+
+  // Sync local notes when job changes
+  useEffect(() => { if (job) setLocalNotes(job.notes || ''); }, [job && job.id]);
+
+  // Fetch description on mount
+  useEffect(() => {
+    if (!job || !IS_SERVED) return;
+    fetch('/api/job-description/' + job.id)
+      .then(r => r.json())
+      .then(data => { if (data.formatted) setDescription(data.formatted); })
+      .catch(() => {});
+  }, [job && job.id]);
+
+  // Fetch company info on mount
+  useEffect(() => {
+    if (!job || !IS_SERVED) return;
+    const name = (job.company || '').trim();
+    if (!name) return;
+    fetch('/api/company-info/' + encodeURIComponent(name))
+      .then(r => r.json())
+      .then(data => { if (!data.error) setCompanyInfo(data); })
+      .catch(() => {});
+  }, [job && job.company]);
+
+  // Auto-refresh job data
+  useEffect(() => {
+    if (!job || !IS_SERVED) return;
+    setRefreshing(true);
+    fetch('/api/refresh-job/' + job.id)
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) { setRefreshing(false); return; }
+        const updates = {};
+        if (data.applicants && data.applicants !== job.applicants) updates.applicants = data.applicants;
+        if (data.live_status) updates.live_status = data.live_status;
+        if (data.live_status_checked) updates.live_status_checked = data.live_status_checked;
+        if (Object.keys(updates).length > 0 && window._updateJob) window._updateJob(job.id, updates);
+        setRefreshing(false);
+      })
+      .catch(() => setRefreshing(false));
+  }, [job && job.id]);
+
+  const saveNotes = useCallback(() => {
+    if (job && window._updateJob) window._updateJob(job.id, { notes: localNotes });
+  }, [job, localNotes]);
+
+  if (!job) return (
+    <div className="min-h-screen flex items-center justify-center">
+      <div className="text-center">
+        <p className="text-gray-500 mb-4">Job not found</p>
+        <button onClick={onBack} className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm">Go Back</button>
+      </div>
+    </div>
+  );
+
+  const currentPlan = appPlans.find(p => p.jobs.some(pj => pj.id === job.id));
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {/* Header bar */}
+      <div className="bg-white border-b px-6 py-4">
+        <div className="max-w-7xl mx-auto flex items-center justify-between">
+          <button onClick={onBack} className="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-800">
+            <span>&larr;</span> Back
+          </button>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => window._toggleFavorite && window._toggleFavorite(job.id)}
+              className={"text-xl " + (job.favorited ? "text-yellow-400" : "text-gray-300 hover:text-yellow-300")}
+              title={job.favorited ? "Remove from shortlist" : "Add to shortlist"}
+            >
+              {job.favorited ? "\u2605" : "\u2606"}
+            </button>
+            <select
+              value={job.status}
+              onChange={e => changeStatus(job.id, e.target.value)}
+              className={"px-3 py-1.5 border rounded text-sm font-medium " + (STATUS_COLORS[job.status] || "")}
+            >
+              {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div className="max-w-7xl mx-auto px-6 py-6">
+        {/* Title section */}
+        <div className="mb-6">
+          <div className="flex items-start justify-between">
+            <div>
+              <h1 className="text-2xl font-bold text-gray-900">{job.company}</h1>
+              <p className="text-lg text-gray-600 mt-1">{job.title}</p>
+            </div>
+            <span className={"px-3 py-1 rounded text-sm font-medium " + TIER_COLORS[job.tier]}>
+              {job.tier} (Score: {job.score})
+            </span>
+          </div>
+          {job.live_status === "closed" && (
+            <span className="inline-block mt-2 px-2 py-1 rounded text-xs font-medium bg-red-50 text-red-500 border border-red-200">Position Closed</span>
+          )}
+        </div>
+
+        {/* Metadata cards */}
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-6">
+          {[
+            { label: "Salary", value: job.salary !== "N/A" ? job.salary : "Not listed" },
+            { label: "Location", value: job.location || "Not listed" },
+            { label: "Work Type", value: job.work_type || "Not listed" },
+            { label: "Posted", value: job.posted_date || "Unknown" },
+            { label: "Applicants", value: (job.applicants || "Unknown") + (refreshing ? " (updating...)" : "") },
+          ].map(card => (
+            <div key={card.label} className="bg-white rounded-lg border p-3">
+              <span className="text-xs text-gray-400 block">{card.label}</span>
+              <p className="font-medium text-sm text-gray-900 mt-0.5">{card.value}</p>
+            </div>
+          ))}
+        </div>
+
+        {/* Action buttons */}
+        <div className="flex gap-2 flex-wrap mb-6">
+          {job.apply_link && (
+            <a href={job.apply_link} target="_blank" rel="noopener"
+              className="px-4 py-2 bg-blue-600 text-white rounded text-sm font-medium hover:bg-blue-700">
+              Apply
+            </a>
+          )}
+          {job.job_link && (
+            <a href={job.job_link} target="_blank" rel="noopener"
+              className="px-4 py-2 bg-gray-100 text-gray-700 rounded text-sm font-medium hover:bg-gray-200 border">
+              LinkedIn Posting
+            </a>
+          )}
+          <button onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title)}
+            className="px-4 py-2 bg-gray-100 text-gray-700 rounded text-sm font-medium hover:bg-gray-200 border">
+            View Resume
+          </button>
+          <button onClick={() => window._openAIChat && window._openAIChat(job.id, job.company + ' \u2014 ' + job.title)}
+            className="px-4 py-2 bg-purple-600 text-white rounded text-sm font-medium hover:bg-purple-700">
+            Ask AI
+          </button>
+          <button onClick={() => window._openJobDetail && window._openJobDetail(job.id)}
+            className="px-4 py-2 bg-gray-800 text-white rounded text-sm font-medium hover:bg-gray-900">
+            Full Page &#8599;
+          </button>
+          {appPlans.length > 0 && (
+            <select value={currentPlan ? currentPlan.id : ""}
+              onChange={e => {
+                const targetId = e.target.value;
+                let updated = appPlans.map(p => ({ ...p, jobs: p.jobs.filter(pj => pj.id !== job.id) }));
+                if (targetId) {
+                  updated = updated.map(p => p.id === targetId
+                    ? { ...p, jobs: [...p.jobs, { id: job.id, company: job.company, title: job.title, notes: '' }] }
+                    : p
+                  );
+                }
+                saveAppPlans(updated);
+              }}
+              className={"px-4 py-2 rounded text-sm font-medium border cursor-pointer " + (currentPlan ? "bg-green-50 text-green-700 border-green-300" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}
+            >
+              <option value="">Add to Plan...</option>
+              {appPlans.map(p => {
+                const already = p.jobs.some(pj => pj.id === job.id);
+                return <option key={p.id} value={p.id}>{p.title}{already ? ' \u2713' : ''}</option>;
+              })}
+            </select>
+          )}
+        </div>
+
+        {/* Two column layout */}
+        <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
+          {/* Left column - 60% */}
+          <div className="lg:col-span-3 space-y-6">
+            {/* Status Timeline */}
+            {Object.keys(job.timestamps || {}).length > 0 && (
+              <div className="bg-white rounded-lg border p-4">
+                <h3 className="text-sm font-semibold text-gray-700 mb-3">Status Timeline</h3>
+                <div className="space-y-2">
+                  {STATUSES.filter(s => job.timestamps[s]).map((s, i, arr) => {
+                    const ts = job.timestamps[s];
+                    const d = new Date(ts);
+                    const dateStr = d.toLocaleDateString() + " " + d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+                    let diff = null;
+                    if (i > 0) {
+                      const prevTs = job.timestamps[arr[i - 1]];
+                      if (prevTs) {
+                        const days = Math.round((ts - prevTs) / (1000 * 60 * 60 * 24) * 10) / 10;
+                        diff = days + "d";
+                      }
+                    }
+                    return (
+                      <div key={s} className="flex items-center gap-3 text-sm">
+                        <span className={"w-2.5 h-2.5 rounded-full flex-shrink-0 " + (STATUS_COLORS[s]?.split(" ")[0] || "bg-gray-300")}></span>
+                        <span className="font-medium w-28">{s}</span>
+                        <span className="text-gray-500">{dateStr}</span>
+                        {diff && <span className="text-gray-400 ml-1">({diff})</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Job Description */}
+            <div className="bg-white rounded-lg border p-4">
+              <h3 className="text-sm font-semibold text-gray-700 mb-3">Job Description</h3>
+              {description ? (
+                <div className="prose prose-sm max-w-none text-gray-700" dangerouslySetInnerHTML={{ __html: description }} />
+              ) : job.description ? (
+                <div className="prose prose-sm max-w-none text-gray-700 whitespace-pre-wrap">{job.description}</div>
+              ) : (
+                <p className="text-gray-400 text-sm">No description available</p>
+              )}
+            </div>
+
+            {/* Company Info */}
+            {companyInfo && (
+              <div className="bg-white rounded-lg border p-4">
+                <h3 className="text-sm font-semibold text-gray-700 mb-3">Company Info</h3>
+                <div className="flex items-start gap-4">
+                  {companyInfo.logo_url && (
+                    <img src={companyInfo.logo_url} alt="" className="w-12 h-12 rounded-lg object-contain border" />
+                  )}
+                  <div className="space-y-1 text-sm">
+                    {companyInfo.industry && <p><span className="text-gray-400">Industry:</span> <span className="text-gray-700">{companyInfo.industry}</span></p>}
+                    {companyInfo.known_for && <p><span className="text-gray-400">Known for:</span> <span className="text-gray-700">{companyInfo.known_for}</span></p>}
+                    {companyInfo.website && (
+                      <p><span className="text-gray-400">Website:</span>{' '}
+                        <a href={companyInfo.website.startsWith('http') ? companyInfo.website : 'https://' + companyInfo.website}
+                          target="_blank" rel="noopener" className="text-blue-500 hover:underline">{companyInfo.website}</a>
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Right column - 40% */}
+          <div className="lg:col-span-2 space-y-6">
+            {/* Notes */}
+            <div className="bg-white rounded-lg border p-4">
+              <h3 className="text-sm font-semibold text-gray-700 mb-2">Notes</h3>
+              <textarea
+                value={localNotes}
+                onChange={e => setLocalNotes(e.target.value)}
+                onBlur={saveNotes}
+                placeholder="Add notes about this position..."
+                className="w-full px-3 py-2 border rounded text-sm h-40 resize-none focus:outline-none focus:ring-2 focus:ring-blue-400"
+              />
+            </div>
+
+            {/* Resume */}
+            <div className="bg-white rounded-lg border p-4">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-sm font-semibold text-gray-700">Resume</h3>
+                {job.pdf_path && (
+                  <a href={job.pdf_path} target="_blank" rel="noopener"
+                    className="text-xs text-blue-500 hover:text-blue-700 underline">
+                    Open in new tab
+                  </a>
+                )}
+              </div>
+              <button
+                onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title)}
+                className="w-full mb-3 px-3 py-2 bg-gray-50 text-gray-700 rounded text-sm border hover:bg-gray-100 text-center"
+              >
+                View Text Resume
+              </button>
+              {job.pdf_path ? (
+                <div className="mb-3 rounded border overflow-hidden" style={{height: '500px'}}>
+                  <iframe
+                    src={job.pdf_path}
+                    className="w-full h-full"
+                    style={{border: 'none'}}
+                    title="Resume Preview"
+                  />
+                </div>
+              ) : null}
+              <BatchPdfDropZone job={job} />
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 
 function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans }) {
   const { useState, useMemo, useCallback } = React;
@@ -2145,7 +2449,7 @@ function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans 
 function App() {
   const [jobs, setJobs] = useState([]);
   const [batchStats, setBatchStats] = useState([]);
-  const [view, setView, batchDetailDate, setHashBatchDate, selectedId, setHashJobId] = useHashRoute();
+  const [view, setView, batchDetailDate, setHashBatchDate, selectedId, setHashJobId, jobDetailId, setJobDetailId] = useHashRoute();
   const [loaded, setLoaded] = useState(!IS_SERVED);
   const [filters, setFilters] = useState({
     tiers: [], statuses: [], search: "", favoritesOnly: false
@@ -2439,7 +2743,8 @@ function App() {
     };
     window._syncAppPlans = (updated) => setAppPlans(updated);
     window._openBatchDetail = (date) => setBatchDetailDate(date);
-    return () => { delete window._getPlans; delete window._addJobToPlan; delete window._syncAppPlans; delete window._openBatchDetail; };
+    window._openJobDetail = (id) => { window.location.hash = '#/job-detail/' + id; };
+    return () => { delete window._getPlans; delete window._addJobToPlan; delete window._syncAppPlans; delete window._openBatchDetail; delete window._openJobDetail; };
   }, [appPlans, saveAppPlans]);
 
   const favCount = useMemo(() => jobs.filter(j => j.favorited).length, [jobs]);
@@ -2525,7 +2830,8 @@ function App() {
 
   return (
     <div className="min-h-screen">
-      {/* Header */}
+      {/* Header — hidden when job detail page is active */}
+      {!jobDetailId && <>
       <div className="bg-white border-b px-6 py-4 flex items-center justify-between">
         <div>
           <div className="flex items-center gap-3">
@@ -2781,8 +3087,9 @@ function App() {
           <p className="text-xs text-green-400 mt-1">Export from LinkedIn Jobs &#8594; Save as CSV. Duplicate jobs are automatically skipped. Batch appears in Stats as "YYYY-MM-DD &#8212; Location".</p>
         </div>
       )}
+      </>}
 
-      {batchDetailDate ? <BatchDetailView jobs={jobs} batchDate={batchDetailDate} onBack={() => setBatchDetailDate(null)} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "stats" ? <StatsPanel jobs={jobs} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "pipeline" ? <PipelineView jobs={jobs} changeStatus={changeStatus} /> : view === "sankey" ? <SankeyView jobs={jobs} /> : view === "plans" ? <PlansView jobs={jobs} /> : <>
+      {jobDetailId ? <JobDetailPage job={jobs.find(j => j.id === jobDetailId)} appPlans={appPlans} saveAppPlans={saveAppPlans} changeStatus={changeStatus} onBack={() => { if (window.history.length > 1) window.history.back(); else window.location.hash = '#/jobs'; }} /> : batchDetailDate ? <BatchDetailView jobs={jobs} batchDate={batchDetailDate} onBack={() => setBatchDetailDate(null)} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "stats" ? <StatsPanel jobs={jobs} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "pipeline" ? <PipelineView jobs={jobs} changeStatus={changeStatus} /> : view === "sankey" ? <SankeyView jobs={jobs} /> : view === "plans" ? <PlansView jobs={jobs} /> : <>
       {/* Metrics Bar */}
       <div className="bg-white border-b px-6 py-3 flex gap-3 flex-wrap">
         {STATUSES.filter(s => metrics.byStatus[s] > 0 || s === "Applied").map(s => (
@@ -2890,6 +3197,7 @@ function App() {
                   <tr
                     key={j.id}
                     onClick={() => setSelectedId(j.id)}
+                    onDoubleClick={() => window._openJobDetail && window._openJobDetail(j.id)}
                     className={"job-row border-b cursor-pointer text-sm " + (selectedId === j.id ? "selected" : "")}
                   >
                     <td className="px-2 py-2 text-center" onClick={e => toggleFavorite(j.id, e)}>
@@ -3058,6 +3366,10 @@ function App() {
                 <button onClick={() => window._openAIChat && window._openAIChat(selectedJob.id, selectedJob.company + ' — ' + selectedJob.title)}
                   className="px-3 py-1.5 bg-purple-600 text-white rounded text-xs font-medium hover:bg-purple-700">
                   Ask AI
+                </button>
+                <button onClick={() => { window.location.hash = '#/job-detail/' + selectedJob.id; }}
+                  className="px-3 py-1.5 bg-gray-800 text-white rounded text-xs font-medium hover:bg-gray-900">
+                  Full Page &#8599;
                 </button>
               </div>
 
@@ -3376,6 +3688,11 @@ function JobDetailModal() {
               }}
               className="px-2.5 py-1 bg-blue-100 text-blue-700 rounded text-xs font-medium hover:bg-blue-200 border border-blue-200">
               Copy My LinkedIn
+            </button>
+            <button
+              onClick={() => { setJobId(null); window.location.hash = '#/job-detail/' + job.id; }}
+              className="px-3 py-1.5 bg-gray-800 text-white rounded text-xs font-medium hover:bg-gray-900">
+              Full Page &#8599;
             </button>
           </div>
 
