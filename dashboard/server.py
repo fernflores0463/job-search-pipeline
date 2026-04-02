@@ -730,7 +730,10 @@ def _run_live_check(batch_filter=None):
 # AI ASSISTANT
 # ─────────────────────────────────────────────────────────
 
-_BULLET_POOL = {key: entry["bullets"] for key, entry in _config["experience"].items()}
+_BULLET_POOL = {
+    entry.get("display_name", key): entry["bullets"]
+    for key, entry in _config["experience"].items()
+}
 _CANDIDATE_SKILLS = _config["candidate"]["skills"]
 
 
@@ -1559,6 +1562,30 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 return
             try:
                 _json_response(self, _fetch_company_info(company_name))
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── /api/resume-text/<id> ─────────────────────────
+        if self.path.startswith("/api/resume-text/"):
+            job_id = self.path[len("/api/resume-text/"):]
+            try:
+                job = load_job(job_id)
+                if not job:
+                    _json_response(
+                        self, {"error": "Job not found"}, 404
+                    )
+                    return
+                text = job.get("resume_text", "")
+                if not text:
+                    _json_response(
+                        self, {"error": "No resume text"}, 404
+                    )
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(text.encode())
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
             return

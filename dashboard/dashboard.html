@@ -2037,7 +2037,7 @@ function JobDetailPage({ job, appPlans = [], saveAppPlans, changeStatus, onBack 
               LinkedIn Posting
             </a>
           )}
-          <button onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title)}
+          <button onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title, job.id)}
             className="px-4 py-2 bg-gray-100 text-gray-700 rounded text-sm font-medium hover:bg-gray-200 border">
             View Resume
           </button>
@@ -2168,7 +2168,7 @@ function JobDetailPage({ job, appPlans = [], saveAppPlans, changeStatus, onBack 
                 )}
               </div>
               <button
-                onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title)}
+                onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title, job.id)}
                 className="w-full mb-3 px-3 py-2 bg-gray-50 text-gray-700 rounded text-sm border hover:bg-gray-100 text-center"
               >
                 View Text Resume
@@ -3491,7 +3491,7 @@ function App() {
                     LinkedIn Posting
                   </a>
                 )}
-                <button onClick={() => window._showResume && window._showResume(selectedJob.resume_path, selectedJob.company, selectedJob.title)}
+                <button onClick={() => window._showResume && window._showResume(selectedJob.resume_path, selectedJob.company, selectedJob.title, selectedJob.id)}
                   className="px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">
                   View Resume
                 </button>
@@ -3861,11 +3861,31 @@ function ResumePreviewModal() {
   const [copiedIdx, setCopiedIdx] = useState(null);
 
   React.useEffect(() => {
-    window._showResume = (path, company, title) => {
+    window._showResume = (path, company, title, jobId) => {
       setCopiedIdx(null);
       setData({ path, company, title, text: null, loading: true, error: null });
-      fetch('/' + path)
-        .then(r => { if (!r.ok) throw new Error('Failed to load'); return r.text(); })
+      // If we have a job ID and the server is running, fetch resume_text from DB
+      const apiUrl = (IS_SERVED && jobId) ? '/api/resume-text/' + encodeURIComponent(jobId) : null;
+      const fileUrl = path ? '/' + path : null;
+      const fetchUrl = apiUrl || fileUrl;
+      if (!fetchUrl) {
+        setData(prev => ({ ...prev, error: 'No resume available', loading: false }));
+        return;
+      }
+      fetch(fetchUrl)
+        .then(r => {
+          if (!r.ok) {
+            // If API failed and we have a file path, try that as fallback
+            if (apiUrl && fileUrl) {
+              return fetch(fileUrl).then(r2 => {
+                if (!r2.ok) throw new Error('Failed to load');
+                return r2.text();
+              });
+            }
+            throw new Error('Failed to load');
+          }
+          return r.text();
+        })
         .then(text => setData(prev => ({ ...prev, text, loading: false })))
         .catch(err => setData(prev => ({ ...prev, error: err.message, loading: false })));
     };
