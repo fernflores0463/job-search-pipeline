@@ -245,12 +245,13 @@ def load_state():
             cur = conn.cursor()
             cur.execute("""
                 SELECT job_id, status, notes, applicants,
-                       live_status, live_status_checked, timestamps
+                       live_status, live_status_checked, timestamps,
+                       pdf_path
                 FROM job_state
             """)
             result = {}
             for row in cur.fetchall():
-                job_id, status, notes, applicants, live_status, live_status_checked, timestamps = row
+                job_id, status, notes, applicants, live_status, live_status_checked, timestamps, pdf_path = row
                 result[job_id] = {
                     "status": status,
                     "notes": notes,
@@ -258,6 +259,7 @@ def load_state():
                     "live_status": live_status,
                     "live_status_checked": live_status_checked.isoformat() if live_status_checked else None,
                     "timestamps": timestamps if isinstance(timestamps, dict) else {},
+                    "pdf_path": pdf_path,
                 }
             return result
     except Exception as e:
@@ -272,8 +274,9 @@ def save_job_state(job_id, state):
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO job_state
-                    (job_id, status, notes, applicants, live_status, live_status_checked, timestamps, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                    (job_id, status, notes, applicants, live_status,
+                     live_status_checked, timestamps, pdf_path, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
                 ON CONFLICT (job_id) DO UPDATE SET
                     status               = EXCLUDED.status,
                     notes                = EXCLUDED.notes,
@@ -281,6 +284,8 @@ def save_job_state(job_id, state):
                     live_status          = EXCLUDED.live_status,
                     live_status_checked  = EXCLUDED.live_status_checked,
                     timestamps           = EXCLUDED.timestamps,
+                    pdf_path             = COALESCE(EXCLUDED.pdf_path,
+                                                    job_state.pdf_path),
                     updated_at           = NOW()
             """, (
                 job_id,
@@ -290,6 +295,7 @@ def save_job_state(job_id, state):
                 state.get("live_status"),
                 state.get("live_status_checked"),
                 json.dumps(state.get("timestamps", {})),
+                state.get("pdf_path"),
             ))
     except Exception as e:
         print(f"Error saving state for {job_id}: {e}")
@@ -1409,6 +1415,21 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             return
 
+        # ── Serve resume PDFs from resumes/ directory ─────
+        if self.path.startswith("/resumes/") and self.path.endswith(".pdf"):
+            pdf_file = os.path.join(PARENT_DIR, self.path.lstrip("/"))
+            if os.path.isfile(pdf_file):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/pdf")
+                self.end_headers()
+                with open(pdf_file, "rb") as f:
+                    self.wfile.write(f.read())
+                return
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+
         if self.path == "/":
             self.path = "/dashboard.html"
 
@@ -1680,24 +1701,27 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(b'{"error":"Unauthorized"}')
             return
 
-        # ── /api/upload-resume/<path> ────────────────────
+        # ── /api/upload-resume/<job_id> ───────────────────
         if self.path.startswith("/api/upload-resume/"):
-            import base64
             try:
-                encoded_path = self.path[len("/api/upload-resume/"):]
-                resume_dir = base64.urlsafe_b64decode(encoded_path).decode("utf-8")
-                full_dir = os.path.normpath(os.path.join(PARENT_DIR, resume_dir))
-                if not full_dir.startswith(PARENT_DIR):
-                    self.send_response(403)
-                    self.end_headers()
-                    return
-                content_length = int(self.headers.get("Content-Length", 0))
+                job_id = self.path[len("/api/upload-resume/"):]
+                pdf_dir = os.path.join(PARENT_DIR, "resumes", job_id)
+                os.makedirs(pdf_dir, exist_ok=True)
+                content_length = int(
+                    self.headers.get("Content-Length", 0)
+                )
                 file_data = self.rfile.read(content_length)
-                os.makedirs(full_dir, exist_ok=True)
-                pdf_path = os.path.join(full_dir, "resume.pdf")
-                with open(pdf_path, "wb") as f:
+                pdf_file = os.path.join(pdf_dir, "resume.pdf")
+                with open(pdf_file, "wb") as f:
                     f.write(file_data)
-                _json_response(self, {"ok": True, "path": resume_dir + "/resume.pdf"})
+                relative_path = f"resumes/{job_id}/resume.pdf"
+                # Persist pdf_path in job_state
+                state = load_state().get(job_id, {})
+                state["pdf_path"] = relative_path
+                save_job_state(job_id, state)
+                _json_response(
+                    self, {"ok": True, "path": relative_path}
+                )
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
             return

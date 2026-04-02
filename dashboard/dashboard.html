@@ -2791,11 +2791,9 @@ function App() {
   }, []);
 
   const uploadPdfFile = useCallback(async (job, file) => {
-    if (!file || !job.resume_path) return;
-    const resumeDir = job.resume_path.replace(/\/resume\.txt$/, "");
-    const encoded = btoa(resumeDir);
+    if (!file || !job.id) return;
     try {
-      const res = await fetch("/api/upload-resume/" + encoded, {
+      const res = await fetch("/api/upload-resume/" + encodeURIComponent(job.id), {
         method: "POST",
         body: file,
       });
