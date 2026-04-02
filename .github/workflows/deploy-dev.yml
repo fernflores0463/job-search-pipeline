@@ -50,6 +50,8 @@ jobs:
 
           ssh -i /tmp/deploy_key.pem \
             -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
             "
               # Login to ECR
@@ -70,9 +72,7 @@ jobs:
               DB_PASS=\$(aws ssm get-parameter --name /job-search/db-password --with-decryption --query Parameter.Value --output text)
 
               # Apply schema to dev database (idempotent — all tables use IF NOT EXISTS)
-              docker run --rm $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:dev cat db/schema.sql \
-                | docker run --rm -i -e PGPASSWORD=\$DB_PASS postgres:15 \
-                  psql -h \$DB_HOST -U \$DB_USER -d jobsearch_dev
+              docker run --rm -e DB_HOST=\$DB_HOST -e DB_NAME=jobsearch_dev -e DB_USER=\$DB_USER -e DB_PASSWORD=\$DB_PASS $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:dev python3 -c 'import sys; sys.path.insert(0, \".\"); from db.db import init_pool,get_conn,put_conn; init_pool(); c=get_conn(); c.cursor().execute(open(\"db/schema.sql\").read()); c.commit(); put_conn(c); print(\"Schema applied to jobsearch_dev\")' || echo 'Schema apply skipped — run one-time DB setup if this is a fresh environment'
 
               # Start dev container (no auth password = open access)
               docker run -d --name ${{ env.DEV_CONTAINER }} \
