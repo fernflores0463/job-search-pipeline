@@ -1186,7 +1186,17 @@ def format_job_description(raw):
 
     raw = raw.replace('\u2018', "'").replace('\u2019', "'")
     raw = raw.replace('\u201c', '"').replace('\u201d', '"')
-    chunks = re.split(r'  +', raw.strip())
+    # Normalize markdown headers (## Header or **Header**) to plain
+    # text on their own line so the header_re can detect them
+    raw = re.sub(r'^#{1,4}\s+(.+)$', r'\1', raw, flags=re.MULTILINE)
+    raw = re.sub(
+        r'^\*{1,2}([^*\n]+)\*{1,2}\s*$', r'\1',
+        raw, flags=re.MULTILINE
+    )
+    # Convert inline bold/italic markdown to HTML
+    raw = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', raw)
+    raw = re.sub(r'\*([^*]+)\*', r'<i>\1</i>', raw)
+    chunks = re.split(r'(?:  +|\n\n+|\n)', raw.strip())
 
     header_re = re.compile(
         r"^(?:about (?:the |this )?(?:role|position|team|company|job|us|you)|"
@@ -1236,11 +1246,22 @@ def format_job_description(raw):
     parts, in_list = [], False
     for kind, content in lines:
         escaped = html_mod.escape(content)
+        # Restore inline bold/italic tags that were converted
+        # from markdown before chunking
+        escaped = escaped.replace(
+            '&lt;b&gt;', '<b>'
+        ).replace(
+            '&lt;/b&gt;', '</b>'
+        ).replace(
+            '&lt;i&gt;', '<i>'
+        ).replace(
+            '&lt;/i&gt;', '</i>'
+        )
         if kind == 'header':
             if in_list:
                 parts.append('</ul>')
                 in_list = False
-            parts.append(f'<h4 style="font-weight:600;font-size:0.8rem;color:#374151;margin:0.75rem 0 0.25rem 0;">{escaped}</h4>')
+            parts.append(f'<h4 style="font-weight:600;font-size:0.85rem;color:#374151;margin:1rem 0 0.35rem 0;">{escaped}</h4>')
         elif kind == 'bullet':
             if not in_list:
                 parts.append('<ul style="margin:0.25rem 0;padding-left:1.25rem;list-style:disc;">')
@@ -1250,7 +1271,7 @@ def format_job_description(raw):
             if in_list:
                 parts.append('</ul>')
                 in_list = False
-            parts.append(f'<p style="font-size:0.75rem;color:#4b5563;margin:0.35rem 0;">{escaped}</p>')
+            parts.append(f'<p style="font-size:0.75rem;color:#4b5563;margin:0.5rem 0;">{escaped}</p>')
     if in_list:
         parts.append('</ul>')
     return '\n'.join(parts)
@@ -1464,7 +1485,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                js.pdf_path
                         FROM jobs j
                         LEFT JOIN job_state js ON j.id = js.job_id
-                        ORDER BY j.import_date DESC, j.score DESC
+                        ORDER BY j.import_date DESC, j.created_at DESC, j.score DESC
                     """)
                     cols = [d[0] for d in cur.description]
                     rows = cur.fetchall()
@@ -1758,6 +1779,311 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 _json_response(self, {"ok": True})
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── POST /api/import-url (AI extraction) ─────────
+        if self.path == "/api/import-url":
+            if not _ANTHROPIC_KEY:
+                _json_response(self, {
+                    "error": "Anthropic API key not configured."
+                }, 500)
+                return
+
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            url = (body.get("url") or "").strip()
+            company_override = (body.get("company_override") or "").strip()
+
+            if not url or not url.startswith(("http://", "https://")):
+                _json_response(
+                    self, {"error": "Invalid URL"}, 400
+                )
+                return
+
+            try:
+                import requests as req_lib
+                from bs4 import BeautifulSoup
+                from datetime import date as _date
+                sys.path.insert(0, PARENT_DIR)
+                from process_new_postings import (
+                    is_excluded_company,
+                    calc_tech_score, calc_level_bonus,
+                    calc_company_bonus, assign_tier,
+                    make_job_id, pick_bullets,
+                    customize_skills, generate_resume_txt,
+                )
+
+                # Fetch page
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Macintosh; "
+                    "Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                }
+                resp = req_lib.get(url, headers=headers, timeout=15)
+                resp.raise_for_status()
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for tag in soup(["script", "style", "nav", "footer"]):
+                    tag.decompose()
+                page_text = soup.get_text(separator="\n", strip=True)
+
+                if len(page_text) < 100:
+                    _json_response(self, {
+                        "error": "Page returned too little text. "
+                        "It may require JavaScript rendering."
+                    }, 400)
+                    return
+
+                # Truncate to avoid huge token costs
+                page_text = page_text[:15000]
+
+                # Ask Claude to extract fields
+                extraction_prompt = (
+                    "Extract the following fields from this job "
+                    "posting page text.\n"
+                    "Return ONLY a JSON object with these keys:\n\n"
+                    '{\n'
+                    '  "company": "Company name",\n'
+                    '  "title": "Job title",\n'
+                    '  "location": "Job location or Remote",\n'
+                    '  "salary": "Salary range if listed, '
+                    'otherwise N/A",\n'
+                    '  "work_type": "Remote, Hybrid, On-site, '
+                    'or empty if unclear",\n'
+                    '  "description": "The full job description '
+                    'text, cleaned up and formatted with clear '
+                    'section headers, bullet points for '
+                    'requirements/responsibilities, and '
+                    'readable paragraphs. Remove boilerplate '
+                    '(EEO statements, cookie notices, nav text). '
+                    'Use newlines for structure."\n'
+                    '}\n\n'
+                    "If a field cannot be determined, use an "
+                    "empty string.\n"
+                    "Do not include any text outside the JSON "
+                    "object.\n\n"
+                    "PAGE TEXT:\n" + page_text
+                )
+
+                ai_response = _call_claude(
+                    "You extract structured job posting data "
+                    "from web page text. Return only valid JSON.",
+                    [{"role": "user", "content": extraction_prompt}]
+                )
+
+                # Parse Claude's JSON response
+                json_match = re.search(
+                    r'\{[\s\S]*\}', ai_response
+                )
+                if not json_match:
+                    _json_response(self, {
+                        "error": "AI could not extract job data"
+                    }, 400)
+                    return
+
+                extracted = json.loads(json_match.group())
+                company = (
+                    company_override
+                    or extracted.get("company", "").strip()
+                )
+                title = extracted.get("title", "").strip()
+                desc = extracted.get("description", "").strip()
+
+                if not company or not title or not desc:
+                    _json_response(self, {
+                        "error": "Could not extract required "
+                        "fields (company, title, description)"
+                    }, 400)
+                    return
+
+                if is_excluded_company(company):
+                    _json_response(self, {
+                        "error": f"'{company}' matches a "
+                        "staffing firm exclusion pattern."
+                    }, 400)
+                    return
+
+                # Dedup
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT id FROM jobs "
+                        "WHERE job_link = %s", (url,)
+                    )
+                    if cur.fetchone():
+                        _json_response(self, {
+                            "error": "Job already exists"
+                        }, 409)
+                        return
+
+                # Score and insert
+                dl = desc.lower()
+                tl = title.lower()
+                score = (calc_tech_score(dl)
+                         + calc_level_bonus(tl)
+                         + calc_company_bonus(company))
+                tier = assign_tier(score)
+                job_id = make_job_id(company, title, url)
+                job = {
+                    "company": company,
+                    "title": title,
+                    "description": desc,
+                }
+                bullets = pick_bullets(desc, title)
+                langs, fw, misc = customize_skills(desc)
+                resume_text = generate_resume_txt(
+                    job, bullets, langs, fw, misc
+                )
+                batch = "AI Import"
+
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO jobs
+                            (id, company, title, location,
+                             work_type, salary, posted_date,
+                             import_date, description, score,
+                             tier, job_link, apply_link,
+                             resume_text)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,
+                                %s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (id) DO NOTHING
+                    """, (
+                        job_id, company, title,
+                        extracted.get("location", ""),
+                        extracted.get("work_type", ""),
+                        extracted.get("salary", "N/A"),
+                        "", batch, desc, score, tier,
+                        url, url, resume_text,
+                    ))
+                    cur.execute(
+                        "INSERT INTO job_state (job_id) "
+                        "VALUES (%s) ON CONFLICT DO NOTHING",
+                        (job_id,)
+                    )
+
+                _json_response(self, {
+                    "ok": True,
+                    "job": {
+                        "id": job_id,
+                        "company": company,
+                        "title": title,
+                        "score": score,
+                        "tier": tier,
+                    }
+                })
+            except json.JSONDecodeError:
+                _json_response(self, {
+                    "error": "AI returned invalid JSON"
+                }, 500)
+            except Exception as e:
+                _json_response(
+                    self, {"error": str(e)}, 500
+                )
+            return
+
+        # ── POST /api/add-job (manual entry) ──────────────
+        if self.path == "/api/add-job":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+
+            company = (body.get("company") or "").strip()
+            title = (body.get("title") or "").strip()
+            desc = (body.get("description") or "").strip()
+
+            if not company or not title or not desc:
+                _json_response(self, {
+                    "error": "Company, title, and description "
+                    "are required"
+                }, 400)
+                return
+
+            try:
+                from datetime import date as _date
+                sys.path.insert(0, PARENT_DIR)
+                from process_new_postings import (
+                    calc_tech_score, calc_level_bonus,
+                    calc_company_bonus, assign_tier,
+                    make_job_id, pick_bullets,
+                    customize_skills, generate_resume_txt,
+                )
+
+                job_link = (body.get("job_link") or "").strip()
+                apply_link = (
+                    body.get("apply_link") or job_link
+                ).strip()
+
+                # Dedup if URL provided
+                if job_link:
+                    with Db() as conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            "SELECT id FROM jobs "
+                            "WHERE job_link = %s", (job_link,)
+                        )
+                        if cur.fetchone():
+                            _json_response(self, {
+                                "error": "Job already exists"
+                            }, 409)
+                            return
+
+                dl = desc.lower()
+                tl = title.lower()
+                score = (calc_tech_score(dl)
+                         + calc_level_bonus(tl)
+                         + calc_company_bonus(company))
+                tier = assign_tier(score)
+                job_id = make_job_id(company, title, job_link)
+                job = {
+                    "company": company,
+                    "title": title,
+                    "description": desc,
+                }
+                bullets = pick_bullets(desc, title)
+                langs, fw, misc = customize_skills(desc)
+                resume_text = generate_resume_txt(
+                    job, bullets, langs, fw, misc
+                )
+                batch = "AI Import"
+
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO jobs
+                            (id, company, title, location,
+                             work_type, salary, posted_date,
+                             import_date, description, score,
+                             tier, job_link, apply_link,
+                             resume_text)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,
+                                %s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (id) DO NOTHING
+                    """, (
+                        job_id, company, title,
+                        (body.get("location") or "").strip(),
+                        (body.get("work_type") or "").strip(),
+                        (body.get("salary") or "N/A").strip(),
+                        "", batch, desc, score, tier,
+                        job_link, apply_link, resume_text,
+                    ))
+                    cur.execute(
+                        "INSERT INTO job_state (job_id) "
+                        "VALUES (%s) ON CONFLICT DO NOTHING",
+                        (job_id,)
+                    )
+
+                _json_response(self, {
+                    "ok": True,
+                    "job": {
+                        "id": job_id,
+                        "company": company,
+                        "title": title,
+                        "score": score,
+                        "tier": tier,
+                    }
+                })
+            except Exception as e:
+                _json_response(
+                    self, {"error": str(e)}, 500
+                )
             return
 
         # ── POST /api/scrape-careers ─────────────────────

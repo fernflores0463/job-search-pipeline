@@ -1286,7 +1286,12 @@ function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
       else if (j.tier === 'Match') byDate[d].match++;
       else byDate[d].weak++;
     });
-    return Object.values(byDate).sort((a, b) => b.date.localeCompare(a.date));
+    return Object.values(byDate).sort((a, b) => {
+      // "AI Import" always first
+      if (a.date === 'AI Import') return -1;
+      if (b.date === 'AI Import') return 1;
+      return b.date.localeCompare(a.date);
+    });
   }, [jobs]);
 
   const topCompanies = useMemo(() => {
@@ -1373,17 +1378,20 @@ function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
                   });
                   return Object.entries(pp).sort((a, b) => b[1] - a[1]).slice(0, 20);
                 })() : [];
+                const isAIBatch = b.date === 'AI Import';
                 const filteredJobs = isExpanded ? (batchTierFilter === 'all' ? [...batchJobs] :
-                  batchJobs.filter(j => j.tier === batchTierFilter)).sort((a, b) => b.score - a.score) : [];
+                  batchJobs.filter(j => j.tier === batchTierFilter)).sort((x, y) =>
+                    isAIBatch ? 0 : y.score - x.score
+                  ) : [];
                 const maxBatchCo = isExpanded && batchCompanies.length > 0 ? batchCompanies[0][1] : 1;
 
                 return (
                   <React.Fragment key={b.date}>
-                    <tr className={"border-b cursor-pointer transition-colors " + (isExpanded ? "bg-blue-50" : "hover:bg-gray-50")}
+                    <tr className={"border-b cursor-pointer transition-colors " + (b.date === 'AI Import' ? (isExpanded ? "bg-purple-100" : "bg-purple-50 hover:bg-purple-100") : (isExpanded ? "bg-blue-50" : "hover:bg-gray-50"))}
                         onClick={() => { setExpandedBatch(isExpanded ? null : b.date); setBatchTierFilter('all'); setSelectedBatchJobId(null); }}>
-                      <td className="py-2 pr-4 font-medium text-gray-700">
+                      <td className={"py-2 pr-4 font-medium " + (b.date === 'AI Import' ? "text-purple-700" : "text-gray-700")}>
                         <span className={"inline-block mr-2 text-xs transition-transform " + (isExpanded ? "transform rotate-90" : "")}>&#9654;</span>
-                        {b.date}
+                        {b.date === 'AI Import' ? '\u{1F916} AI Import' : b.date}
                       </td>
                       <td className="text-right px-3 text-green-700 font-medium">{b.strong}</td>
                       <td className="text-right px-3 text-blue-700 font-medium">{b.match}</td>
@@ -2657,6 +2665,15 @@ function App() {
   const [importLocation, setImportLocation] = useState('');
   const [importStatus, setImportStatus]     = useState(null);
 
+  const [showAIImport, setShowAIImport] = useState(false);
+  const [aiImportUrl, setAiImportUrl] = useState('');
+  const [aiImportCompany, setAiImportCompany] = useState('');
+  const [aiImportStatus, setAiImportStatus] = useState(null);
+
+  const [showManualAdd, setShowManualAdd] = useState(false);
+  const [manualJob, setManualJob] = useState({ company: '', title: '', description: '', job_link: '', apply_link: '', location: '', salary: '', work_type: '' });
+  const [manualAddStatus, setManualAddStatus] = useState(null);
+
   const inferLocationFromFilename = (filename) => {
     const STOP_WORDS = /\b(jobs?|export|linkedin|easy|apply|results?|search|csv|import)\b/gi;
     return filename
@@ -3057,6 +3074,18 @@ function App() {
               >
                 &#128196; Import CSV
               </button>
+              <button
+                onClick={() => setShowAIImport(!showAIImport)}
+                className={"ml-2 px-3 py-1.5 rounded text-xs font-medium border " + (showAIImport ? "bg-purple-600 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}
+              >
+                &#129302; AI Import
+              </button>
+              <button
+                onClick={() => setShowManualAdd(!showManualAdd)}
+                className={"ml-2 px-3 py-1.5 rounded text-xs font-medium border " + (showManualAdd ? "bg-gray-800 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}
+              >
+                &#43; Add Job
+              </button>
               </>
             )
           )}
@@ -3250,6 +3279,145 @@ function App() {
             </div>
           )}
           <p className="text-xs text-green-400 mt-1">Export from LinkedIn Jobs &#8594; Save as CSV. Duplicate jobs are automatically skipped. Batch appears in Stats as "YYYY-MM-DD &#8212; Location".</p>
+        </div>
+      )}
+
+      {showAIImport && (
+        <div className="bg-purple-50 border-b border-purple-200 px-6 py-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className="text-sm font-medium text-purple-700">AI Import from URL:</span>
+            <input
+              type="text"
+              placeholder="https://careers.company.com/jobs/senior-swe"
+              value={aiImportUrl}
+              onChange={e => setAiImportUrl(e.target.value)}
+              className="flex-1 min-w-64 px-3 py-1.5 border border-purple-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-purple-400"
+            />
+            <input
+              type="text"
+              placeholder="Company name (optional override)"
+              value={aiImportCompany}
+              onChange={e => setAiImportCompany(e.target.value)}
+              className="w-48 px-3 py-1.5 border border-purple-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-purple-400"
+            />
+            <button
+              onClick={async () => {
+                if (!aiImportUrl.trim()) return;
+                setAiImportStatus({ loading: true, message: 'Fetching page and analyzing with Claude...' });
+                try {
+                  const res = await fetch('/api/import-url', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: aiImportUrl.trim(), company_override: aiImportCompany.trim() }),
+                  });
+                  const data = await res.json();
+                  if (data.ok) {
+                    setAiImportStatus({ loading: false, message: `Added: ${data.job.company} \u2014 ${data.job.title} (${data.job.tier}, Score: ${data.job.score})`, jobId: data.job.id });
+                    setAiImportUrl('');
+                    setAiImportCompany('');
+                    setTimeout(() => window.location.reload(), 5000);
+                  } else {
+                    setAiImportStatus({ loading: false, message: 'Error: ' + data.error });
+                  }
+                } catch (err) {
+                  setAiImportStatus({ loading: false, message: 'Error: ' + err.message });
+                }
+              }}
+              disabled={aiImportStatus?.loading || !aiImportUrl.trim()}
+              className="px-4 py-1.5 bg-purple-600 text-white rounded text-sm font-medium hover:bg-purple-700 disabled:opacity-50"
+            >
+              {aiImportStatus?.loading ? 'Analyzing...' : 'Import with AI'}
+            </button>
+          </div>
+          {aiImportStatus?.message && (
+            <p className={"text-xs mt-1 " + (aiImportStatus.message.startsWith('Error') ? "text-red-500" : "text-purple-600")}>
+              {aiImportStatus.message}
+              {aiImportStatus.jobId && (
+                <a href={'#/job-detail/' + aiImportStatus.jobId}
+                  className="ml-2 text-purple-700 underline font-medium hover:text-purple-900"
+                  onClick={e => { e.preventDefault(); window.location.hash = '#/job-detail/' + aiImportStatus.jobId; }}
+                >View Job &rarr;</a>
+              )}
+            </p>
+          )}
+          <p className="text-xs text-purple-400 mt-1">Paste any job posting URL. Claude will extract the company, title, description, and other fields automatically.</p>
+        </div>
+      )}
+
+      {showManualAdd && (
+        <div className="bg-gray-50 border-b border-gray-300 px-6 py-3">
+          <div className="flex items-start gap-4 flex-wrap">
+            <span className="text-sm font-medium text-gray-700 mt-1">Add Job Manually:</span>
+            <div className="flex-1 min-w-96 grid grid-cols-2 gap-2">
+              <input type="text" placeholder="Company *" value={manualJob.company}
+                onChange={e => setManualJob(prev => ({ ...prev, company: e.target.value }))}
+                className="px-3 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-gray-400" />
+              <input type="text" placeholder="Job Title *" value={manualJob.title}
+                onChange={e => setManualJob(prev => ({ ...prev, title: e.target.value }))}
+                className="px-3 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-gray-400" />
+              <input type="text" placeholder="Location" value={manualJob.location}
+                onChange={e => setManualJob(prev => ({ ...prev, location: e.target.value }))}
+                className="px-3 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-gray-400" />
+              <input type="text" placeholder="Salary" value={manualJob.salary}
+                onChange={e => setManualJob(prev => ({ ...prev, salary: e.target.value }))}
+                className="px-3 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-gray-400" />
+              <input type="text" placeholder="Job URL" value={manualJob.job_link}
+                onChange={e => setManualJob(prev => ({ ...prev, job_link: e.target.value }))}
+                className="px-3 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-gray-400" />
+              <select value={manualJob.work_type}
+                onChange={e => setManualJob(prev => ({ ...prev, work_type: e.target.value }))}
+                className="px-3 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-gray-400 text-gray-500">
+                <option value="">Work Type</option>
+                <option value="Remote">Remote</option>
+                <option value="Hybrid">Hybrid</option>
+                <option value="On-site">On-site</option>
+              </select>
+              <textarea placeholder="Job Description *" value={manualJob.description}
+                onChange={e => setManualJob(prev => ({ ...prev, description: e.target.value }))}
+                className="col-span-2 px-3 py-1.5 border rounded text-sm h-24 resize-none focus:outline-none focus:ring-2 focus:ring-gray-400" />
+            </div>
+            <button
+              onClick={async () => {
+                if (!manualJob.company.trim() || !manualJob.title.trim() || !manualJob.description.trim()) {
+                  setManualAddStatus({ message: 'Error: Company, title, and description are required' });
+                  return;
+                }
+                setManualAddStatus({ loading: true, message: 'Adding job...' });
+                try {
+                  const res = await fetch('/api/add-job', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(manualJob),
+                  });
+                  const data = await res.json();
+                  if (data.ok) {
+                    setManualAddStatus({ loading: false, message: `Added: ${data.job.company} \u2014 ${data.job.title} (${data.job.tier}, Score: ${data.job.score})`, jobId: data.job.id });
+                    setManualJob({ company: '', title: '', description: '', job_link: '', apply_link: '', location: '', salary: '', work_type: '' });
+                    setTimeout(() => window.location.reload(), 5000);
+                  } else {
+                    setManualAddStatus({ loading: false, message: 'Error: ' + data.error });
+                  }
+                } catch (err) {
+                  setManualAddStatus({ loading: false, message: 'Error: ' + err.message });
+                }
+              }}
+              disabled={manualAddStatus?.loading}
+              className="px-4 py-1.5 bg-gray-800 text-white rounded text-sm font-medium hover:bg-gray-900 disabled:opacity-50 mt-1"
+            >
+              {manualAddStatus?.loading ? 'Adding...' : 'Add Job'}
+            </button>
+          </div>
+          {manualAddStatus?.message && (
+            <p className={"text-xs mt-1 " + (manualAddStatus.message.startsWith('Error') ? "text-red-500" : "text-green-600")}>
+              {manualAddStatus.message}
+              {manualAddStatus.jobId && (
+                <a href={'#/job-detail/' + manualAddStatus.jobId}
+                  className="ml-2 text-green-700 underline font-medium hover:text-green-900"
+                  onClick={e => { e.preventDefault(); window.location.hash = '#/job-detail/' + manualAddStatus.jobId; }}
+                >View Job &rarr;</a>
+              )}
+            </p>
+          )}
         </div>
       )}
       </>}
