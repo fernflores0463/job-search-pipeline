@@ -1926,6 +1926,28 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 }
                 _CANDIDATE_SKILLS = cfg["candidate"]["skills"]
 
+                # Reload process_new_postings module variables
+                # so pick_bullets/customize_skills use new config
+                import process_new_postings as pnp
+                pnp._config = cfg
+                pnp.BULLETS = {
+                    entry.get("display_name", key): entry["bullets"]
+                    for key, entry in cfg["experience"].items()
+                }
+                pnp.BULLET_LIMITS = {
+                    entry.get("display_name", key): entry[
+                        "bullet_limit"
+                    ]
+                    for key, entry in cfg["experience"].items()
+                }
+                pnp.SKILLS_DEFAULT = cfg.get(
+                    "skills_template", pnp.SKILLS_DEFAULT
+                )
+                pnp.BULLET_KEYWORD_PAIRS = [
+                    (p[0], p[1])
+                    for p in cfg.get("bullet_keyword_pairs", [])
+                ]
+
                 _json_response(self, {"ok": True})
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
