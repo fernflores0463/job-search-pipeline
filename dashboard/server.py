@@ -1186,7 +1186,7 @@ def format_job_description(raw):
 
     raw = raw.replace('\u2018', "'").replace('\u2019', "'")
     raw = raw.replace('\u201c', '"').replace('\u201d', '"')
-    chunks = re.split(r'  +', raw.strip())
+    chunks = re.split(r'(?:  +|\n\n+|\n)', raw.strip())
 
     header_re = re.compile(
         r"^(?:about (?:the |this )?(?:role|position|team|company|job|us|you)|"
@@ -1240,7 +1240,7 @@ def format_job_description(raw):
             if in_list:
                 parts.append('</ul>')
                 in_list = False
-            parts.append(f'<h4 style="font-weight:600;font-size:0.8rem;color:#374151;margin:0.75rem 0 0.25rem 0;">{escaped}</h4>')
+            parts.append(f'<h4 style="font-weight:600;font-size:0.85rem;color:#374151;margin:1rem 0 0.35rem 0;">{escaped}</h4>')
         elif kind == 'bullet':
             if not in_list:
                 parts.append('<ul style="margin:0.25rem 0;padding-left:1.25rem;list-style:disc;">')
@@ -1250,7 +1250,7 @@ def format_job_description(raw):
             if in_list:
                 parts.append('</ul>')
                 in_list = False
-            parts.append(f'<p style="font-size:0.75rem;color:#4b5563;margin:0.35rem 0;">{escaped}</p>')
+            parts.append(f'<p style="font-size:0.75rem;color:#4b5563;margin:0.5rem 0;">{escaped}</p>')
     if in_list:
         parts.append('</ul>')
     return '\n'.join(parts)
