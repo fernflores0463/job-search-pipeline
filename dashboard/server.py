@@ -809,15 +809,40 @@ def _load_anthropic_key():
 
 _ANTHROPIC_KEY = _load_anthropic_key()
 
+# Reuse a single client instance for connection pooling
+_anthropic_client = None
+
+
+def _get_anthropic_client():
+    global _anthropic_client
+    if _anthropic_client is None and _ANTHROPIC_KEY:
+        import anthropic
+        _anthropic_client = anthropic.Anthropic(api_key=_ANTHROPIC_KEY)
+    return _anthropic_client
+
 
 def _call_claude(system_prompt, messages, model="claude-sonnet-4-20250514"):
-    """Call the Anthropic Claude API."""
-    import anthropic
-    client = anthropic.Anthropic(api_key=_ANTHROPIC_KEY)
+    """Call the Anthropic Claude API with prompt caching.
+
+    The system prompt is marked with cache_control so Anthropic
+    caches it across calls. Subsequent requests within the 5-minute
+    TTL pay only 10% of the input token cost for the cached portion.
+    """
+    client = _get_anthropic_client()
+    if not client:
+        raise RuntimeError("Anthropic client not initialized")
+
+    # Structure system prompt as a cacheable content block
+    system_blocks = [{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
     response = client.messages.create(
         model=model,
         max_tokens=4096,
-        system=system_prompt,
+        system=system_blocks,
         messages=messages,
     )
     return response.content[0].text
