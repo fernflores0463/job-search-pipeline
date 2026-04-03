@@ -1286,7 +1286,12 @@ function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
       else if (j.tier === 'Match') byDate[d].match++;
       else byDate[d].weak++;
     });
-    return Object.values(byDate).sort((a, b) => b.date.localeCompare(a.date));
+    return Object.values(byDate).sort((a, b) => {
+      // "AI Import" always first
+      if (a.date === 'AI Import') return -1;
+      if (b.date === 'AI Import') return 1;
+      return b.date.localeCompare(a.date);
+    });
   }, [jobs]);
 
   const topCompanies = useMemo(() => {
@@ -1373,17 +1378,20 @@ function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
                   });
                   return Object.entries(pp).sort((a, b) => b[1] - a[1]).slice(0, 20);
                 })() : [];
+                const isAIBatch = b.date === 'AI Import';
                 const filteredJobs = isExpanded ? (batchTierFilter === 'all' ? [...batchJobs] :
-                  batchJobs.filter(j => j.tier === batchTierFilter)).sort((a, b) => b.score - a.score) : [];
+                  batchJobs.filter(j => j.tier === batchTierFilter)).sort((x, y) =>
+                    isAIBatch ? 0 : y.score - x.score
+                  ) : [];
                 const maxBatchCo = isExpanded && batchCompanies.length > 0 ? batchCompanies[0][1] : 1;
 
                 return (
                   <React.Fragment key={b.date}>
-                    <tr className={"border-b cursor-pointer transition-colors " + (isExpanded ? "bg-blue-50" : "hover:bg-gray-50")}
+                    <tr className={"border-b cursor-pointer transition-colors " + (b.date === 'AI Import' ? (isExpanded ? "bg-purple-100" : "bg-purple-50 hover:bg-purple-100") : (isExpanded ? "bg-blue-50" : "hover:bg-gray-50"))}
                         onClick={() => { setExpandedBatch(isExpanded ? null : b.date); setBatchTierFilter('all'); setSelectedBatchJobId(null); }}>
-                      <td className="py-2 pr-4 font-medium text-gray-700">
+                      <td className={"py-2 pr-4 font-medium " + (b.date === 'AI Import' ? "text-purple-700" : "text-gray-700")}>
                         <span className={"inline-block mr-2 text-xs transition-transform " + (isExpanded ? "transform rotate-90" : "")}>&#9654;</span>
-                        {b.date}
+                        {b.date === 'AI Import' ? '\u{1F916} AI Import' : b.date}
                       </td>
                       <td className="text-right px-3 text-green-700 font-medium">{b.strong}</td>
                       <td className="text-right px-3 text-blue-700 font-medium">{b.match}</td>

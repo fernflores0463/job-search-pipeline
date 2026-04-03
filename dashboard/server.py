@@ -1464,7 +1464,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                js.pdf_path
                         FROM jobs j
                         LEFT JOIN job_state js ON j.id = js.job_id
-                        ORDER BY j.import_date DESC, j.score DESC
+                        ORDER BY j.import_date DESC, j.created_at DESC, j.score DESC
                     """)
                     cols = [d[0] for d in cur.description]
                     rows = cur.fetchall()
@@ -1828,7 +1828,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     '  "work_type": "Remote, Hybrid, On-site, '
                     'or empty if unclear",\n'
                     '  "description": "The full job description '
-                    'text (responsibilities, qualifications, etc.)"\n'
+                    'text, cleaned up and formatted with clear '
+                    'section headers, bullet points for '
+                    'requirements/responsibilities, and '
+                    'readable paragraphs. Remove boilerplate '
+                    '(EEO statements, cookie notices, nav text). '
+                    'Use newlines for structure."\n'
                     '}\n\n'
                     "If a field cannot be determined, use an "
                     "empty string.\n"
@@ -1906,7 +1911,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 resume_text = generate_resume_txt(
                     job, bullets, langs, fw, misc
                 )
-                batch = _date.today().isoformat() + " \u2014 AI Import"
+                batch = "AI Import"
 
                 with Db() as conn:
                     cur = conn.cursor()
@@ -2016,10 +2021,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 resume_text = generate_resume_txt(
                     job, bullets, langs, fw, misc
                 )
-                batch = (
-                    _date.today().isoformat()
-                    + " \u2014 Manual Entry"
-                )
+                batch = "AI Import"
 
                 with Db() as conn:
                     cur = conn.cursor()
