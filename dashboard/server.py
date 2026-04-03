@@ -1837,6 +1837,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     '}\n\n'
                     "If a field cannot be determined, use an "
                     "empty string.\n"
+                    "IMPORTANT: Do not use markdown formatting "
+                    "(no **, no ##, no *) in any field values. "
+                    "Use plain text only.\n"
                     "Do not include any text outside the JSON "
                     "object.\n\n"
                     "PAGE TEXT:\n" + page_text
@@ -1865,6 +1868,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 )
                 title = extracted.get("title", "").strip()
                 desc = extracted.get("description", "").strip()
+                # Clean markdown formatting from Claude's output
+                desc = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', desc)
+                desc = re.sub(r'#{1,4}\s*', '', desc)
 
                 if not company or not title or not desc:
                     _json_response(self, {
