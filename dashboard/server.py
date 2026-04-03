@@ -1186,6 +1186,16 @@ def format_job_description(raw):
 
     raw = raw.replace('\u2018', "'").replace('\u2019', "'")
     raw = raw.replace('\u201c', '"').replace('\u201d', '"')
+    # Normalize markdown headers (## Header or **Header**) to plain
+    # text on their own line so the header_re can detect them
+    raw = re.sub(r'^#{1,4}\s+(.+)$', r'\1', raw, flags=re.MULTILINE)
+    raw = re.sub(
+        r'^\*{1,2}([^*\n]+)\*{1,2}\s*$', r'\1',
+        raw, flags=re.MULTILINE
+    )
+    # Convert inline bold/italic markdown to HTML
+    raw = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', raw)
+    raw = re.sub(r'\*([^*]+)\*', r'<i>\1</i>', raw)
     chunks = re.split(r'(?:  +|\n\n+|\n)', raw.strip())
 
     header_re = re.compile(
@@ -1236,6 +1246,17 @@ def format_job_description(raw):
     parts, in_list = [], False
     for kind, content in lines:
         escaped = html_mod.escape(content)
+        # Restore inline bold/italic tags that were converted
+        # from markdown before chunking
+        escaped = escaped.replace(
+            '&lt;b&gt;', '<b>'
+        ).replace(
+            '&lt;/b&gt;', '</b>'
+        ).replace(
+            '&lt;i&gt;', '<i>'
+        ).replace(
+            '&lt;/i&gt;', '</i>'
+        )
         if kind == 'header':
             if in_list:
                 parts.append('</ul>')
@@ -1837,9 +1858,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     '}\n\n'
                     "If a field cannot be determined, use an "
                     "empty string.\n"
-                    "IMPORTANT: Do not use markdown formatting "
-                    "(no **, no ##, no *) in any field values. "
-                    "Use plain text only.\n"
                     "Do not include any text outside the JSON "
                     "object.\n\n"
                     "PAGE TEXT:\n" + page_text
@@ -1868,9 +1886,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 )
                 title = extracted.get("title", "").strip()
                 desc = extracted.get("description", "").strip()
-                # Clean markdown formatting from Claude's output
-                desc = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', desc)
-                desc = re.sub(r'#{1,4}\s*', '', desc)
 
                 if not company or not title or not desc:
                     _json_response(self, {
