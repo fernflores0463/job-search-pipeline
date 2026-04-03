@@ -1760,6 +1760,309 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 _json_response(self, {"error": str(e)}, 500)
             return
 
+        # ── POST /api/import-url (AI extraction) ─────────
+        if self.path == "/api/import-url":
+            if not _ANTHROPIC_KEY:
+                _json_response(self, {
+                    "error": "Anthropic API key not configured."
+                }, 500)
+                return
+
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            url = (body.get("url") or "").strip()
+            company_override = (body.get("company_override") or "").strip()
+
+            if not url or not url.startswith(("http://", "https://")):
+                _json_response(
+                    self, {"error": "Invalid URL"}, 400
+                )
+                return
+
+            try:
+                import requests as req_lib
+                from bs4 import BeautifulSoup
+                from datetime import date as _date
+                sys.path.insert(0, PARENT_DIR)
+                from process_new_postings import (
+                    is_excluded_company,
+                    calc_tech_score, calc_level_bonus,
+                    calc_company_bonus, assign_tier,
+                    make_job_id, pick_bullets,
+                    customize_skills, generate_resume_txt,
+                )
+
+                # Fetch page
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Macintosh; "
+                    "Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                }
+                resp = req_lib.get(url, headers=headers, timeout=15)
+                resp.raise_for_status()
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for tag in soup(["script", "style", "nav", "footer"]):
+                    tag.decompose()
+                page_text = soup.get_text(separator="\n", strip=True)
+
+                if len(page_text) < 100:
+                    _json_response(self, {
+                        "error": "Page returned too little text. "
+                        "It may require JavaScript rendering."
+                    }, 400)
+                    return
+
+                # Truncate to avoid huge token costs
+                page_text = page_text[:15000]
+
+                # Ask Claude to extract fields
+                extraction_prompt = (
+                    "Extract the following fields from this job "
+                    "posting page text.\n"
+                    "Return ONLY a JSON object with these keys:\n\n"
+                    '{\n'
+                    '  "company": "Company name",\n'
+                    '  "title": "Job title",\n'
+                    '  "location": "Job location or Remote",\n'
+                    '  "salary": "Salary range if listed, '
+                    'otherwise N/A",\n'
+                    '  "work_type": "Remote, Hybrid, On-site, '
+                    'or empty if unclear",\n'
+                    '  "description": "The full job description '
+                    'text (responsibilities, qualifications, etc.)"\n'
+                    '}\n\n'
+                    "If a field cannot be determined, use an "
+                    "empty string.\n"
+                    "Do not include any text outside the JSON "
+                    "object.\n\n"
+                    "PAGE TEXT:\n" + page_text
+                )
+
+                ai_response = _call_claude(
+                    "You extract structured job posting data "
+                    "from web page text. Return only valid JSON.",
+                    [{"role": "user", "content": extraction_prompt}]
+                )
+
+                # Parse Claude's JSON response
+                json_match = re.search(
+                    r'\{[\s\S]*\}', ai_response
+                )
+                if not json_match:
+                    _json_response(self, {
+                        "error": "AI could not extract job data"
+                    }, 400)
+                    return
+
+                extracted = json.loads(json_match.group())
+                company = (
+                    company_override
+                    or extracted.get("company", "").strip()
+                )
+                title = extracted.get("title", "").strip()
+                desc = extracted.get("description", "").strip()
+
+                if not company or not title or not desc:
+                    _json_response(self, {
+                        "error": "Could not extract required "
+                        "fields (company, title, description)"
+                    }, 400)
+                    return
+
+                if is_excluded_company(company):
+                    _json_response(self, {
+                        "error": f"'{company}' matches a "
+                        "staffing firm exclusion pattern."
+                    }, 400)
+                    return
+
+                # Dedup
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT id FROM jobs "
+                        "WHERE job_link = %s", (url,)
+                    )
+                    if cur.fetchone():
+                        _json_response(self, {
+                            "error": "Job already exists"
+                        }, 409)
+                        return
+
+                # Score and insert
+                dl = desc.lower()
+                tl = title.lower()
+                score = (calc_tech_score(dl)
+                         + calc_level_bonus(tl)
+                         + calc_company_bonus(company))
+                tier = assign_tier(score)
+                job_id = make_job_id(company, title, url)
+                job = {
+                    "company": company,
+                    "title": title,
+                    "description": desc,
+                }
+                bullets = pick_bullets(desc, title)
+                langs, fw, misc = customize_skills(desc)
+                resume_text = generate_resume_txt(
+                    job, bullets, langs, fw, misc
+                )
+                batch = _date.today().isoformat() + " \u2014 AI Import"
+
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO jobs
+                            (id, company, title, location,
+                             work_type, salary, posted_date,
+                             import_date, description, score,
+                             tier, job_link, apply_link,
+                             resume_text)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,
+                                %s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (id) DO NOTHING
+                    """, (
+                        job_id, company, title,
+                        extracted.get("location", ""),
+                        extracted.get("work_type", ""),
+                        extracted.get("salary", "N/A"),
+                        "", batch, desc, score, tier,
+                        url, url, resume_text,
+                    ))
+                    cur.execute(
+                        "INSERT INTO job_state (job_id) "
+                        "VALUES (%s) ON CONFLICT DO NOTHING",
+                        (job_id,)
+                    )
+
+                _json_response(self, {
+                    "ok": True,
+                    "job": {
+                        "id": job_id,
+                        "company": company,
+                        "title": title,
+                        "score": score,
+                        "tier": tier,
+                    }
+                })
+            except json.JSONDecodeError:
+                _json_response(self, {
+                    "error": "AI returned invalid JSON"
+                }, 500)
+            except Exception as e:
+                _json_response(
+                    self, {"error": str(e)}, 500
+                )
+            return
+
+        # ── POST /api/add-job (manual entry) ──────────────
+        if self.path == "/api/add-job":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+
+            company = (body.get("company") or "").strip()
+            title = (body.get("title") or "").strip()
+            desc = (body.get("description") or "").strip()
+
+            if not company or not title or not desc:
+                _json_response(self, {
+                    "error": "Company, title, and description "
+                    "are required"
+                }, 400)
+                return
+
+            try:
+                from datetime import date as _date
+                sys.path.insert(0, PARENT_DIR)
+                from process_new_postings import (
+                    calc_tech_score, calc_level_bonus,
+                    calc_company_bonus, assign_tier,
+                    make_job_id, pick_bullets,
+                    customize_skills, generate_resume_txt,
+                )
+
+                job_link = (body.get("job_link") or "").strip()
+                apply_link = (
+                    body.get("apply_link") or job_link
+                ).strip()
+
+                # Dedup if URL provided
+                if job_link:
+                    with Db() as conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            "SELECT id FROM jobs "
+                            "WHERE job_link = %s", (job_link,)
+                        )
+                        if cur.fetchone():
+                            _json_response(self, {
+                                "error": "Job already exists"
+                            }, 409)
+                            return
+
+                dl = desc.lower()
+                tl = title.lower()
+                score = (calc_tech_score(dl)
+                         + calc_level_bonus(tl)
+                         + calc_company_bonus(company))
+                tier = assign_tier(score)
+                job_id = make_job_id(company, title, job_link)
+                job = {
+                    "company": company,
+                    "title": title,
+                    "description": desc,
+                }
+                bullets = pick_bullets(desc, title)
+                langs, fw, misc = customize_skills(desc)
+                resume_text = generate_resume_txt(
+                    job, bullets, langs, fw, misc
+                )
+                batch = (
+                    _date.today().isoformat()
+                    + " \u2014 Manual Entry"
+                )
+
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO jobs
+                            (id, company, title, location,
+                             work_type, salary, posted_date,
+                             import_date, description, score,
+                             tier, job_link, apply_link,
+                             resume_text)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,
+                                %s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (id) DO NOTHING
+                    """, (
+                        job_id, company, title,
+                        (body.get("location") or "").strip(),
+                        (body.get("work_type") or "").strip(),
+                        (body.get("salary") or "N/A").strip(),
+                        "", batch, desc, score, tier,
+                        job_link, apply_link, resume_text,
+                    ))
+                    cur.execute(
+                        "INSERT INTO job_state (job_id) "
+                        "VALUES (%s) ON CONFLICT DO NOTHING",
+                        (job_id,)
+                    )
+
+                _json_response(self, {
+                    "ok": True,
+                    "job": {
+                        "id": job_id,
+                        "company": company,
+                        "title": title,
+                        "score": score,
+                        "tier": tier,
+                    }
+                })
+            except Exception as e:
+                _json_response(
+                    self, {"error": str(e)}, 500
+                )
+            return
+
         # ── POST /api/scrape-careers ─────────────────────
         if self.path == "/api/scrape-careers":
             length = int(self.headers.get("Content-Length", 0))
