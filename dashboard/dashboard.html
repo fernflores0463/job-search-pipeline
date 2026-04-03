@@ -124,8 +124,9 @@ function useHashRoute() {
 }
 
 const STATUSES = [
-  "Not Applied", "Applied", "1st Interview", "2nd Interview",
-  "Final", "Rejected", "Auto-Reject", "Applied, Closed, No Update",
+  "Not Applied", "Applied", "Online Assessment", "Recruiter Screen",
+  "1st Interview", "2nd Interview", "Onsite", "Manager Screen",
+  "Rejected", "Auto-Reject", "Applied, Closed, No Update",
   "Position Closed, No Application Submitted", "Verbal Offer", "Offer", "Accepted"
 ];
 const BATCH_STATS = [];
@@ -133,9 +134,12 @@ const BATCH_STATS = [];
 const STATUS_COLORS = {
   "Not Applied": "bg-gray-100 text-gray-600",
   "Applied": "bg-blue-100 text-blue-700",
+  "Online Assessment": "bg-sky-100 text-sky-700",
+  "Recruiter Screen": "bg-teal-100 text-teal-700",
   "1st Interview": "bg-cyan-100 text-cyan-700",
   "2nd Interview": "bg-indigo-100 text-indigo-700",
-  "Final": "bg-purple-100 text-purple-700",
+  "Onsite": "bg-violet-100 text-violet-700",
+  "Manager Screen": "bg-purple-100 text-purple-700",
   "Rejected": "bg-red-100 text-red-700",
   "Auto-Reject": "bg-yellow-100 text-yellow-700",
   "Applied, Closed, No Update": "bg-orange-100 text-orange-700",
@@ -633,9 +637,12 @@ function PipelineView({ jobs, changeStatus }) {
   // Only show jobs that have been applied to (or further), plus Not Applied with favorites
   const PIPELINE_STAGES = [
     { id: "Applied", color: "#3b82f6", bg: "#eff6ff", border: "#bfdbfe" },
+    { id: "Online Assessment", color: "#0284c7", bg: "#f0f9ff", border: "#bae6fd" },
+    { id: "Recruiter Screen", color: "#0d9488", bg: "#f0fdfa", border: "#99f6e4" },
     { id: "1st Interview", color: "#0891b2", bg: "#ecfeff", border: "#a5f3fc" },
     { id: "2nd Interview", color: "#6366f1", bg: "#eef2ff", border: "#c7d2fe" },
-    { id: "Final", color: "#7c3aed", bg: "#f5f3ff", border: "#ddd6fe" },
+    { id: "Onsite", color: "#8b5cf6", bg: "#f5f3ff", border: "#ddd6fe" },
+    { id: "Manager Screen", color: "#7c3aed", bg: "#f5f3ff", border: "#ddd6fe" },
     { id: "Verbal Offer", color: "#059669", bg: "#ecfdf5", border: "#a7f3d0" },
     { id: "Offer", color: "#16a34a", bg: "#f0fdf4", border: "#bbf7d0" },
     { id: "Accepted", color: "#15803d", bg: "#f0fdf4", border: "#86efac" },
@@ -868,7 +875,8 @@ function BatchPdfDropZone({ job }) {
 
 // ── Sankey Diagram ──────────────────────────────────────────────────
 const SANKEY_STAGES = [
-  "Applied", "1st Interview", "2nd Interview", "Final",
+  "Applied", "Online Assessment", "Recruiter Screen",
+  "1st Interview", "2nd Interview", "Onsite", "Manager Screen",
   "Verbal Offer", "Offer", "Accepted"
 ];
 const SANKEY_STAGE_INDEX = {};
@@ -876,9 +884,12 @@ SANKEY_STAGES.forEach((s, i) => { SANKEY_STAGE_INDEX[s] = i; });
 
 const SANKEY_NODE_COLORS = {
   "Applied": "#3b82f6",
+  "Online Assessment": "#0284c7",
+  "Recruiter Screen": "#0d9488",
   "1st Interview": "#0891b2",
   "2nd Interview": "#6366f1",
-  "Final": "#7c3aed",
+  "Onsite": "#8b5cf6",
+  "Manager Screen": "#7c3aed",
   "Verbal Offer": "#059669",
   "Offer": "#16a34a",
   "Accepted": "#15803d",
