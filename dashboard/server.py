@@ -1456,7 +1456,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                j.posted_date, j.import_date, j.score, j.tier,
                                j.job_link, j.apply_link,
                                js.status, js.notes, js.applicants,
-                               js.live_status, js.live_status_checked, js.timestamps
+                               js.live_status, js.live_status_checked, js.timestamps,
+                               js.pdf_path
                         FROM jobs j
                         LEFT JOIN job_state js ON j.id = js.job_id
                         ORDER BY j.import_date DESC, j.score DESC

@@ -206,7 +206,7 @@ function initJobsFromApi(apiJobs) {
     timestamps: j.timestamps || {},
     favorited: false,
     applicants: j.applicants || "Unknown",
-    pdf_path: null,
+    pdf_path: j.pdf_path || null,
     live_status: j.live_status || null,
     live_status_checked: j.live_status_checked || null,
   }));
