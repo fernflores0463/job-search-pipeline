@@ -643,7 +643,11 @@ def _check_apply_link(apply_link):
         return "inconclusive"
 
 
-INTERVIEW_STAGES = {"1st Interview", "2nd Interview", "Final", "Verbal Offer", "Offer", "Accepted"}
+INTERVIEW_STAGES = {
+    "Online Assessment", "Recruiter Screen",
+    "1st Interview", "2nd Interview", "Onsite", "Manager Screen",
+    "Verbal Offer", "Offer", "Accepted",
+}
 
 
 def _run_live_check(batch_filter=None):
