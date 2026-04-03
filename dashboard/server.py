@@ -2222,14 +2222,25 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 "auto-generated for this specific job by selecting "
                 "and ordering bullets based on keyword matching",
                 "",
+                "CRITICAL CONSTRAINT — BULLET OWNERSHIP:",
+                "Each bullet belongs to a SPECIFIC company section "
+                "(Compass, Mastercard, JP Morgan, or Leidos). "
+                "Bullets CANNOT be moved between companies. A "
+                "JP Morgan bullet can ONLY replace another JP Morgan "
+                "bullet. A Compass bullet can ONLY replace another "
+                "Compass bullet. Never suggest swapping a bullet "
+                "from one company into a different company's section.",
+                "",
                 "YOUR ROLE:",
                 "- Compare the TAILORED RESUME against the JOB "
                 "POSTING and identify gaps, missing keywords, and "
                 "weak alignment",
                 "- Suggest SPECIFIC bullet replacements or rewordings "
-                "by pulling from the FULL BULLET POOL",
+                "by pulling from the FULL BULLET POOL, respecting "
+                "the company ownership constraint above",
                 "- When suggesting changes, QUOTE the current bullet "
-                "and show the improved version side by side",
+                "and show the improved version side by side, and "
+                "name which company section it belongs to",
                 "- Rate resume-to-job fit using concrete evidence "
                 "from both documents",
                 "- For interview prep, base questions on the specific "
