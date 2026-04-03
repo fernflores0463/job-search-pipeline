@@ -1752,6 +1752,83 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 _json_response(self, {"error": str(e)}, 500)
             return
 
+        # ── POST /api/delete-jobs — delete one or more jobs ─
+        if self.path == "/api/delete-jobs":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            job_ids = body.get("ids", [])
+            if not job_ids:
+                _json_response(
+                    self, {"error": "No job IDs provided"}, 400
+                )
+                return
+            try:
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "DELETE FROM application_plan_jobs "
+                        "WHERE job_id = ANY(%s)", (job_ids,)
+                    )
+                    cur.execute(
+                        "DELETE FROM job_state "
+                        "WHERE job_id = ANY(%s)", (job_ids,)
+                    )
+                    cur.execute(
+                        "DELETE FROM jobs WHERE id = ANY(%s)",
+                        (job_ids,)
+                    )
+                    deleted = cur.rowcount
+                _json_response(
+                    self, {"ok": True, "deleted": deleted}
+                )
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── POST /api/delete-batch — delete all jobs in a batch
+        if self.path == "/api/delete-batch":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            batch = body.get("batch", "")
+            if not batch:
+                _json_response(
+                    self, {"error": "No batch specified"}, 400
+                )
+                return
+            try:
+                with Db() as conn:
+                    cur = conn.cursor()
+                    # Get all job IDs in this batch
+                    cur.execute(
+                        "SELECT id FROM jobs "
+                        "WHERE import_date = %s", (batch,)
+                    )
+                    job_ids = [r[0] for r in cur.fetchall()]
+                    if not job_ids:
+                        _json_response(
+                            self, {"ok": True, "deleted": 0}
+                        )
+                        return
+                    cur.execute(
+                        "DELETE FROM application_plan_jobs "
+                        "WHERE job_id = ANY(%s)", (job_ids,)
+                    )
+                    cur.execute(
+                        "DELETE FROM job_state "
+                        "WHERE job_id = ANY(%s)", (job_ids,)
+                    )
+                    cur.execute(
+                        "DELETE FROM jobs WHERE id = ANY(%s)",
+                        (job_ids,)
+                    )
+                    deleted = cur.rowcount
+                _json_response(
+                    self, {"ok": True, "deleted": deleted}
+                )
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
         # ── POST /api/state — save single job state ──────
         if self.path == "/api/state":
             length = int(self.headers.get("Content-Length", 0))

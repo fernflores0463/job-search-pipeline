@@ -1410,6 +1410,11 @@ function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
                           className="px-2 py-1 bg-indigo-600 text-white rounded text-xs font-medium hover:bg-indigo-700 whitespace-nowrap">
                           Full View
                         </button>
+                        <button
+                          onClick={e => { e.stopPropagation(); if (confirm('Delete all ' + b.total + ' jobs in batch "' + b.date + '"?')) { fetch('/api/delete-batch', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({batch: b.date}) }).then(() => window.location.reload()); }}}
+                          className="ml-1 px-2 py-1 bg-red-100 text-red-600 rounded text-xs font-medium hover:bg-red-200 whitespace-nowrap">
+                          Delete Batch
+                        </button>
                       </td>
                     </tr>
                     {isExpanded && (
@@ -2113,6 +2118,11 @@ function JobDetailPage({ job, appPlans = [], saveAppPlans, changeStatus, onBack 
               })}
             </select>
           )}
+          <button
+            onClick={() => { if (confirm('Delete ' + job.company + ' \u2014 ' + job.title + '?')) { fetch('/api/delete-jobs', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ids: [job.id]}) }).then(() => { window.location.hash = '#/jobs'; window.location.reload(); }); }}}
+            className="px-4 py-2 bg-red-50 text-red-600 rounded text-sm font-medium hover:bg-red-100 border border-red-200">
+            Delete Job
+          </button>
         </div>
 
         {/* Two column layout */}
@@ -3557,6 +3567,11 @@ function App() {
                     </td>
                     <td className="px-3 py-2 text-gray-500 text-xs whitespace-nowrap">{j.applicants || "-"}</td>
                     <td className="px-3 py-2 text-gray-500 text-xs whitespace-nowrap">{j.posted_date || "-"}</td>
+                    <td className="px-1 py-2">
+                      <button
+                        onClick={e => { e.stopPropagation(); if (confirm('Delete ' + j.company + ' \u2014 ' + j.title + '?')) { fetch('/api/delete-jobs', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ids: [j.id]}) }).then(() => window.location.reload()); }}}
+                        className="text-gray-300 hover:text-red-500 text-xs px-1" title="Delete job">&#10005;</button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
