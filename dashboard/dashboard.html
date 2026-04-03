@@ -70,18 +70,22 @@ function renderMarkdown(text) {
 const VALID_ROUTES = ['jobs', 'stats', 'pipeline', 'sankey', 'plans'];
 function parseHash() {
   const raw = decodeURIComponent(window.location.hash.replace(/^#\/?/, ''));
+  const r = { view: 'jobs', batchDate: null, jobId: null, jobDetailId: null, planId: null };
   // Check for batch route: #/batch/<date>
   const batchMatch = raw.match(/^batch\/(.+)$/i);
-  if (batchMatch) return { view: 'stats', batchDate: batchMatch[1], jobId: null, jobDetailId: null };
+  if (batchMatch) return { ...r, view: 'stats', batchDate: batchMatch[1] };
   // Check for job-detail route: #/job-detail/<id>
   const detailMatch = raw.match(/^job-detail\/(.+)$/i);
-  if (detailMatch) return { view: 'jobs', batchDate: null, jobId: null, jobDetailId: detailMatch[1] };
+  if (detailMatch) return { ...r, jobDetailId: detailMatch[1] };
   // Check for job route: #/job/<id>
   const jobMatch = raw.match(/^job\/(.+)$/i);
-  if (jobMatch) return { view: 'jobs', batchDate: null, jobId: jobMatch[1], jobDetailId: null };
+  if (jobMatch) return { ...r, jobId: jobMatch[1] };
+  // Check for plan route: #/plan/<id>
+  const planMatch = raw.match(/^plan\/(.+)$/i);
+  if (planMatch) return { ...r, view: 'plans', planId: planMatch[1] };
   // Standard route
   const v = raw.toLowerCase();
-  return { view: VALID_ROUTES.includes(v) ? v : 'jobs', batchDate: null, jobId: null, jobDetailId: null };
+  return { ...r, view: VALID_ROUTES.includes(v) ? v : 'jobs' };
 }
 function useHashRoute() {
   const initial = parseHash();
@@ -89,6 +93,7 @@ function useHashRoute() {
   const [hashBatchDate, setHashBatchDate] = useState(initial.batchDate);
   const [hashJobId, setHashJobId] = useState(initial.jobId);
   const [hashJobDetailId, setHashJobDetailId] = useState(initial.jobDetailId);
+  const [hashPlanId, setHashPlanId] = useState(initial.planId);
   const suppressHash = useRef(false);
 
   useEffect(() => {
@@ -99,6 +104,7 @@ function useHashRoute() {
       setHashBatchDate(parsed.batchDate);
       setHashJobId(parsed.jobId);
       setHashJobDetailId(parsed.jobDetailId);
+      setHashPlanId(parsed.planId);
     };
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
@@ -109,11 +115,12 @@ function useHashRoute() {
     setHashBatchDate(null);
     setHashJobId(null);
     setHashJobDetailId(null);
+    setHashPlanId(null);
     suppressHash.current = true;
     window.location.hash = '#/' + v;
   }, []);
 
-  return [view, setView, hashBatchDate, setHashBatchDate, hashJobId, setHashJobId, hashJobDetailId, setHashJobDetailId];
+  return [view, setView, hashBatchDate, setHashBatchDate, hashJobId, setHashJobId, hashJobDetailId, setHashJobDetailId, hashPlanId, setHashPlanId];
 }
 
 const STATUSES = [
@@ -248,7 +255,7 @@ function calcMetrics(jobs) {
 
 
 
-function PlansView({ jobs }) {
+function PlansView({ jobs, planDetailId }) {
   const { useState, useEffect, useCallback, useMemo } = React;
   const [plans, setPlans] = useState([]);
   const [selectedPlan, setSelectedPlan] = useState(null);
@@ -261,9 +268,24 @@ function PlansView({ jobs }) {
   // Load plans from server
   useEffect(() => {
     fetch('/api/plans').then(r => r.json()).then(data => {
-      if (Array.isArray(data)) setPlans(data);
+      if (Array.isArray(data)) {
+        setPlans(data);
+        // Auto-select plan from URL route
+        if (planDetailId) {
+          const match = data.find(p => p.id === planDetailId);
+          if (match) setSelectedPlan(match);
+        }
+      }
     }).catch(() => {});
   }, []);
+
+  // React to planDetailId changes (e.g. browser back/forward)
+  useEffect(() => {
+    if (planDetailId && plans.length) {
+      const match = plans.find(p => p.id === planDetailId);
+      if (match) setSelectedPlan(match);
+    }
+  }, [planDetailId, plans]);
 
   const savePlans = useCallback((updated) => {
     setPlans(updated);
@@ -295,12 +317,13 @@ function PlansView({ jobs }) {
     setSelectedPlan(plan);
     setShowCreate(false);
     setNewTitle('');
+    window.location.hash = '#/plan/' + plan.id;
   }, [newDate, newTitle, plans, savePlans]);
 
   const deletePlan = useCallback((planId) => {
     const updated = plans.filter(p => p.id !== planId);
     savePlans(updated);
-    if (selectedPlan?.id === planId) setSelectedPlan(null);
+    if (selectedPlan?.id === planId) { setSelectedPlan(null); window.location.hash = '#/plans'; }
   }, [plans, selectedPlan, savePlans]);
 
   const addJobToPlan = useCallback((job) => {
@@ -396,7 +419,7 @@ function PlansView({ jobs }) {
           )}
           {plans.map(plan => (
             <div key={plan.id}
-              onClick={() => { setSelectedPlan(plan); setAddingJobs(false); setSearchTerm(''); }}
+              onClick={() => { setSelectedPlan(plan); setAddingJobs(false); setSearchTerm(''); window.location.hash = '#/plan/' + plan.id; }}
               className={"p-3 border-b cursor-pointer hover:bg-blue-50 transition-colors " +
                 (selectedPlan?.id === plan.id ? 'bg-blue-50 border-l-4 border-l-blue-500' : '')}>
               <div className="flex justify-between items-start">
@@ -2581,7 +2604,7 @@ function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans 
 function App() {
   const [jobs, setJobs] = useState([]);
   const [batchStats, setBatchStats] = useState([]);
-  const [view, setView, batchDetailDate, setHashBatchDate, selectedId, setHashJobId, jobDetailId, setJobDetailId] = useHashRoute();
+  const [view, setView, batchDetailDate, setHashBatchDate, selectedId, setHashJobId, jobDetailId, setJobDetailId, planDetailId, setPlanDetailId] = useHashRoute();
   const [loaded, setLoaded] = useState(!IS_SERVED);
   const [filters, setFilters] = useState({
     tiers: [], statuses: [], search: "", favoritesOnly: false
@@ -2874,7 +2897,8 @@ function App() {
     window._syncAppPlans = (updated) => setAppPlans(updated);
     window._openBatchDetail = (date) => setBatchDetailDate(date);
     window._openJobDetail = (id) => { window.location.hash = '#/job-detail/' + id; };
-    return () => { delete window._getPlans; delete window._addJobToPlan; delete window._syncAppPlans; delete window._openBatchDetail; delete window._openJobDetail; };
+    window._openPlanDetail = (id) => { window.location.hash = '#/plan/' + id; };
+    return () => { delete window._getPlans; delete window._addJobToPlan; delete window._syncAppPlans; delete window._openBatchDetail; delete window._openJobDetail; delete window._openPlanDetail; };
   }, [appPlans, saveAppPlans]);
 
   const favCount = useMemo(() => jobs.filter(j => j.favorited).length, [jobs]);
@@ -3219,7 +3243,7 @@ function App() {
       )}
       </>}
 
-      {jobDetailId ? <JobDetailPage job={jobs.find(j => j.id === jobDetailId)} appPlans={appPlans} saveAppPlans={saveAppPlans} changeStatus={changeStatus} onBack={() => { if (window.history.length > 1) window.history.back(); else window.location.hash = '#/jobs'; }} /> : batchDetailDate ? <BatchDetailView jobs={jobs} batchDate={batchDetailDate} onBack={() => setBatchDetailDate(null)} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "stats" ? <StatsPanel jobs={jobs} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "pipeline" ? <PipelineView jobs={jobs} changeStatus={changeStatus} /> : view === "sankey" ? <SankeyView jobs={jobs} /> : view === "plans" ? <PlansView jobs={jobs} /> : <>
+      {jobDetailId ? <JobDetailPage job={jobs.find(j => j.id === jobDetailId)} appPlans={appPlans} saveAppPlans={saveAppPlans} changeStatus={changeStatus} onBack={() => { if (window.history.length > 1) window.history.back(); else window.location.hash = '#/jobs'; }} /> : batchDetailDate ? <BatchDetailView jobs={jobs} batchDate={batchDetailDate} onBack={() => setBatchDetailDate(null)} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "stats" ? <StatsPanel jobs={jobs} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "pipeline" ? <PipelineView jobs={jobs} changeStatus={changeStatus} /> : view === "sankey" ? <SankeyView jobs={jobs} /> : view === "plans" ? <PlansView jobs={jobs} planDetailId={planDetailId} /> : <>
       {/* Metrics Bar */}
       <div className="bg-white border-b px-6 py-3 flex gap-3 flex-wrap">
         {STATUSES.filter(s => metrics.byStatus[s] > 0 || s === "Applied").map(s => (
