@@ -67,7 +67,7 @@ function renderMarkdown(text) {
 }
 
 // ── Hash-based routing ───────────────────────────────────────────────
-const VALID_ROUTES = ['jobs', 'stats', 'pipeline', 'sankey', 'plans'];
+const VALID_ROUTES = ['jobs', 'stats', 'pipeline', 'sankey', 'plans', 'profile'];
 function parseHash() {
   const raw = decodeURIComponent(window.location.hash.replace(/^#\/?/, ''));
   const r = { view: 'jobs', batchDate: null, jobId: null, jobDetailId: null, planId: null };
@@ -257,6 +257,221 @@ function calcMetrics(jobs) {
 }
 
 
+
+
+function ProfileView() {
+  const { useState, useEffect, useCallback } = React;
+  const [profile, setProfile] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState('');
+  const [newBullet, setNewBullet] = useState({});
+  const [editingBullet, setEditingBullet] = useState(null); // {compKey, index}
+
+  useEffect(() => {
+    fetch('/api/profile').then(r => r.json()).then(data => {
+      if (!data.error) setProfile(data);
+    }).catch(() => {});
+  }, []);
+
+  const saveProfile = useCallback(async (updated) => {
+    setSaving(true);
+    setSaveMsg('');
+    try {
+      const res = await fetch('/api/profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updated),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setSaveMsg('Saved');
+        setTimeout(() => setSaveMsg(''), 2000);
+      } else {
+        setSaveMsg('Error: ' + data.error);
+      }
+    } catch (err) {
+      setSaveMsg('Error: ' + err.message);
+    }
+    setSaving(false);
+  }, []);
+
+  const addBullet = useCallback((compKey) => {
+    const text = (newBullet[compKey] || '').trim();
+    if (!text || !profile) return;
+    const updated = { ...profile };
+    updated.experience[compKey].bullets = [...updated.experience[compKey].bullets, text];
+    setProfile(updated);
+    setNewBullet(prev => ({ ...prev, [compKey]: '' }));
+    saveProfile(updated);
+  }, [profile, newBullet, saveProfile]);
+
+  const removeBullet = useCallback((compKey, index) => {
+    if (!profile) return;
+    if (!confirm('Remove this bullet?')) return;
+    const updated = { ...profile };
+    updated.experience[compKey].bullets = updated.experience[compKey].bullets.filter((_, i) => i !== index);
+    setProfile(updated);
+    saveProfile(updated);
+  }, [profile, saveProfile]);
+
+  const updateBullet = useCallback((compKey, index, text) => {
+    if (!profile) return;
+    const updated = { ...profile };
+    updated.experience[compKey].bullets = updated.experience[compKey].bullets.map((b, i) => i === index ? text : b);
+    setProfile(updated);
+  }, [profile]);
+
+  const saveBulletEdit = useCallback((compKey, index) => {
+    setEditingBullet(null);
+    if (profile) saveProfile(profile);
+  }, [profile, saveProfile]);
+
+  const updateCandidate = useCallback((field, value) => {
+    if (!profile) return;
+    const updated = { ...profile, candidate: { ...profile.candidate, [field]: value } };
+    setProfile(updated);
+  }, [profile]);
+
+  const updateSkills = useCallback((field, value) => {
+    if (!profile) return;
+    const updated = { ...profile, skills_template: { ...profile.skills_template, [field]: value } };
+    setProfile(updated);
+  }, [profile]);
+
+  if (!profile) return (
+    <div className="flex items-center justify-center" style={{height: 'calc(100vh - 130px)'}}>
+      <p className="text-gray-400">Loading profile...</p>
+    </div>
+  );
+
+  const companies = Object.entries(profile.experience);
+
+  return (
+    <div className="p-6 overflow-auto" style={{height: 'calc(100vh - 130px)'}}>
+      <div className="max-w-5xl mx-auto">
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <h2 className="text-xl font-bold text-gray-800">Profile &amp; Bullet Pool</h2>
+            <p className="text-sm text-gray-500">{companies.reduce((sum, [, e]) => sum + e.bullets.length, 0)} bullets across {companies.length} companies</p>
+          </div>
+          <div className="flex items-center gap-3">
+            {saveMsg && <span className={"text-xs font-medium " + (saveMsg.startsWith('Error') ? "text-red-500" : "text-green-600")}>{saveMsg}</span>}
+            <button
+              onClick={() => saveProfile(profile)}
+              disabled={saving}
+              className="px-4 py-2 bg-blue-600 text-white rounded text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
+            >
+              {saving ? 'Saving...' : 'Save Changes'}
+            </button>
+          </div>
+        </div>
+
+        {/* Candidate Info */}
+        <div className="bg-white rounded-lg border p-4 mb-4">
+          <h3 className="text-sm font-semibold text-gray-700 mb-3">Candidate Info</h3>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-gray-400 block mb-1">Name</label>
+              <input type="text" value={profile.candidate.name || ''}
+                onChange={e => updateCandidate('name', e.target.value)}
+                onBlur={() => saveProfile(profile)}
+                className="w-full px-3 py-1.5 border rounded text-sm" />
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 block mb-1">LinkedIn URL</label>
+              <input type="text" value={profile.candidate.linkedin_url || ''}
+                onChange={e => updateCandidate('linkedin_url', e.target.value)}
+                onBlur={() => saveProfile(profile)}
+                className="w-full px-3 py-1.5 border rounded text-sm" />
+            </div>
+            <div className="col-span-2">
+              <label className="text-xs text-gray-400 block mb-1">Skills</label>
+              <input type="text" value={profile.candidate.skills || ''}
+                onChange={e => updateCandidate('skills', e.target.value)}
+                onBlur={() => saveProfile(profile)}
+                className="w-full px-3 py-1.5 border rounded text-sm" />
+            </div>
+          </div>
+        </div>
+
+        {/* Skills Template */}
+        <div className="bg-white rounded-lg border p-4 mb-4">
+          <h3 className="text-sm font-semibold text-gray-700 mb-3">Skills Template (for generated resumes)</h3>
+          <div className="grid grid-cols-1 gap-3">
+            {['languages', 'frameworks', 'misc'].map(field => (
+              <div key={field}>
+                <label className="text-xs text-gray-400 block mb-1 capitalize">{field}</label>
+                <input type="text" value={profile.skills_template[field] || ''}
+                  onChange={e => updateSkills(field, e.target.value)}
+                  onBlur={() => saveProfile(profile)}
+                  className="w-full px-3 py-1.5 border rounded text-sm" />
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Experience / Bullet Pool */}
+        {companies.map(([compKey, comp]) => (
+          <div key={compKey} className="bg-white rounded-lg border p-4 mb-4">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-700">{comp.display_name}</h3>
+                <p className="text-xs text-gray-400">{comp.context} &bull; Limit: {comp.bullet_limit} per resume &bull; {comp.bullets.length} bullets in pool</p>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              {comp.bullets.map((bullet, i) => (
+                <div key={i} className="flex items-start gap-2 group">
+                  <span className="text-xs text-gray-300 mt-1.5 w-5 flex-shrink-0 text-right">{i + 1}.</span>
+                  {editingBullet && editingBullet.compKey === compKey && editingBullet.index === i ? (
+                    <textarea
+                      value={bullet}
+                      onChange={e => updateBullet(compKey, i, e.target.value)}
+                      onBlur={() => saveBulletEdit(compKey, i)}
+                      onKeyDown={e => { if (e.key === 'Escape') setEditingBullet(null); }}
+                      className="flex-1 px-2 py-1 border border-blue-300 rounded text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-400"
+                      rows={3}
+                      autoFocus
+                    />
+                  ) : (
+                    <p className="flex-1 text-sm text-gray-700 leading-relaxed cursor-pointer hover:bg-gray-50 px-2 py-1 rounded"
+                      onClick={() => setEditingBullet({ compKey, index: i })}
+                      title="Click to edit">
+                      {bullet}
+                    </p>
+                  )}
+                  <button
+                    onClick={() => removeBullet(compKey, i)}
+                    className="text-gray-200 hover:text-red-500 text-xs px-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                    title="Remove bullet"
+                  >&#10005;</button>
+                </div>
+              ))}
+            </div>
+
+            {/* Add new bullet */}
+            <div className="mt-3 flex gap-2">
+              <input
+                type="text"
+                placeholder={"Add a new bullet for " + comp.display_name + "..."}
+                value={newBullet[compKey] || ''}
+                onChange={e => setNewBullet(prev => ({ ...prev, [compKey]: e.target.value }))}
+                onKeyDown={e => { if (e.key === 'Enter') addBullet(compKey); }}
+                className="flex-1 px-3 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+              />
+              <button
+                onClick={() => addBullet(compKey)}
+                disabled={!(newBullet[compKey] || '').trim()}
+                className="px-3 py-1.5 bg-blue-600 text-white rounded text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
+              >+ Add</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 
 function PlansView({ jobs, planDetailId }) {
@@ -3049,6 +3264,10 @@ function App() {
               onClick={() => setView("plans")}
               className={"px-3 py-1.5 border-l " + (view === "plans" ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50")}
             >&#128203; Plans</button>
+            <button
+              onClick={() => setView("profile")}
+              className={"px-3 py-1.5 border-l " + (view === "profile" ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50")}
+            >&#128100; Profile</button>
           </div>
         </div>
           <p className="text-sm text-gray-500">{metrics.total} positions | {metrics.applied} applied</p>
@@ -3432,7 +3651,7 @@ function App() {
       )}
       </>}
 
-      {jobDetailId ? <JobDetailPage job={jobs.find(j => j.id === jobDetailId)} appPlans={appPlans} saveAppPlans={saveAppPlans} changeStatus={changeStatus} onBack={() => { if (window.history.length > 1) window.history.back(); else window.location.hash = '#/jobs'; }} /> : batchDetailDate ? <BatchDetailView jobs={jobs} batchDate={batchDetailDate} onBack={() => setBatchDetailDate(null)} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "stats" ? <StatsPanel jobs={jobs} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "pipeline" ? <PipelineView jobs={jobs} changeStatus={changeStatus} /> : view === "sankey" ? <SankeyView jobs={jobs} /> : view === "plans" ? <PlansView jobs={jobs} planDetailId={planDetailId} /> : <>
+      {jobDetailId ? <JobDetailPage job={jobs.find(j => j.id === jobDetailId)} appPlans={appPlans} saveAppPlans={saveAppPlans} changeStatus={changeStatus} onBack={() => { if (window.history.length > 1) window.history.back(); else window.location.hash = '#/jobs'; }} /> : batchDetailDate ? <BatchDetailView jobs={jobs} batchDate={batchDetailDate} onBack={() => setBatchDetailDate(null)} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "stats" ? <StatsPanel jobs={jobs} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "pipeline" ? <PipelineView jobs={jobs} changeStatus={changeStatus} /> : view === "sankey" ? <SankeyView jobs={jobs} /> : view === "plans" ? <PlansView jobs={jobs} planDetailId={planDetailId} /> : view === "profile" ? <ProfileView /> : <>
       {/* Metrics Bar */}
       <div className="bg-white border-b px-6 py-3 flex gap-3 flex-wrap">
         {STATUSES.filter(s => metrics.byStatus[s] > 0 || s === "Applied").map(s => (
