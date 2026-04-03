@@ -87,6 +87,7 @@ jobs:
             -e DB_PASSWORD="$DB_PASS" \
             -e DASHBOARD_PASSWORD="" \
             -v /home/ec2-user/config.json:/app/config.json:ro \
+            -v /home/ec2-user/resumes:/app/resumes \
             "$IMAGE"
 
           echo "==> Scheduling auto-kill in 1 hour..."

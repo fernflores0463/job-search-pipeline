@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS job_state (
   live_status         VARCHAR(20),
   live_status_checked TIMESTAMP,
   timestamps          JSONB DEFAULT '{}',
+  pdf_path            TEXT,
   updated_at          TIMESTAMP DEFAULT NOW()
 );
 
