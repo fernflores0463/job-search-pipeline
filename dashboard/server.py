@@ -1491,6 +1491,24 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             })
             return
 
+        # ── /api/profile — candidate + experience config ──
+        if self.path == "/api/profile":
+            _json_response(self, {
+                "candidate": _config.get("candidate", {}),
+                "experience": {
+                    key: {
+                        "key": key,
+                        "display_name": entry.get("display_name", key),
+                        "context": entry.get("context", ""),
+                        "bullet_limit": entry.get("bullet_limit", 5),
+                        "bullets": entry.get("bullets", []),
+                    }
+                    for key, entry in _config.get("experience", {}).items()
+                },
+                "skills_template": _config.get("skills_template", {}),
+            })
+            return
+
         # ── /api/state — all job state ───────────────────
         if self.path == "/api/state":
             _json_response(self, load_state())
@@ -1867,6 +1885,48 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     _json_response(self, {"ok": True})
                 else:
                     _json_response(self, {"error": "missing id or state"}, 400)
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── POST /api/profile — update candidate + experience ─
+        if self.path == "/api/profile":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            try:
+                config_path = os.path.join(PARENT_DIR, "config.json")
+                with open(config_path) as f:
+                    cfg = json.load(f)
+
+                # Update candidate info if provided
+                if "candidate" in body:
+                    for k in ("name", "linkedin_url", "summary",
+                              "skills"):
+                        if k in body["candidate"]:
+                            cfg["candidate"][k] = body["candidate"][k]
+
+                # Update experience if provided
+                if "experience" in body:
+                    cfg["experience"] = body["experience"]
+
+                # Update skills_template if provided
+                if "skills_template" in body:
+                    cfg["skills_template"] = body["skills_template"]
+
+                with open(config_path, "w") as f:
+                    json.dump(cfg, f, indent=2)
+                    f.write("\n")
+
+                # Reload in-memory config
+                global _config, _BULLET_POOL, _CANDIDATE_SKILLS
+                _config = cfg
+                _BULLET_POOL = {
+                    entry.get("display_name", key): entry["bullets"]
+                    for key, entry in cfg["experience"].items()
+                }
+                _CANDIDATE_SKILLS = cfg["candidate"]["skills"]
+
+                _json_response(self, {"ok": True})
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
             return
