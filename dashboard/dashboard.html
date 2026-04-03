@@ -3312,10 +3312,10 @@ function App() {
                   });
                   const data = await res.json();
                   if (data.ok) {
-                    setAiImportStatus({ loading: false, message: `Added: ${data.job.company} \u2014 ${data.job.title} (${data.job.tier}, Score: ${data.job.score})` });
+                    setAiImportStatus({ loading: false, message: `Added: ${data.job.company} \u2014 ${data.job.title} (${data.job.tier}, Score: ${data.job.score})`, jobId: data.job.id });
                     setAiImportUrl('');
                     setAiImportCompany('');
-                    setTimeout(() => window.location.reload(), 1500);
+                    setTimeout(() => window.location.reload(), 5000);
                   } else {
                     setAiImportStatus({ loading: false, message: 'Error: ' + data.error });
                   }
@@ -3332,6 +3332,12 @@ function App() {
           {aiImportStatus?.message && (
             <p className={"text-xs mt-1 " + (aiImportStatus.message.startsWith('Error') ? "text-red-500" : "text-purple-600")}>
               {aiImportStatus.message}
+              {aiImportStatus.jobId && (
+                <a href={'#/job-detail/' + aiImportStatus.jobId}
+                  className="ml-2 text-purple-700 underline font-medium hover:text-purple-900"
+                  onClick={e => { e.preventDefault(); window.location.hash = '#/job-detail/' + aiImportStatus.jobId; }}
+                >View Job &rarr;</a>
+              )}
             </p>
           )}
           <p className="text-xs text-purple-400 mt-1">Paste any job posting URL. Claude will extract the company, title, description, and other fields automatically.</p>
@@ -3385,9 +3391,9 @@ function App() {
                   });
                   const data = await res.json();
                   if (data.ok) {
-                    setManualAddStatus({ loading: false, message: `Added: ${data.job.company} \u2014 ${data.job.title} (${data.job.tier}, Score: ${data.job.score})` });
+                    setManualAddStatus({ loading: false, message: `Added: ${data.job.company} \u2014 ${data.job.title} (${data.job.tier}, Score: ${data.job.score})`, jobId: data.job.id });
                     setManualJob({ company: '', title: '', description: '', job_link: '', apply_link: '', location: '', salary: '', work_type: '' });
-                    setTimeout(() => window.location.reload(), 1500);
+                    setTimeout(() => window.location.reload(), 5000);
                   } else {
                     setManualAddStatus({ loading: false, message: 'Error: ' + data.error });
                   }
@@ -3404,6 +3410,12 @@ function App() {
           {manualAddStatus?.message && (
             <p className={"text-xs mt-1 " + (manualAddStatus.message.startsWith('Error') ? "text-red-500" : "text-green-600")}>
               {manualAddStatus.message}
+              {manualAddStatus.jobId && (
+                <a href={'#/job-detail/' + manualAddStatus.jobId}
+                  className="ml-2 text-green-700 underline font-medium hover:text-green-900"
+                  onClick={e => { e.preventDefault(); window.location.hash = '#/job-detail/' + manualAddStatus.jobId; }}
+                >View Job &rarr;</a>
+              )}
             </p>
           )}
         </div>
