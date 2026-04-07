@@ -4,14 +4,21 @@ A personal job search automation system that processes LinkedIn CSV exports, sco
 
 ## Features
 
-- **Scoring & Filtering**: Automatically scores job postings based on tech keyword matches, seniority level, and company tier. Filters out staffing agencies, wrong seniority levels, and irrelevant specializations.
+- **Regex Scoring & Filtering**: Automatically scores job postings based on tech keyword matches, seniority level, and company tier. Filters out staffing agencies, wrong seniority levels, and irrelevant specializations.
+- **AI Scoring (Claude Haiku)**: Optional second import path that scores every job 1–10 using Claude Haiku against your candidate profile. Stores AI reasoning per job. Falls back to regex scoring per-job on API errors — imports never abort.
+- **AI vs Regex Comparison**: During AI imports, the regex score is also computed for free. Inline chips (`AI 18 ↑ Rx 12`) appear on every job's reasoning block, and a live agreement summary card shows how often the two systems agree.
 - **Resume Tailoring**: Selects and orders resume bullets based on keyword overlap with each job's description. Generates a tailored resume for every qualifying position.
 - **Interactive Dashboard**: Shows all jobs with status tracking, notes, batch history, a Sankey flow visualization, and an application pipeline board.
-- **CSV Upload**: Upload LinkedIn CSV exports directly through the dashboard — no local Python install needed. Jobs are scored and imported server-side.
-- **AI Assistant**: Chat with a local Ollama model about any job posting — fit analysis, resume suggestions, interview prep.
+- **CSV Upload (Regex)**: Upload LinkedIn CSV exports directly through the dashboard — no local Python install needed. Jobs are scored and imported server-side.
+- **CSV Upload (AI)**: Upload the same CSV through the "🤖 AI Import CSV" panel. Jobs are scored by Claude Haiku in parallel (2 workers) with automatic 429 retry and exponential backoff.
+- **Anthropic Batch API mode**: Opt-in checkbox on the AI import panel submits all jobs as a single Anthropic batch request (50% cost discount, async). Dashboard polls every 30s; inserts all jobs when the batch ends.
+- **Real-time Import Status (SSE)**: The AI import panel subscribes to `/api/ai-import-stream` (Server-Sent Events) instead of polling. Status updates are pushed in real time. On page refresh, the dashboard automatically reattaches the stream if an import is still running.
+- **AI Resume Assistant**: Chat with Claude directly on any job's detail page — fit analysis, bullet suggestions, interview prep. Uses prompt caching for cost efficiency.
+- **AI Job Import**: Paste a job URL and let Claude extract all structured fields automatically.
 - **Careers Scraper**: Scrape Greenhouse, Lever, and Ashby job boards directly into the pipeline.
+- **Live Status Checker**: Checks whether job postings are still open (not 404 or expired).
 - **Login Protection**: Single-password session auth with HTTP-only cookies. Password stored in AWS Parameter Store — changeable without a rebuild.
-- **Config-Driven**: All personal data (name, LinkedIn URL, resume bullets, scoring weights) lives in `config.json`. The code ships with no personal information.
+- **Config-Driven**: All personal data (name, LinkedIn URL, resume bullets, scoring weights, filter lists) lives in `config.json`. The code ships with no personal information.
 
 ---
 
@@ -49,10 +56,13 @@ cd job-search-pipeline
 cp config.example.json config.json
 # Edit config.json with your name, LinkedIn URL, bullets, and scoring weights
 
-# 2. Start Postgres + the server with hot reload
+# 2. Add your Anthropic API key (needed for AI import features)
+echo "ANTHROPIC_API_KEY=sk-ant-..." > .env   # gitignored
+
+# 3. Start Postgres + the server with hot reload
 docker compose -f docker-compose.dev.yml up
 
-# 3. Open http://localhost:8080
+# 4. Open http://localhost:8080
 # No password required locally.
 ```
 
@@ -173,12 +183,12 @@ Your work history, organized by company key. Each entry has a `display_name`, a 
 
 ### `scoring`
 Controls how jobs are scored and tiered:
-- `tech_keywords`: Map of regex patterns to point values.
-- `tier_thresholds`: `strong` (default: 13) and `match` (default: 7) thresholds.
-- `top_companies`: Company name substrings that get a +2 bonus.
+- `tech_keywords`: Map of regex patterns to point values (used by the regex baseline).
+- `tier_thresholds`: `strong` (default: 13) and `match` (default: 7) thresholds for the 0–24 legacy score range.
+- `top_companies`: Company name substrings that get a +2 bonus on the regex score.
 
 ### `filters`
-Controls which jobs are excluded:
+Controls which jobs are excluded before scoring:
 - `exclude_companies_containing`: Substrings — any company whose name contains one is filtered out (e.g., `"staffing"`, `"recruiting"`).
 - `exclude_title_keywords`: Job title keywords to reject (e.g., `"principal"`, `"intern"`).
 - `exclude_role_keywords`: Description keywords for wrong specializations (e.g., `"mobile"`, `"devops"`).
@@ -206,30 +216,95 @@ Default skills section for generated resumes:
 LinkedIn CSV export
        |
        v
-process_new_postings.py (local)      or      Dashboard CSV Upload (remote)
-  |-- Filter (company, title, role)            |-- Same filter/score logic
-  |-- Score (tech + level + company)           |-- Inserts directly to PostgreSQL
-  |-- Tier (Strong / Match / Weak)             '-- Resume text stored in DB
-  |-- Generate resumes/ per job
-  '-- Write metadata to JSON
+┌──────────────────────────────────┬────────────────────────────────────────┐
+│  Regex Import (free, instant)    │  AI Import (Claude Haiku, ~$0.001/job) │
+│  POST /api/import-csv            │  POST /api/import-csv-ai               │
+│                                  │    ?mode=live  (default)               │
+│  Filter → Regex Score → Insert   │    ?mode=batch (50% off, async)        │
+│                                  │                                        │
+│                                  │  Filter → AI Score + Regex Baseline    │
+│                                  │        → Compare → Insert              │
+└──────────────────────────────────┴────────────────────────────────────────┘
        |
        v
 dashboard/server.py (port 8080)
-  |-- GET  /               -> dashboard.html
-  |-- GET  /login          -> login page
-  |-- POST /api/login      -> set session cookie
-  |-- GET  /api/logout     -> clear session
-  |-- GET  /api/jobs-data  -> all jobs + state merged
-  |-- POST /api/import-csv -> upload LinkedIn CSV
-  |-- GET  /api/batch-stats
-  |-- POST /api/state      -> save job state
-  |-- GET  /api/plans      -> application plans
-  |-- POST /api/plans      -> save plans
-  |-- GET  /api/config     -> candidate name + LinkedIn URL
-  |-- POST /api/ai-chat    -> Ollama AI assistant
-  |-- POST /api/scrape-careers -> scrape a careers page
-  '-- POST /api/run-live-check -> check if postings are still open
+  |-- GET  /                      -> dashboard.html
+  |-- GET  /login                 -> login page
+  |-- POST /api/login             -> set session cookie
+  |-- GET  /api/logout            -> clear session
+  |-- GET  /api/jobs-data         -> all jobs + state merged
+  |-- GET  /api/batch-stats       -> import batch history
+  |-- POST /api/import-csv        -> regex CSV upload
+  |-- GET  /api/import-status     -> regex import progress
+  |-- POST /api/import-csv-ai     -> AI CSV upload (live or batch mode)
+  |-- GET  /api/ai-import-status  -> AI import progress (one-shot poll)
+  |-- GET  /api/ai-import-stream  -> AI import progress (SSE stream)
+  |-- POST /api/ai-import-stop    -> graceful stop (live mode only)
+  |-- POST /api/state             -> save job state
+  |-- GET  /api/plans             -> application plans
+  |-- POST /api/plans             -> save plans
+  |-- GET  /api/config            -> candidate name + LinkedIn URL
+  |-- POST /api/ai-chat           -> Ollama AI assistant
+  |-- POST /api/scrape-careers    -> scrape a careers page
+  |-- GET  /api/scrape-status     -> scrape progress
+  '-- POST /api/run-live-check    -> check if postings are still open
 ```
+
+---
+
+## AI Scoring
+
+### How it works
+
+The "🤖 AI Import CSV" panel accepts the same LinkedIn CSV as the regular import. Instead of the regex scorer, every qualifying job is sent to **Claude Haiku** with a system prompt containing your candidate profile and full bullet pool. Haiku returns:
+
+```json
+{ "fit_score": 8, "tier": "Strong Match", "reasoning": "Strong Go + gRPC + Kafka overlap..." }
+```
+
+The fit score (1–10) is mapped to the 0–24 legacy range so tiers are consistent with regex-scored batches. AI reasoning is stored in the `ai_reasoning` column and shown as a purple block on every job detail view.
+
+The regex score is also computed for every AI-imported job (free, local), enabling the inline comparison chip and the AI vs Regex agreement summary.
+
+### Scoring tiers
+
+| AI fit score | Legacy score | Tier |
+|---|---|---|
+| 8–10 | 18–24 | Strong Match |
+| 5–7 | 12–17 | Match |
+| 1–4 | 0–11 | Weak Match |
+
+Entry-level / new-grad roles are capped at **Match** (score 5) regardless of tech overlap — seniority mismatch is factored in by the AI prompt.
+
+### Rate limiting
+
+Anthropic Tier 1 allows 50,000 input tokens per minute. Each scoring call uses ~2,200 tokens (system prompt + job description). The server uses **2 parallel workers** with **exponential backoff** on 429 errors (5s → 10s → 20s, up to 3 retries). Jobs that still fail after retries fall back to regex scoring and are marked as fallback in the status panel.
+
+To score faster, upgrade your Anthropic account to Tier 2 (100K ITPM) and increase `max_workers` in `_run_import_csv_ai`.
+
+### Batch API mode
+
+Checking "Use Batch API (50% off, async)" submits all jobs as a single Anthropic Message Batch instead of parallel live calls. The server polls Anthropic every 30s and inserts all results when the batch ends. Key differences from live mode:
+
+| | Live mode | Batch mode |
+|---|---|---|
+| Cost | ~$0.00093/job | ~$0.00047/job |
+| Speed | 40–90s for ~150 jobs | Minutes to hours |
+| DB inserts | All at once after scoring | All at once after batch ends |
+| Rate limit risk | Low (2 workers + backoff) | None (Anthropic handles it) |
+| Stop button | Yes | No (batch runs at Anthropic) |
+
+### Cost estimates
+
+| Scenario | Cost |
+|---|---|
+| Per job (live) | ~$0.00093 |
+| Per job (batch) | ~$0.00047 |
+| 150-job CSV (live) | ~$0.14 |
+| 150-job CSV (batch) | ~$0.07 |
+| Full 925-job CSV (no dedup hits, live) | ~$0.86 |
+
+Prompt caching makes the first call in a batch more expensive; subsequent calls within a 5-minute window benefit from cached system prompt tokens (~90% discount on the cached portion).
 
 ---
 
@@ -239,13 +314,17 @@ PostgreSQL schema lives in `db/schema.sql`. Five tables:
 
 | Table | Contents |
 |---|---|
-| `jobs` | Job metadata — title, company, score, tier, links |
+| `jobs` | Job metadata — title, company, score, tier, links, `ai_reasoning`, `regex_score` |
 | `job_state` | Per-job status, notes, timestamps, live status |
 | `application_plans` | Named batches of jobs to apply to |
 | `application_plan_jobs` | Jobs within each plan |
 | `company_cache` | Company summaries and logo URLs |
 
 DB credentials are read from environment variables (`DB_HOST`, `DB_PASSWORD`, etc.) or pulled from AWS Parameter Store automatically in production.
+
+### Additive migrations
+
+New columns are added at the bottom of `db/schema.sql` as idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements. Safe to re-run on existing databases — all new columns are nullable.
 
 ### One-time migration from JSON files
 If you have existing data in the legacy JSON files:
@@ -318,6 +397,36 @@ Password resolution order at startup:
 
 The dev container sets `DASHBOARD_PASSWORD=""` explicitly so it never picks up the production password from Parameter Store.
 
+### Setting the Anthropic API key
+The key lives in AWS Parameter Store alongside the dashboard password:
+```bash
+aws ssm put-parameter \
+  --name "/job-search/anthropic-api-key" \
+  --value "sk-ant-..." \
+  --type SecureString \
+  --overwrite
+```
+The server loads it at startup from Parameter Store automatically (no restart needed if the container is already running — set it before the first deploy or restart the container after adding it). For local dev, put it in a gitignored `.env` file:
+```bash
+echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
+```
+`docker-compose.dev.yml` picks up `.env` automatically via `env_file`.
+
+### Manual deploy (without CI/CD)
+```bash
+# 1. Build and push to ECR
+aws ecr get-login-password --region us-west-2 | \
+  docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-west-2.amazonaws.com
+
+docker build --platform linux/amd64 \
+  -t <account-id>.dkr.ecr.us-west-2.amazonaws.com/job-search-pipeline:latest .
+docker push <account-id>.dkr.ecr.us-west-2.amazonaws.com/job-search-pipeline:latest
+
+# 2. Pull and restart on EC2
+ssh -i <key.pem> ec2-user@<EC2-IP> \
+  "docker compose pull server && docker compose up -d --force-recreate server"
+```
+
 ### Deploy nginx config changes
 After editing `infra/nginx.conf`, copy it to the server and reload:
 ```bash
@@ -347,6 +456,20 @@ Standalone script that fetches updated applicant counts without starting the das
 ```bash
 python3 update_applicants.py
 ```
+
+### Cowork AI Scorer (`job_search_2026/cowork-ai-scorer/`)
+A standalone CLI version of the AI scoring pipeline designed to run inside a Claude Cowork session or locally. No database, no web UI — CSV in, scored CSV out.
+
+```bash
+cd cowork-ai-scorer
+pip install -r requirements.txt
+export ANTHROPIC_API_KEY=sk-ant-...
+python3 score_csv.py ~/Downloads/linkedin_jobs.csv
+```
+
+Output CSV adds: `ai_fit_score`, `ai_legacy_score`, `ai_tier`, `ai_reasoning`, `regex_score`, `regex_tier`, `comparison` (agree / ai_promoted / ai_demoted / fallback), `ai_error`.
+
+See `cowork-ai-scorer/README.md` for full usage, options, and cost estimates.
 
 ---
 
