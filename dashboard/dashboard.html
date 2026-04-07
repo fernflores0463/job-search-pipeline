@@ -155,6 +155,29 @@ const TIER_COLORS = {
   "Weak Match": "tier-weak",
 };
 
+// Numeric rank used to compare AI vs Regex tiers in ScoreCompare.
+// Must match _TIER_RANK in dashboard/server.py.
+const TIER_RANK = { "Weak Match": 0, "Match": 1, "Strong Match": 2 };
+
+// Inline AI vs Regex score chip shown next to AI Reasoning blocks.
+// Renders nothing if regex_score is missing (legacy / regex-only jobs).
+function ScoreCompare({ aiScore, aiTier, regexScore, regexTier }) {
+  if (regexScore == null || regexTier == null) return null;
+  const aiRank = TIER_RANK[aiTier] ?? 1;
+  const rxRank = TIER_RANK[regexTier] ?? 1;
+  let arrow = "=", arrowColor = "text-gray-400", label = "agree";
+  if (aiRank > rxRank) { arrow = "\u2191"; arrowColor = "text-green-600"; label = "AI promoted"; }
+  else if (aiRank < rxRank) { arrow = "\u2193"; arrowColor = "text-orange-600"; label = "AI demoted"; }
+  return (
+    <span className="inline-flex items-center gap-1 text-[10px] font-mono bg-white border border-pink-200 rounded px-1.5 py-0.5"
+          title={`AI: ${aiScore} (${aiTier}) vs Regex: ${regexScore} (${regexTier}) — ${label}`}>
+      <span className="text-pink-600">AI {aiScore}</span>
+      <span className={arrowColor + " font-bold"}>{arrow}</span>
+      <span className="text-gray-500">Rx {regexScore}</span>
+    </span>
+  );
+}
+
 // Persistence: server API with localStorage fallback
 const IS_SERVED = window.location.protocol === "http:" || window.location.protocol === "https:";
 let _serverState = null;
@@ -2285,6 +2308,20 @@ function JobDetailPage({ job, appPlans = [], saveAppPlans, changeStatus, onBack 
           ))}
         </div>
 
+        {/* AI Reasoning */}
+        {job.ai_reasoning && (
+          <div className="bg-pink-50 rounded-lg border border-pink-200 p-3 mb-6">
+            <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+              <div className="text-xs font-semibold text-pink-700">&#129302; AI Scoring Reasoning</div>
+              {job.regex_score != null && (
+                <ScoreCompare aiScore={job.score} aiTier={job.tier}
+                              regexScore={job.regex_score} regexTier={job.regex_tier} />
+              )}
+            </div>
+            <p className="text-sm text-gray-700 leading-relaxed">{job.ai_reasoning}</p>
+          </div>
+        )}
+
         {/* Action buttons */}
         <div className="flex gap-2 flex-wrap mb-6">
           {job.apply_link && (
@@ -2717,6 +2754,19 @@ function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans 
                             <button onClick={(e) => { e.stopPropagation(); setExpandedJobId(null); }}
                               className="text-gray-400 hover:text-gray-600 text-lg">&times;</button>
                           </div>
+                          {/* AI Reasoning */}
+                          {j.ai_reasoning && (
+                            <div className="bg-pink-50 rounded border border-pink-200 p-2 mb-3">
+                              <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+                                <div className="text-xs font-semibold text-pink-700">&#129302; AI Reasoning</div>
+                                {j.regex_score != null && (
+                                  <ScoreCompare aiScore={j.score} aiTier={j.tier}
+                                                regexScore={j.regex_score} regexTier={j.regex_tier} />
+                                )}
+                              </div>
+                              <p className="text-xs text-gray-700 leading-relaxed">{j.ai_reasoning}</p>
+                            </div>
+                          )}
                           {/* Description + Company Info */}
                           <div className="flex gap-4 mb-3">
                             <div className="flex-1 min-w-0">
@@ -2851,7 +2901,7 @@ function App() {
   const [view, setView, batchDetailDate, setHashBatchDate, selectedId, setHashJobId, jobDetailId, setJobDetailId, planDetailId, setPlanDetailId] = useHashRoute();
   const [loaded, setLoaded] = useState(!IS_SERVED);
   const [filters, setFilters] = useState({
-    tiers: [], statuses: [], search: "", favoritesOnly: false
+    tiers: [], statuses: [], search: "", favoritesOnly: false, aiScoredOnly: false
   });
   const [sortBy, setSortBy] = useState("score");
   const [sortDir, setSortDir] = useState("desc");
@@ -2890,6 +2940,11 @@ function App() {
   const [importLocation, setImportLocation] = useState('');
   const [importStatus, setImportStatus]     = useState(null);
 
+  const [showAICsvImport, setShowAICsvImport]   = useState(false);
+  const [aiCsvFile, setAiCsvFile]               = useState(null);
+  const [aiCsvLocation, setAiCsvLocation]       = useState('');
+  const [aiCsvStatus, setAiCsvStatus]           = useState(null);
+
   const [showAIImport, setShowAIImport] = useState(false);
   const [aiImportUrl, setAiImportUrl] = useState('');
   const [aiImportCompany, setAiImportCompany] = useState('');
@@ -2925,6 +2980,27 @@ function App() {
         }), 1500);
     });
   }, [importFile, importLocation]);
+
+  const startAICsvImport = useCallback(() => {
+    if (!aiCsvFile) return;
+    const qs = aiCsvLocation.trim()
+      ? `?location=${encodeURIComponent(aiCsvLocation.trim())}` : '';
+    fetch(`/api/import-csv-ai${qs}`, {
+      method: 'POST', body: aiCsvFile,
+      headers: { 'Content-Type': 'text/csv' },
+    }).then(r => r.json()).then(data => {
+      if (data.error) {
+        setAiCsvStatus({ running: false, message: 'Error: ' + data.error });
+        return;
+      }
+      setAiCsvStatus({ running: true, message: 'Starting AI scoring...', progress: 0, total: 0, scored_ai: 0, scored_fallback: 0, estimated_cost: 0 });
+      const poll = setInterval(() =>
+        fetch('/api/ai-import-status').then(r => r.json()).then(s => {
+          setAiCsvStatus(s);
+          if (!s.running) clearInterval(poll);
+        }), 1500);
+    });
+  }, [aiCsvFile, aiCsvLocation]);
 
   const startScrape = useCallback(() => {
     if (!scrapeUrl.trim()) return;
@@ -3160,6 +3236,8 @@ function App() {
     let result = jobs;
     if (filters.favoritesOnly)
       result = result.filter(j => j.favorited);
+    if (filters.aiScoredOnly)
+      result = result.filter(j => j.ai_reasoning);
     if (filters.tiers.length > 0)
       result = result.filter(j => filters.tiers.includes(j.tier));
     if (filters.statuses.length > 0)
@@ -3304,10 +3382,17 @@ function App() {
                 &#128196; Import CSV
               </button>
               <button
+                onClick={() => setShowAICsvImport(!showAICsvImport)}
+                className={"ml-2 px-3 py-1.5 rounded text-xs font-semibold border-2 transition-colors " + (showAICsvImport ? "bg-pink-600 text-white border-pink-700 shadow-md" : "bg-pink-100 text-pink-800 border-pink-500 hover:bg-pink-200")}
+                title="Score a CSV with Claude AI instead of regex"
+              >
+                &#129302; AI Import CSV
+              </button>
+              <button
                 onClick={() => setShowAIImport(!showAIImport)}
                 className={"ml-2 px-3 py-1.5 rounded text-xs font-medium border " + (showAIImport ? "bg-purple-600 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}
               >
-                &#129302; AI Import
+                &#129302; AI Import URL
               </button>
               <button
                 onClick={() => setShowManualAdd(!showManualAdd)}
@@ -3511,6 +3596,143 @@ function App() {
         </div>
       )}
 
+      {showAICsvImport && (
+        <div className="bg-pink-50 border-b border-pink-200 px-6 py-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className="text-sm font-medium text-pink-700">&#129302; AI Import LinkedIn CSV:</span>
+            <input
+              type="file" accept=".csv"
+              onChange={e => {
+                const file = e.target.files[0] || null;
+                setAiCsvFile(file);
+                if (file) {
+                  const inferred = inferLocationFromFilename(file.name);
+                  if (inferred) setAiCsvLocation(inferred);
+                }
+              }}
+              className="text-sm text-gray-700"
+            />
+            <input
+              type="text" placeholder="Location (e.g. Seattle)"
+              value={aiCsvLocation}
+              onChange={e => setAiCsvLocation(e.target.value)}
+              className="w-48 px-3 py-1.5 border border-pink-300 rounded text-sm focus:outline-none"
+            />
+            <button
+              onClick={startAICsvImport}
+              disabled={!aiCsvFile || aiCsvStatus?.running}
+              className={"px-6 py-2 rounded text-base font-bold border-2 shadow-md transition-all " + (
+                !aiCsvFile || aiCsvStatus?.running
+                  ? "bg-pink-200 text-pink-700 border-pink-400 cursor-not-allowed"
+                  : "bg-pink-600 text-white border-pink-700 hover:bg-pink-700 hover:shadow-lg ring-2 ring-pink-300"
+              )}
+            >
+              {aiCsvStatus?.running ? '\u23F3 Scoring with AI...' : '\u25B6 Score with AI'}
+            </button>
+            {aiCsvStatus?.running && (
+              <button
+                onClick={() => {
+                  fetch('/api/ai-import-stop', { method: 'POST' });
+                }}
+                className="px-4 py-1.5 bg-red-600 text-white rounded text-sm font-medium hover:bg-red-700"
+                title="Stop AI scoring and finish remaining jobs with regex fallback"
+              >
+                &#9209; Stop &amp; Finish
+              </button>
+            )}
+          </div>
+          {aiCsvStatus && (
+            <div className="mt-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                {aiCsvStatus.running && <div className="w-3 h-3 border-2 border-pink-600 border-t-transparent rounded-full animate-spin" />}
+                <span className={"text-xs " + (aiCsvStatus.message?.startsWith("Error") ? "text-red-600" : "text-pink-700")}>
+                  {aiCsvStatus.message}
+                </span>
+                {aiCsvStatus.running && aiCsvStatus.total > 0 && (
+                  <>
+                    <span className="text-xs text-gray-500">({aiCsvStatus.progress}/{aiCsvStatus.total})</span>
+                    {aiCsvStatus.scored_fallback > 0 && (
+                      <span className="text-xs text-orange-600">{aiCsvStatus.scored_fallback} fell back to regex</span>
+                    )}
+                    <span className="text-xs text-gray-600">est. cost: ${(aiCsvStatus.estimated_cost || 0).toFixed(3)}</span>
+                  </>
+                )}
+              </div>
+              {/* AI vs Regex Agreement Card — live during run, persists after */}
+              {aiCsvStatus.scored_ai > 0 && (() => {
+                const total = aiCsvStatus.scored_ai;
+                const agree = aiCsvStatus.regex_agree || 0;
+                const promoted = aiCsvStatus.ai_promoted || 0;
+                const demoted = aiCsvStatus.ai_demoted || 0;
+                const pct = (n) => total > 0 ? Math.round((n / total) * 100) : 0;
+                return (
+                  <div className="mt-2 bg-white border border-pink-200 rounded p-2">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <span className="text-xs font-semibold text-pink-700">&#129302; AI vs Regex Agreement</span>
+                      <span className="text-[10px] text-gray-400">{total} jobs scored by AI</span>
+                    </div>
+                    {/* Stacked bar */}
+                    <div className="flex h-2 rounded overflow-hidden bg-gray-100 mb-1.5">
+                      <div className="bg-gray-400" style={{width: pct(agree) + "%"}} title={`Agree: ${agree}`} />
+                      <div className="bg-green-500" style={{width: pct(promoted) + "%"}} title={`AI promoted: ${promoted}`} />
+                      <div className="bg-orange-500" style={{width: pct(demoted) + "%"}} title={`AI demoted: ${demoted}`} />
+                    </div>
+                    <div className="grid grid-cols-3 gap-1 text-[10px]">
+                      <div className="flex items-center gap-1">
+                        <span className="w-2 h-2 rounded-sm bg-gray-400" />
+                        <span className="text-gray-600">Agree</span>
+                        <span className="font-mono text-gray-900">{agree} ({pct(agree)}%)</span>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <span className="w-2 h-2 rounded-sm bg-green-500" />
+                        <span className="text-gray-600">AI &#8593;</span>
+                        <span className="font-mono text-gray-900">{promoted} ({pct(promoted)}%)</span>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <span className="w-2 h-2 rounded-sm bg-orange-500" />
+                        <span className="text-gray-600">AI &#8595;</span>
+                        <span className="font-mono text-gray-900">{demoted} ({pct(demoted)}%)</span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+              {!aiCsvStatus.running && aiCsvStatus.jobs_found?.length > 0 && (
+                <div className="mt-2 max-h-40 overflow-y-auto">
+                  <table className="text-xs w-full">
+                    <thead><tr className="text-gray-500 border-b">
+                      <th className="text-left py-1 pr-2">Title</th>
+                      <th className="text-left py-1 px-2">Tier</th>
+                      <th className="text-right py-1 px-2">Score (1-10)</th>
+                      <th className="text-left py-1 pl-2">Location</th>
+                    </tr></thead>
+                    <tbody>
+                      {aiCsvStatus.jobs_found.map((j, i) => (
+                        <tr key={i} className="border-b border-gray-100">
+                          <td className="py-1 pr-2 text-gray-700">{j.title}</td>
+                          <td className="py-1 px-2">
+                            <span className={"px-1.5 py-0.5 rounded text-xs font-medium " + TIER_COLORS[j.tier]}>{j.tier}</span>
+                          </td>
+                          <td className="py-1 px-2 text-right text-gray-600">{j.score}</td>
+                          <td className="py-1 pl-2 text-gray-500">{j.location}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {!aiCsvStatus.running && aiCsvStatus.added > 0 && (
+                <button onClick={() => window.location.reload()}
+                  className="mt-2 px-3 py-1 bg-pink-600 text-white rounded text-xs font-medium hover:bg-pink-700">
+                  Reload Dashboard
+                </button>
+              )}
+            </div>
+          )}
+          <p className="text-xs text-pink-500 mt-1">Each job is scored 1-10 by Claude Haiku 4.5 with reasoning. Approx cost: $0.0017 per job (~$1.60 for a 925-job CSV). Description boilerplate is stripped to reduce token usage. Jobs that fail AI scoring fall back to regex automatically.</p>
+        </div>
+      )}
+
       {showAIImport && (
         <div className="bg-purple-50 border-b border-purple-200 px-6 py-3">
           <div className="flex items-center gap-3 flex-wrap">
@@ -3690,6 +3912,19 @@ function App() {
               <span className="font-medium">Shortlist Only</span>
               {favCount > 0 && <span className="text-xs text-gray-400">({favCount})</span>}
             </label>
+            <label className="flex items-center gap-2 text-sm cursor-pointer mt-1">
+              <input
+                type="checkbox"
+                checked={filters.aiScoredOnly}
+                onChange={() => setFilters(prev => ({...prev, aiScoredOnly: !prev.aiScoredOnly}))}
+              />
+              <span className="text-pink-500">&#129302;</span>
+              <span className="font-medium">AI Scored Only</span>
+              {(() => {
+                const aiCount = jobs.filter(j => j.ai_reasoning).length;
+                return aiCount > 0 ? <span className="text-xs text-gray-400">({aiCount})</span> : null;
+              })()}
+            </label>
           </div>
 
           <div className="mb-4">
@@ -3721,7 +3956,7 @@ function App() {
           </div>
 
           <button
-            onClick={() => setFilters({tiers: [], statuses: [], search: "", favoritesOnly: false})}
+            onClick={() => setFilters({tiers: [], statuses: [], search: "", favoritesOnly: false, aiScoredOnly: false})}
             className="text-xs text-blue-600 hover:underline"
           >Clear All Filters</button>
         </div>
@@ -3774,7 +4009,14 @@ function App() {
                         {j.tier === "Strong Match" ? "Strong" : j.tier === "Weak Match" ? "Weak" : "Match"}
                       </span>
                     </td>
-                    <td className="px-3 py-2 text-gray-600">{j.score}</td>
+                    <td className="px-3 py-2 text-gray-600">
+                      <span className="inline-flex items-center gap-1">
+                        {j.score}
+                        {j.ai_reasoning && (
+                          <span className="text-pink-500 text-xs" title="Scored by AI">&#129302;</span>
+                        )}
+                      </span>
+                    </td>
                     <td className="px-3 py-2 text-gray-600 whitespace-nowrap">{j.salary !== "N/A" ? j.salary : "-"}</td>
                     <td className="px-3 py-2">
                       <span className={"px-2 py-0.5 rounded text-xs font-medium " + (STATUS_COLORS[j.status] || "")}>
@@ -3898,6 +4140,20 @@ function App() {
                       );
                     })}
                   </div>
+                </div>
+              )}
+
+              {/* AI Reasoning */}
+              {selectedJob.ai_reasoning && (
+                <div className="bg-pink-50 rounded border border-pink-200 p-2">
+                  <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+                    <div className="text-xs font-semibold text-pink-700">&#129302; AI Reasoning</div>
+                    {selectedJob.regex_score != null && (
+                      <ScoreCompare aiScore={selectedJob.score} aiTier={selectedJob.tier}
+                                    regexScore={selectedJob.regex_score} regexTier={selectedJob.regex_tier} />
+                    )}
+                  </div>
+                  <p className="text-xs text-gray-700 leading-relaxed">{selectedJob.ai_reasoning}</p>
                 </div>
               )}
 
@@ -4127,6 +4383,20 @@ function JobDetailModal() {
               <p className="font-medium text-gray-400">{job.id.slice(0, 12)}</p>
             </div>
           </div>
+
+          {/* AI Reasoning */}
+          {job.ai_reasoning && (
+            <div className="bg-pink-50 rounded border border-pink-200 p-2">
+              <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+                <div className="text-xs font-semibold text-pink-700">&#129302; AI Reasoning</div>
+                {job.regex_score != null && (
+                  <ScoreCompare aiScore={job.score} aiTier={job.tier}
+                                regexScore={job.regex_score} regexTier={job.regex_tier} />
+                )}
+              </div>
+              <p className="text-xs text-gray-700 leading-relaxed">{job.ai_reasoning}</p>
+            </div>
+          )}
 
           {/* Status */}
           <div>
