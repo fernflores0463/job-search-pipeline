@@ -161,7 +161,9 @@ _ai_import_status = {
     "running": False, "progress": 0, "total": 0, "added": 0,
     "scored_ai": 0, "scored_fallback": 0,
     "estimated_cost": 0.0, "message": "", "jobs_found": [],
+    "stopped": False,
 }
+_ai_import_stop_event = threading.Event()
 
 _live_check_lock = threading.Lock()
 _live_check_status = {"running": False, "progress": 0, "total": 0, "closed": 0, "live": 0, "inconclusive": 0, "auto_updated": 0, "message": ""}
@@ -1284,11 +1286,14 @@ def _run_import_csv_ai(csv_bytes, location):
             customize_skills, generate_resume_txt,
         )
 
+        # Reset stop event at the start of each run
+        _ai_import_stop_event.clear()
+
         with _ai_import_lock:
             _ai_import_status.update({
                 "running": True, "progress": 0, "total": 0,
                 "added": 0, "scored_ai": 0, "scored_fallback": 0,
-                "estimated_cost": 0.0,
+                "estimated_cost": 0.0, "stopped": False,
                 "message": "Parsing CSV\u2026", "jobs_found": [],
             })
 
@@ -1381,8 +1386,30 @@ def _run_import_csv_ai(csv_bytes, location):
         # Build system prompt once — reused across all calls, cached
         system_prompt = _build_scoring_system_prompt()
 
+        # Helper: regex-fallback scoring shared by stop and error paths
+        def _regex_fallback(job):
+            dl = job["description"].lower()
+            tl = job["title"].lower()
+            regex_score = (
+                calc_tech_score(dl)
+                + calc_level_bonus(tl)
+                + calc_company_bonus(job["company"])
+            )
+            job["score"] = regex_score
+            job["tier"] = assign_tier(regex_score)
+            job["ai_reasoning"] = None
+
         # Score in parallel (5 workers — conservative for rate limits)
         def score_one(job):
+            # If stop was requested, skip the API call entirely and
+            # use regex fallback for fast finish
+            if _ai_import_stop_event.is_set():
+                _regex_fallback(job)
+                with _ai_import_lock:
+                    _ai_import_status["scored_fallback"] += 1
+                    _ai_import_status["progress"] += 1
+                return job
+
             result = _score_job_with_haiku(job, system_prompt)
             if result.get("used_ai"):
                 job["score"] = result["fit_score"]
@@ -1394,17 +1421,7 @@ def _run_import_csv_ai(csv_bytes, location):
                         AI_SCORING_COST_PER_JOB
                     )
             else:
-                # Fall back to regex
-                dl = job["description"].lower()
-                tl = job["title"].lower()
-                regex_score = (
-                    calc_tech_score(dl)
-                    + calc_level_bonus(tl)
-                    + calc_company_bonus(job["company"])
-                )
-                job["score"] = regex_score
-                job["tier"] = assign_tier(regex_score)
-                job["ai_reasoning"] = None
+                _regex_fallback(job)
                 with _ai_import_lock:
                     _ai_import_status["scored_fallback"] += 1
             with _ai_import_lock:
@@ -1462,12 +1479,15 @@ def _run_import_csv_ai(csv_bytes, location):
         summary = ", ".join(
             f"{t}: {len(v)}" for t, v in sorted(tiers.items())
         )
+        was_stopped = _ai_import_stop_event.is_set()
         with _ai_import_lock:
             _ai_import_status.update({
                 "running": False,
                 "added": len(scored_jobs),
+                "stopped": was_stopped,
                 "message": (
-                    f"Done! {len(scored_jobs)} scored "
+                    ("Stopped early. " if was_stopped else "Done! ")
+                    + f"{len(scored_jobs)} inserted "
                     f"({_ai_import_status['scored_ai']} AI, "
                     f"{_ai_import_status['scored_fallback']} fallback), "
                     f"cost ~${_ai_import_status['estimated_cost']:.3f}. "
@@ -2630,6 +2650,22 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     _json_response(self, {"ok": True, "message": "Started"})
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── POST /api/ai-import-stop — graceful stop ─────
+        if self.path == "/api/ai-import-stop":
+            if not _ai_import_status.get("running"):
+                _json_response(self, {
+                    "ok": True, "message": "Not running"
+                })
+                return
+            _ai_import_stop_event.set()
+            with _ai_import_lock:
+                _ai_import_status["message"] = (
+                    "Stop requested \u2014 finishing remaining "
+                    "jobs with regex fallback..."
+                )
+            _json_response(self, {"ok": True})
             return
 
         # ── POST /api/import-csv-ai — AI scoring CSV import ─

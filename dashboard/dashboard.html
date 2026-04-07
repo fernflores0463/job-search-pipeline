@@ -3588,6 +3588,17 @@ function App() {
             >
               {aiCsvStatus?.running ? 'Scoring with AI...' : 'Import with AI'}
             </button>
+            {aiCsvStatus?.running && (
+              <button
+                onClick={() => {
+                  fetch('/api/ai-import-stop', { method: 'POST' });
+                }}
+                className="px-4 py-1.5 bg-red-600 text-white rounded text-sm font-medium hover:bg-red-700"
+                title="Stop AI scoring and finish remaining jobs with regex fallback"
+              >
+                &#9209; Stop &amp; Finish
+              </button>
+            )}
           </div>
           {aiCsvStatus && (
             <div className="mt-2">
