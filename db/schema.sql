@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   resume_text   TEXT,
   resume_s3_key TEXT,
   ai_reasoning  TEXT,
+  regex_score   INTEGER,
   created_at    TIMESTAMP DEFAULT NOW()
 );
 
@@ -62,3 +63,15 @@ CREATE INDEX IF NOT EXISTS idx_jobs_import_date ON jobs(import_date);
 CREATE INDEX IF NOT EXISTS idx_jobs_tier ON jobs(tier);
 CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs(score DESC);
 CREATE INDEX IF NOT EXISTS idx_job_state_status ON job_state(status);
+
+-- ─────────────────────────────────────────────────────────
+-- Idempotent migrations for additive columns
+-- ─────────────────────────────────────────────────────────
+-- CREATE TABLE IF NOT EXISTS above is a no-op when the table already
+-- exists, so columns added after the original schema must also be
+-- declared as ALTER TABLE ... ADD COLUMN IF NOT EXISTS for existing
+-- databases to pick them up on redeploy. All statements below are
+-- additive, nullable, and safe to re-run.
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ai_reasoning TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS regex_score  INTEGER;

@@ -162,6 +162,11 @@ _ai_import_status = {
     "scored_ai": 0, "scored_fallback": 0,
     "estimated_cost": 0.0, "message": "", "jobs_found": [],
     "stopped": False,
+    # AI-vs-regex comparison counters (only counted on AI-scored jobs):
+    #   regex_agree    = AI tier matches regex tier
+    #   ai_promoted    = AI tier > regex tier (AI is more bullish)
+    #   ai_demoted     = AI tier < regex tier (AI is less bullish)
+    "regex_agree": 0, "ai_promoted": 0, "ai_demoted": 0,
 }
 _ai_import_stop_event = threading.Event()
 
@@ -913,7 +918,8 @@ def _build_scoring_system_prompt():
     name = _config["candidate"].get("name", "the candidate")
     return "\n".join([
         f"You are a job-fit scoring assistant evaluating how well {name} "
-        "(a software engineer) matches each job posting.",
+        "(a senior software engineer with 10+ years of professional "
+        "experience) matches each job posting.",
         "",
         f"CANDIDATE SKILLS: {_CANDIDATE_SKILLS}",
         "",
@@ -922,12 +928,18 @@ def _build_scoring_system_prompt():
         "",
         "SCORING CRITERIA (1-10 integer scale):",
         "  9-10: Near-perfect stack overlap + relevant domain experience",
-        "  7-8:  Strong overlap, minor gaps that can be addressed",
+        "        AND seniority level matches (Senior, Staff, Principal,",
+        "        Lead, or unleveled IC roles at 5+ YoE)",
+        "  7-8:  Strong overlap, minor gaps, seniority is appropriate",
         "  5-6:  Partial overlap, would need to learn some technologies",
         "  3-4:  Weak overlap, but transferable skills exist",
         "  1-2:  Wrong domain or requires expertise candidate lacks",
         "",
         "NEGATIVE SIGNALS (reduce score):",
+        "  - Entry-level, new-grad, intern, SE I, SE II, Junior, or",
+        "    Associate roles \u2014 candidate is overqualified and likely",
+        "    would not be seriously considered. Cap these at score 5",
+        "    (still surfaced as Match for manual review, never Strong).",
         "  - Requires security clearance candidate doesn't have",
         "  - Requires 8+ years in a technology candidate has <2 years in",
         "  - Primary language is one candidate doesn't know",
@@ -1305,6 +1317,7 @@ def _run_import_csv_ai(csv_bytes, location):
                 "running": True, "progress": 0, "total": 0,
                 "added": 0, "scored_ai": 0, "scored_fallback": 0,
                 "estimated_cost": 0.0, "stopped": False,
+                "regex_agree": 0, "ai_promoted": 0, "ai_demoted": 0,
                 "message": "Parsing CSV\u2026", "jobs_found": [],
             })
 
@@ -1397,16 +1410,26 @@ def _run_import_csv_ai(csv_bytes, location):
         # Build system prompt once — reused across all calls, cached
         system_prompt = _build_scoring_system_prompt()
 
-        # Helper: regex-fallback scoring shared by stop and error paths
-        def _regex_fallback(job):
+        # Helper: compute regex score for a job (free, local, fast).
+        # Used for both fallback scoring AND for the AI-vs-regex
+        # comparison view shown in the dashboard.
+        def _compute_regex_score(job):
             dl = job["description"].lower()
             tl = job["title"].lower()
-            regex_score = (
+            return (
                 calc_tech_score(dl)
                 + calc_level_bonus(tl)
                 + calc_company_bonus(job["company"])
             )
+
+        # Tier rank for AI-vs-regex agreement comparison
+        _TIER_RANK = {"Weak Match": 0, "Match": 1, "Strong Match": 2}
+
+        # Helper: regex-fallback scoring shared by stop and error paths
+        def _regex_fallback(job):
+            regex_score = _compute_regex_score(job)
             job["score"] = regex_score
+            job["regex_score"] = regex_score
             job["tier"] = assign_tier(regex_score)
             job["ai_reasoning"] = None
 
@@ -1429,11 +1452,23 @@ def _run_import_csv_ai(csv_bytes, location):
                 job["score"] = result["legacy_score"]
                 job["tier"] = assign_tier(result["legacy_score"])
                 job["ai_reasoning"] = result["reasoning"]
+                # Compute the regex score in parallel for comparison.
+                # Free + local — no extra API cost.
+                job["regex_score"] = _compute_regex_score(job)
+                regex_tier = assign_tier(job["regex_score"])
+                ai_rank = _TIER_RANK.get(job["tier"], 1)
+                rx_rank = _TIER_RANK.get(regex_tier, 1)
                 with _ai_import_lock:
                     _ai_import_status["scored_ai"] += 1
                     _ai_import_status["estimated_cost"] += (
                         AI_SCORING_COST_PER_JOB
                     )
+                    if ai_rank == rx_rank:
+                        _ai_import_status["regex_agree"] += 1
+                    elif ai_rank > rx_rank:
+                        _ai_import_status["ai_promoted"] += 1
+                    else:
+                        _ai_import_status["ai_demoted"] += 1
             else:
                 _regex_fallback(job)
                 with _ai_import_lock:
@@ -1471,15 +1506,15 @@ def _run_import_csv_ai(csv_bytes, location):
                         (id, company, title, location, work_type, salary,
                          posted_date, import_date, description, score,
                          tier, job_link, apply_link, resume_text,
-                         ai_reasoning)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         ai_reasoning, regex_score)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (id) DO NOTHING
                 """, (
                     j["id"], j["company"], j["title"], j["location"],
                     j["work_type"], j["salary"], j["posted_date"],
                     j["import_date"], j["description"], j["score"],
                     j["tier"], j["job_link"], j["apply_link"],
-                    resume_text, j.get("ai_reasoning"),
+                    resume_text, j.get("ai_reasoning"), j.get("regex_score"),
                 ))
                 cur.execute(
                     "INSERT INTO job_state (job_id) VALUES (%s) "
@@ -1887,12 +1922,14 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         # ── /api/jobs-data — full job list + state merged ─
         if self.path == "/api/jobs-data":
             try:
+                # Local import to match the existing pattern in this file
+                from process_new_postings import assign_tier
                 with Db() as conn:
                     cur = conn.cursor()
                     cur.execute("""
                         SELECT j.id, j.company, j.title, j.location, j.work_type, j.salary,
                                j.posted_date, j.import_date, j.score, j.tier,
-                               j.job_link, j.apply_link, j.ai_reasoning,
+                               j.job_link, j.apply_link, j.ai_reasoning, j.regex_score,
                                js.status, js.notes, js.applicants,
                                js.live_status, js.live_status_checked, js.timestamps,
                                js.pdf_path
@@ -1902,7 +1939,17 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     """)
                     cols = [d[0] for d in cur.description]
                     rows = cur.fetchall()
-                jobs = [_serialize(dict(zip(cols, row))) for row in rows]
+                jobs = []
+                for row in rows:
+                    job = _serialize(dict(zip(cols, row)))
+                    # Derive regex_tier from regex_score using the same
+                    # assign_tier() the scoring pipeline uses, so the
+                    # frontend doesn't need its own thresholds.
+                    rs = job.get("regex_score")
+                    job["regex_tier"] = (
+                        assign_tier(rs) if rs is not None else None
+                    )
+                    jobs.append(job)
                 _json_response(self, jobs)
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
