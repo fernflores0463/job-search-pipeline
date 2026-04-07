@@ -156,6 +156,13 @@ _scrape_status = {"running": False, "progress": 0, "total": 0, "added": 0, "mess
 _import_lock = threading.Lock()
 _import_status = {"running": False, "progress": 0, "total": 0, "added": 0, "message": "", "jobs_found": []}
 
+_ai_import_lock = threading.Lock()
+_ai_import_status = {
+    "running": False, "progress": 0, "total": 0, "added": 0,
+    "scored_ai": 0, "scored_fallback": 0,
+    "estimated_cost": 0.0, "message": "", "jobs_found": [],
+}
+
 _live_check_lock = threading.Lock()
 _live_check_status = {"running": False, "progress": 0, "total": 0, "closed": 0, "live": 0, "inconclusive": 0, "auto_updated": 0, "message": ""}
 
@@ -867,6 +874,107 @@ def _extract_pdf_text(pdf_path):
 
 
 # ─────────────────────────────────────────────────────────
+# AI JOB SCORING (Claude Haiku)
+# ─────────────────────────────────────────────────────────
+
+AI_SCORING_MODEL = "claude-3-5-haiku-20241022"
+AI_SCORING_COST_PER_JOB = 0.00093  # Approximate Haiku cost per 3200-token call
+
+
+def _build_scoring_system_prompt():
+    """Build the system prompt for AI job scoring.
+
+    Uses the current in-memory _config so Profile page edits take
+    effect without a restart. Returns a string ~1,500 tokens.
+    """
+    name = _config["candidate"].get("name", "the candidate")
+    return "\n".join([
+        f"You are a job-fit scoring assistant evaluating how well {name} "
+        "(a software engineer) matches each job posting.",
+        "",
+        f"CANDIDATE SKILLS: {_CANDIDATE_SKILLS}",
+        "",
+        "EXPERIENCE (bullets locked to company sections \u2014 cannot be "
+        "moved between companies):",
+        _format_bullet_pool(),
+        "",
+        "SCORING CRITERIA (1-10 integer scale):",
+        "  9-10: Near-perfect stack overlap + relevant domain experience",
+        "  7-8:  Strong overlap, minor gaps that can be addressed",
+        "  5-6:  Partial overlap, would need to learn some technologies",
+        "  3-4:  Weak overlap, but transferable skills exist",
+        "  1-2:  Wrong domain or requires expertise candidate lacks",
+        "",
+        "NEGATIVE SIGNALS (reduce score):",
+        "  - Requires security clearance candidate doesn't have",
+        "  - Requires 8+ years in a technology candidate has <2 years in",
+        "  - Primary language is one candidate doesn't know",
+        "    (e.g. Rust, Scala, .NET as primary)",
+        "  - Heavy domain expertise (healthcare EMR, financial regs)",
+        "",
+        "Return ONLY a JSON object with this exact shape (no markdown, "
+        "no explanation outside the JSON):",
+        '{"fit_score": <1-10 integer>,',
+        ' "tier": "<Strong Match|Match|Weak Match>",',
+        ' "reasoning": "<2-3 sentence explanation referencing specific '
+        'bullets or requirements>"}',
+    ])
+
+
+def _score_job_with_haiku(job, system_prompt):
+    """Score a single job using Claude Haiku. Returns dict.
+
+    On success: {fit_score, tier, reasoning, used_ai: True}
+    On failure: {used_ai: False, error: str}
+    """
+    try:
+        user_message = (
+            f"Score this job posting.\n\n"
+            f"Company: {job.get('company', '')}\n"
+            f"Title: {job.get('title', '')}\n"
+            f"Location: {job.get('location', '')}\n"
+            f"Salary: {job.get('salary', 'N/A')}\n\n"
+            f"JOB DESCRIPTION:\n{job.get('description', '')[:6000]}"
+        )
+        raw = _call_claude(
+            system_prompt,
+            [{"role": "user", "content": user_message}],
+            model=AI_SCORING_MODEL,
+        )
+
+        # Extract the JSON block from the response
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if not match:
+            return {"used_ai": False, "error": "No JSON in response"}
+
+        data = json.loads(match.group(0))
+        fit_score = int(data.get("fit_score", 5))
+        fit_score = max(1, min(10, fit_score))  # Clamp 1-10
+
+        # Derive tier from fit_score if missing or invalid
+        tier = data.get("tier", "")
+        valid_tiers = {"Strong Match", "Match", "Weak Match"}
+        if tier not in valid_tiers:
+            if fit_score >= 8:
+                tier = "Strong Match"
+            elif fit_score >= 5:
+                tier = "Match"
+            else:
+                tier = "Weak Match"
+
+        reasoning = str(data.get("reasoning", "")).strip()
+
+        return {
+            "fit_score": fit_score,
+            "tier": tier,
+            "reasoning": reasoning,
+            "used_ai": True,
+        }
+    except Exception as e:
+        return {"used_ai": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────
 # CAREERS PAGE SCRAPER
 # ─────────────────────────────────────────────────────────
 
@@ -1151,6 +1259,228 @@ def _run_import_csv(csv_bytes, location):
     except Exception as e:
         with _import_lock:
             _import_status.update({"running": False, "message": f"Error: {str(e)}"})
+
+
+def _run_import_csv_ai(csv_bytes, location):
+    """Background thread: parse CSV and import new jobs using
+    Claude Haiku for scoring. Parallel to _run_import_csv() \u2014 does
+    not modify the existing regex import path."""
+    try:
+        import csv as _csv
+        import io
+        from concurrent.futures import ThreadPoolExecutor
+        from datetime import date as _date
+        from process_new_postings import (
+            is_excluded_company, is_excluded_description,
+            is_excluded_title, is_excluded_role, is_swe_role,
+            calc_tech_score, calc_level_bonus, calc_company_bonus,
+            assign_tier, make_job_id, pick_bullets,
+            customize_skills, generate_resume_txt,
+        )
+
+        with _ai_import_lock:
+            _ai_import_status.update({
+                "running": True, "progress": 0, "total": 0,
+                "added": 0, "scored_ai": 0, "scored_fallback": 0,
+                "estimated_cost": 0.0,
+                "message": "Parsing CSV\u2026", "jobs_found": [],
+            })
+
+        text = csv_bytes.decode("utf-8-sig")
+        rows = list(_csv.DictReader(io.StringIO(text)))
+
+        if not location and rows:
+            location = (rows[0].get("Search Location") or "").strip() or None
+
+        # Distinguishable batch label so AI imports show separately
+        batch_label = _date.today().isoformat()
+        if location:
+            batch_label += f" \u2014 {location} (AI)"
+        else:
+            batch_label += " \u2014 AI"
+
+        # Filter (same logic as existing import)
+        seen, filtered = set(), []
+        for r in rows:
+            company = (r.get("Company") or "").strip()
+            title = (r.get("Job Title") or "").strip()
+            link = (r.get("Job Link") or "").strip()
+            key = link if link else (company, title)
+            if key in seen:
+                continue
+            seen.add(key)
+            if is_excluded_company(company):
+                continue
+            tl = title.lower()
+            desc = r.get("Description") or ""
+            dl = desc.lower()
+            if is_excluded_title(tl) or is_excluded_role(tl) \
+                    or not is_swe_role(tl):
+                continue
+            if is_excluded_description(dl):
+                continue
+            filtered.append({
+                "id": make_job_id(company, title, link),
+                "company": company,
+                "title": title,
+                "location": (r.get("Location") or "").strip(),
+                "work_type": (r.get("Work Type") or "").strip(),
+                "salary": (r.get("Salary") or "N/A").strip(),
+                "posted_date": (r.get("Posted Date") or "").strip(),
+                "import_date": batch_label,
+                "description": desc,
+                "job_link": link,
+                "apply_link": (r.get("Application Link") or "").strip(),
+            })
+
+        with _ai_import_lock:
+            _ai_import_status["total"] = len(filtered)
+            _ai_import_status["message"] = (
+                f"Found {len(filtered)} qualifying jobs. Checking DB\u2026"
+            )
+
+        if not filtered:
+            with _ai_import_lock:
+                _ai_import_status.update({
+                    "running": False,
+                    "message": "No qualifying SWE jobs found in CSV.",
+                })
+            return
+
+        # Dedup against existing DB
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT job_link FROM jobs WHERE job_link IS NOT NULL"
+            )
+            existing = {row[0] for row in cur.fetchall()}
+
+        new_jobs = [j for j in filtered if j["job_link"] not in existing]
+
+        with _ai_import_lock:
+            _ai_import_status["total"] = len(new_jobs)
+            _ai_import_status["message"] = (
+                f"Scoring {len(new_jobs)} new jobs with Claude Haiku\u2026"
+            )
+
+        if not new_jobs:
+            with _ai_import_lock:
+                _ai_import_status.update({
+                    "running": False,
+                    "message": "No new jobs to import "
+                    "(all dedupped against existing).",
+                })
+            return
+
+        # Build system prompt once — reused across all calls, cached
+        system_prompt = _build_scoring_system_prompt()
+
+        # Score in parallel (5 workers — conservative for rate limits)
+        def score_one(job):
+            result = _score_job_with_haiku(job, system_prompt)
+            if result.get("used_ai"):
+                job["score"] = result["fit_score"]
+                job["tier"] = result["tier"]
+                job["ai_reasoning"] = result["reasoning"]
+                with _ai_import_lock:
+                    _ai_import_status["scored_ai"] += 1
+                    _ai_import_status["estimated_cost"] += (
+                        AI_SCORING_COST_PER_JOB
+                    )
+            else:
+                # Fall back to regex
+                dl = job["description"].lower()
+                tl = job["title"].lower()
+                regex_score = (
+                    calc_tech_score(dl)
+                    + calc_level_bonus(tl)
+                    + calc_company_bonus(job["company"])
+                )
+                job["score"] = regex_score
+                job["tier"] = assign_tier(regex_score)
+                job["ai_reasoning"] = None
+                with _ai_import_lock:
+                    _ai_import_status["scored_fallback"] += 1
+            with _ai_import_lock:
+                _ai_import_status["progress"] += 1
+                s = _ai_import_status
+                _ai_import_status["message"] = (
+                    f"AI scoring: {s['progress']}/{s['total']} "
+                    f"({s['scored_ai']} AI, "
+                    f"{s['scored_fallback']} fallback, "
+                    f"~${s['estimated_cost']:.3f})"
+                )
+            return job
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            scored_jobs = list(executor.map(score_one, new_jobs))
+
+        with _ai_import_lock:
+            _ai_import_status["message"] = (
+                f"Inserting {len(scored_jobs)} jobs into DB\u2026"
+            )
+
+        # Insert — same pattern as _run_import_csv but with ai_reasoning
+        with Db() as conn:
+            cur = conn.cursor()
+            for i, j in enumerate(scored_jobs):
+                bullets = pick_bullets(j["description"], j["title"])
+                langs, frameworks, misc = customize_skills(j["description"])
+                resume_text = generate_resume_txt(
+                    j, bullets, langs, frameworks, misc
+                )
+                cur.execute("""
+                    INSERT INTO jobs
+                        (id, company, title, location, work_type, salary,
+                         posted_date, import_date, description, score,
+                         tier, job_link, apply_link, resume_text,
+                         ai_reasoning)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (id) DO NOTHING
+                """, (
+                    j["id"], j["company"], j["title"], j["location"],
+                    j["work_type"], j["salary"], j["posted_date"],
+                    j["import_date"], j["description"], j["score"],
+                    j["tier"], j["job_link"], j["apply_link"],
+                    resume_text, j.get("ai_reasoning"),
+                ))
+                cur.execute(
+                    "INSERT INTO job_state (job_id) VALUES (%s) "
+                    "ON CONFLICT DO NOTHING",
+                    (j["id"],)
+                )
+
+        tiers = {}
+        for j in scored_jobs:
+            tiers.setdefault(j["tier"], []).append(j["title"])
+        summary = ", ".join(
+            f"{t}: {len(v)}" for t, v in sorted(tiers.items())
+        )
+        with _ai_import_lock:
+            _ai_import_status.update({
+                "running": False,
+                "added": len(scored_jobs),
+                "message": (
+                    f"Done! {len(scored_jobs)} scored "
+                    f"({_ai_import_status['scored_ai']} AI, "
+                    f"{_ai_import_status['scored_fallback']} fallback), "
+                    f"cost ~${_ai_import_status['estimated_cost']:.3f}. "
+                    f"{summary}."
+                ),
+                "jobs_found": [
+                    {"title": j["title"], "tier": j["tier"],
+                     "score": j["score"], "location": j["location"]}
+                    for j in sorted(
+                        scored_jobs, key=lambda x: -x["score"]
+                    )[:20]
+                ],
+            })
+
+    except Exception as e:
+        with _ai_import_lock:
+            _ai_import_status.update(
+                {"running": False, "message": f"Error: {str(e)}"}
+            )
 
 
 # ─────────────────────────────────────────────────────────
@@ -1522,7 +1852,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     cur.execute("""
                         SELECT j.id, j.company, j.title, j.location, j.work_type, j.salary,
                                j.posted_date, j.import_date, j.score, j.tier,
-                               j.job_link, j.apply_link,
+                               j.job_link, j.apply_link, j.ai_reasoning,
                                js.status, js.notes, js.applicants,
                                js.live_status, js.live_status_checked, js.timestamps,
                                js.pdf_path
@@ -1598,6 +1928,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         if self.path == "/api/import-status":
             with _import_lock:
                 _json_response(self, dict(_import_status))
+            return
+
+        # ── /api/ai-import-status ────────────────────────
+        if self.path == "/api/ai-import-status":
+            with _ai_import_lock:
+                _json_response(self, dict(_ai_import_status))
             return
 
         # ── /api/refresh-job/<id> ────────────────────────
@@ -2286,6 +2622,39 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 else:
                     threading.Thread(target=_run_scrape_careers, args=(url, company), daemon=True).start()
                     _json_response(self, {"ok": True, "message": "Started"})
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── POST /api/import-csv-ai — AI scoring CSV import ─
+        # Must come BEFORE /api/import-csv since that uses startswith
+        if self.path.startswith("/api/import-csv-ai"):
+            if not _ANTHROPIC_KEY:
+                _json_response(self, {
+                    "error": "Anthropic API key not configured"
+                }, 500)
+                return
+            if _ai_import_status.get("running"):
+                _json_response(self, {
+                    "ok": True, "message": "Already running"
+                })
+                return
+            try:
+                qs = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query
+                )
+                loc = (qs.get("location", [""])[0] or "").strip() or None
+                length = int(self.headers.get("Content-Length", 0))
+                csv_bytes = self.rfile.read(length)
+                if not csv_bytes:
+                    _json_response(self, {"error": "Empty body"}, 400)
+                    return
+                threading.Thread(
+                    target=_run_import_csv_ai,
+                    args=(csv_bytes, loc),
+                    daemon=True,
+                ).start()
+                _json_response(self, {"ok": True})
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
             return

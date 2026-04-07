@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   apply_link    TEXT,
   resume_text   TEXT,
   resume_s3_key TEXT,
+  ai_reasoning  TEXT,
   created_at    TIMESTAMP DEFAULT NOW()
 );
 
