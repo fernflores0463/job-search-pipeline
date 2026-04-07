@@ -877,8 +877,8 @@ def _extract_pdf_text(pdf_path):
 # AI JOB SCORING (Claude Haiku)
 # ─────────────────────────────────────────────────────────
 
-AI_SCORING_MODEL = "claude-3-5-haiku-20241022"
-AI_SCORING_COST_PER_JOB = 0.00093  # Approximate Haiku cost per 3200-token call
+AI_SCORING_MODEL = "claude-haiku-4-5-20251001"
+AI_SCORING_COST_PER_JOB = 0.0028  # Haiku 4.5: $1/MTok input, $5/MTok output
 
 
 def _build_scoring_system_prompt():
