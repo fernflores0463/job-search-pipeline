@@ -4091,7 +4091,7 @@ if __name__ == "__main__":
     print(f"Open http://localhost:{PORT} in your browser")
     print("Press Ctrl+C to stop\n")
     _resume_in_flight_imports()
-    server = http.server.HTTPServer(("", PORT), DashboardHandler)
+    server = http.server.ThreadingHTTPServer(("", PORT), DashboardHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
