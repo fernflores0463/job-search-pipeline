@@ -3,7 +3,8 @@
     "name": "Your Name",
     "linkedin_url": "https://www.linkedin.com/in/your-profile/",
     "summary": "A software engineer with experience at Company A and Company B",
-    "skills": "Go, Java, JavaScript, Python, SQL, Spring Boot, React, Docker, Kubernetes"
+    "skills": "Go, Java, JavaScript, Python, SQL, Spring Boot, React, Docker, Kubernetes",
+    "years_of_experience": 5
   },
   "experience": {
     "COMPANY_A": {

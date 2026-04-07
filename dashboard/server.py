@@ -1080,9 +1080,10 @@ def _build_scoring_system_prompt():
     effect without a restart. Returns a string ~1,500 tokens.
     """
     name = _config["candidate"].get("name", "the candidate")
+    yoe = _config["candidate"].get("years_of_experience", 5)
     return "\n".join([
         f"You are a job-fit scoring assistant evaluating how well {name} "
-        "(a senior software engineer with 10+ years of professional "
+        f"(a software engineer with {yoe} years of professional "
         "experience) matches each job posting.",
         "",
         f"CANDIDATE SKILLS: {_CANDIDATE_SKILLS}",
