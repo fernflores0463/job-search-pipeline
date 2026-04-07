@@ -18,6 +18,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import urllib.request
 import urllib.parse
@@ -167,6 +168,16 @@ _ai_import_status = {
     #   ai_promoted    = AI tier > regex tier (AI is more bullish)
     #   ai_demoted     = AI tier < regex tier (AI is less bullish)
     "regex_agree": 0, "ai_promoted": 0, "ai_demoted": 0,
+    # Most recent fallback error string (truncated to 240 chars). Used
+    # by the UI to surface why jobs are falling back without needing to
+    # SSH into the container. Cleared at the start of each new run.
+    "last_error": "",
+    # Mode and batch-API state. mode is "live" or "batch".
+    # batch_id is set only when mode == "batch".
+    "mode": "live",
+    "batch_id": None,
+    "batch_processing_status": None,
+    "batch_request_counts": None,
 }
 _ai_import_stop_event = threading.Event()
 
@@ -862,6 +873,43 @@ def _call_claude(system_prompt, messages, model="claude-sonnet-4-20250514"):
     return response.content[0].text
 
 
+def _call_claude_with_retry(
+    system_prompt, messages, model="claude-sonnet-4-20250514",
+    max_retries=3, initial_backoff=5,
+):
+    """Call _call_claude with exponential backoff on rate limits.
+
+    Retries on 429 (rate_limit_error) and 529 (overloaded_error) only.
+    Other exceptions propagate immediately. Backoff: initial_backoff,
+    initial_backoff*2, initial_backoff*4 (default 5s, 10s, 20s).
+
+    Used by AI scoring to recover from Anthropic Tier 1 ITPM (50K/min)
+    rate limits instead of falling back to regex on every spike.
+    """
+    backoff = initial_backoff
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return _call_claude(system_prompt, messages, model=model)
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            is_rate_limit = (
+                "429" in msg or "rate_limit" in msg.lower()
+            )
+            is_overloaded = (
+                "529" in msg or "overloaded" in msg.lower()
+            )
+            if (is_rate_limit or is_overloaded) and attempt < max_retries - 1:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            raise
+    # Defensive: should be unreachable, but if the loop exits
+    # without returning or raising, surface the last error.
+    raise last_error if last_error else RuntimeError("retry loop exited without result")
+
+
 def _extract_pdf_text(pdf_path):
     """Extract text from a PDF file. Returns None on failure."""
     try:
@@ -978,7 +1026,7 @@ def _score_job_with_haiku(job, system_prompt):
             f"Title: {job.get('title', '')}\n\n"
             f"DESCRIPTION (relevant excerpt):\n{relevant_desc}"
         )
-        raw = _call_claude(
+        raw = _call_claude_with_retry(
             system_prompt,
             [{"role": "user", "content": user_message}],
             model=AI_SCORING_MODEL,
@@ -1003,6 +1051,110 @@ def _score_job_with_haiku(job, system_prompt):
         }
     except Exception as e:
         return {"used_ai": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────
+# ANTHROPIC BATCH API SUPPORT (50% discount, async)
+# ─────────────────────────────────────────────────────────
+#
+# Bypasses ITPM rate limits entirely by submitting all requests at
+# once and letting Anthropic process them at its own pace. Trades the
+# live progress UX for ~50% lower cost. Typical turnaround: minutes to
+# hours, max 24h. Used by /api/import-csv-ai?mode=batch.
+
+def _build_batch_request(job_id, system_prompt, job):
+    """Build one entry of an Anthropic Messages Batches request.
+
+    Each entry has a custom_id that we use to match results back to
+    the originating job. The params dict mirrors messages.create()
+    arguments exactly.
+    """
+    relevant_desc = _extract_relevant_description(
+        job.get('description', ''), max_chars=2500
+    )
+    user_message = (
+        f"Score this job posting.\n\n"
+        f"Company: {job.get('company', '')}\n"
+        f"Title: {job.get('title', '')}\n\n"
+        f"DESCRIPTION (relevant excerpt):\n{relevant_desc}"
+    )
+    return {
+        "custom_id": job_id,
+        "params": {
+            "model": AI_SCORING_MODEL,
+            "max_tokens": 512,
+            "system": [{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            "messages": [{"role": "user", "content": user_message}],
+        },
+    }
+
+
+def _create_anthropic_batch(requests):
+    """Submit a batch of message requests to Anthropic. Returns the
+    batch object (with .id and .processing_status).
+    """
+    client = _get_anthropic_client()
+    if not client:
+        raise RuntimeError("Anthropic client not initialized")
+    return client.messages.batches.create(requests=requests)
+
+
+def _get_anthropic_batch(batch_id):
+    """Fetch the current status of a batch."""
+    client = _get_anthropic_client()
+    return client.messages.batches.retrieve(batch_id)
+
+
+def _retrieve_anthropic_batch_results(batch_id):
+    """Stream and parse batch results.
+
+    Yields (custom_id, parsed_result_dict) tuples. parsed_result_dict
+    has the same shape as _score_job_with_haiku's success / failure
+    return value, so the caller can reuse the same downstream logic.
+    """
+    client = _get_anthropic_client()
+    for result in client.messages.batches.results(batch_id):
+        custom_id = result.custom_id
+        # result.result is a union type: succeeded | errored | expired | canceled
+        rtype = result.result.type
+        if rtype == "succeeded":
+            try:
+                msg = result.result.message
+                raw = msg.content[0].text
+                m = re.search(r'\{[\s\S]*\}', raw)
+                if not m:
+                    yield custom_id, {
+                        "used_ai": False,
+                        "error": "No JSON in batch response"
+                    }
+                    continue
+                data = json.loads(m.group(0))
+                ai_fit_score = max(1, min(10, int(data.get("fit_score", 5))))
+                yield custom_id, {
+                    "used_ai": True,
+                    "ai_fit_score": ai_fit_score,
+                    "legacy_score": _ai_score_to_legacy_scale(ai_fit_score),
+                    "reasoning": str(data.get("reasoning", "")).strip(),
+                }
+            except Exception as e:
+                yield custom_id, {
+                    "used_ai": False,
+                    "error": f"parse error: {e}",
+                }
+        elif rtype == "errored":
+            err = getattr(result.result, "error", None)
+            err_msg = str(err) if err else "unknown batch error"
+            yield custom_id, {"used_ai": False, "error": err_msg[:240]}
+        elif rtype == "expired":
+            yield custom_id, {"used_ai": False, "error": "batch request expired"}
+        elif rtype == "canceled":
+            yield custom_id, {"used_ai": False, "error": "batch request canceled"}
+        else:
+            yield custom_id, {"used_ai": False, "error": f"unknown result type: {rtype}"}
 
 
 # ─────────────────────────────────────────────────────────
@@ -1318,6 +1470,9 @@ def _run_import_csv_ai(csv_bytes, location):
                 "added": 0, "scored_ai": 0, "scored_fallback": 0,
                 "estimated_cost": 0.0, "stopped": False,
                 "regex_agree": 0, "ai_promoted": 0, "ai_demoted": 0,
+                "last_error": "", "mode": "live",
+                "batch_id": None, "batch_processing_status": None,
+                "batch_request_counts": None,
                 "message": "Parsing CSV\u2026", "jobs_found": [],
             })
 
@@ -1471,8 +1626,11 @@ def _run_import_csv_ai(csv_bytes, location):
                         _ai_import_status["ai_demoted"] += 1
             else:
                 _regex_fallback(job)
+                err = (result.get("error") or "")[:240]
                 with _ai_import_lock:
                     _ai_import_status["scored_fallback"] += 1
+                    if err:
+                        _ai_import_status["last_error"] = err
             with _ai_import_lock:
                 _ai_import_status["progress"] += 1
                 s = _ai_import_status
@@ -1484,7 +1642,10 @@ def _run_import_csv_ai(csv_bytes, location):
                 )
             return job
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # 2 workers keeps us under Anthropic Tier 1 ITPM (50K/min)
+        # with ~2,200 input tokens/call. Was 5 — caused 27-50% 429
+        # fallbacks. Bump back to 5 once on Tier 2.
+        with ThreadPoolExecutor(max_workers=2) as executor:
             scored_jobs = list(executor.map(score_one, new_jobs))
 
         with _ai_import_lock:
@@ -1555,6 +1716,333 @@ def _run_import_csv_ai(csv_bytes, location):
         with _ai_import_lock:
             _ai_import_status.update(
                 {"running": False, "message": f"Error: {str(e)}"}
+            )
+
+
+# ─────────────────────────────────────────────────────────
+# BATCH MODE — same import flow but uses Anthropic Batches
+# ─────────────────────────────────────────────────────────
+
+def _run_import_csv_ai_batch(csv_bytes, location):
+    """Background thread: parse CSV, submit a single Batch API job to
+    Anthropic, poll until complete, retrieve results, then insert.
+
+    Trades ~50% lower cost for async processing (minutes to hours).
+    Reuses _ai_import_status (with mode="batch") so the existing UI
+    polling continues to work.
+    """
+    try:
+        import csv as _csv
+        import io
+        from datetime import date as _date
+        from process_new_postings import (
+            is_excluded_company, is_excluded_description,
+            is_excluded_title, is_excluded_role, is_swe_role,
+            calc_tech_score, calc_level_bonus, calc_company_bonus,
+            assign_tier, make_job_id, pick_bullets,
+            customize_skills, generate_resume_txt,
+        )
+
+        _ai_import_stop_event.clear()
+
+        with _ai_import_lock:
+            _ai_import_status.update({
+                "running": True, "progress": 0, "total": 0,
+                "added": 0, "scored_ai": 0, "scored_fallback": 0,
+                "estimated_cost": 0.0, "stopped": False,
+                "regex_agree": 0, "ai_promoted": 0, "ai_demoted": 0,
+                "last_error": "", "mode": "batch",
+                "batch_id": None, "batch_processing_status": None,
+                "batch_request_counts": None,
+                "message": "Parsing CSV\u2026", "jobs_found": [],
+            })
+
+        text = csv_bytes.decode("utf-8-sig")
+        rows = list(_csv.DictReader(io.StringIO(text)))
+
+        if not location and rows:
+            location = (rows[0].get("Search Location") or "").strip() or None
+
+        batch_label = _date.today().isoformat()
+        if location:
+            batch_label += f" \u2014 {location} (AI batch)"
+        else:
+            batch_label += " \u2014 AI batch"
+
+        # Same filter pass as live mode
+        seen, filtered = set(), []
+        for r in rows:
+            company = (r.get("Company") or "").strip()
+            title = (r.get("Job Title") or "").strip()
+            link = (r.get("Job Link") or "").strip()
+            key = link if link else (company, title)
+            if key in seen:
+                continue
+            seen.add(key)
+            if is_excluded_company(company):
+                continue
+            tl = title.lower()
+            desc = r.get("Description") or ""
+            dl = desc.lower()
+            if is_excluded_title(tl) or is_excluded_role(tl) \
+                    or not is_swe_role(tl):
+                continue
+            if is_excluded_description(dl):
+                continue
+            filtered.append({
+                "id": make_job_id(company, title, link),
+                "company": company,
+                "title": title,
+                "location": (r.get("Location") or "").strip(),
+                "work_type": (r.get("Work Type") or "").strip(),
+                "salary": (r.get("Salary") or "N/A").strip(),
+                "posted_date": (r.get("Posted Date") or "").strip(),
+                "import_date": batch_label,
+                "description": desc,
+                "job_link": link,
+                "apply_link": (r.get("Application Link") or "").strip(),
+            })
+
+        with _ai_import_lock:
+            _ai_import_status["total"] = len(filtered)
+            _ai_import_status["message"] = (
+                f"Found {len(filtered)} qualifying jobs. Checking DB\u2026"
+            )
+
+        if not filtered:
+            with _ai_import_lock:
+                _ai_import_status.update({
+                    "running": False,
+                    "message": "No qualifying SWE jobs found in CSV.",
+                })
+            return
+
+        # Dedup against existing
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT job_link FROM jobs WHERE job_link IS NOT NULL"
+            )
+            existing = {row[0] for row in cur.fetchall()}
+        new_jobs = [j for j in filtered if j["job_link"] not in existing]
+        # Keep an index from custom_id (job id) to job dict
+        job_by_id = {j["id"]: j for j in new_jobs}
+
+        with _ai_import_lock:
+            _ai_import_status["total"] = len(new_jobs)
+            _ai_import_status["message"] = (
+                f"Submitting batch of {len(new_jobs)} jobs to Anthropic\u2026"
+            )
+
+        if not new_jobs:
+            with _ai_import_lock:
+                _ai_import_status.update({
+                    "running": False,
+                    "message": "No new jobs to import "
+                    "(all dedupped against existing).",
+                })
+            return
+
+        system_prompt = _build_scoring_system_prompt()
+        requests = [
+            _build_batch_request(j["id"], system_prompt, j)
+            for j in new_jobs
+        ]
+        batch = _create_anthropic_batch(requests)
+
+        with _ai_import_lock:
+            _ai_import_status["batch_id"] = batch.id
+            _ai_import_status["batch_processing_status"] = (
+                getattr(batch, "processing_status", "in_progress")
+            )
+            _ai_import_status["message"] = (
+                f"Batch {batch.id[:8]}\u2026 submitted. "
+                f"Polling every 30s."
+            )
+
+        # Poll until done. The status endpoint reflects this state, so
+        # the user can keep the dashboard open and watch progress.
+        poll_interval = 30
+        while True:
+            if _ai_import_stop_event.is_set():
+                # User requested stop. We don't cancel the Anthropic
+                # batch (it's already paid for) — just exit and let
+                # them retrieve results manually later if they want.
+                with _ai_import_lock:
+                    _ai_import_status.update({
+                        "running": False,
+                        "stopped": True,
+                        "message": (
+                            f"Stopped polling batch {batch.id[:8]}\u2026. "
+                            f"Results will still be available from "
+                            f"Anthropic when complete."
+                        ),
+                    })
+                return
+
+            time.sleep(poll_interval)
+            try:
+                batch = _get_anthropic_batch(batch.id)
+            except Exception as e:
+                with _ai_import_lock:
+                    _ai_import_status["last_error"] = (
+                        f"poll error: {str(e)[:200]}"
+                    )
+                continue
+
+            counts = getattr(batch, "request_counts", None)
+            counts_dict = None
+            if counts is not None:
+                counts_dict = {
+                    "processing": getattr(counts, "processing", 0),
+                    "succeeded": getattr(counts, "succeeded", 0),
+                    "errored": getattr(counts, "errored", 0),
+                    "canceled": getattr(counts, "canceled", 0),
+                    "expired": getattr(counts, "expired", 0),
+                }
+
+            with _ai_import_lock:
+                _ai_import_status["batch_processing_status"] = (
+                    batch.processing_status
+                )
+                _ai_import_status["batch_request_counts"] = counts_dict
+                if counts_dict:
+                    finished = (
+                        counts_dict["succeeded"]
+                        + counts_dict["errored"]
+                        + counts_dict["canceled"]
+                        + counts_dict["expired"]
+                    )
+                    _ai_import_status["progress"] = finished
+                    _ai_import_status["message"] = (
+                        f"Batch {batch.id[:8]}\u2026 "
+                        f"{batch.processing_status} "
+                        f"({finished}/{len(new_jobs)} processed)"
+                    )
+
+            if batch.processing_status == "ended":
+                break
+
+        # Retrieve and parse results
+        with _ai_import_lock:
+            _ai_import_status["message"] = (
+                f"Batch {batch.id[:8]}\u2026 ended. Retrieving results\u2026"
+            )
+
+        _TIER_RANK = {"Weak Match": 0, "Match": 1, "Strong Match": 2}
+        scored_jobs = []
+        for custom_id, result in _retrieve_anthropic_batch_results(batch.id):
+            job = job_by_id.get(custom_id)
+            if not job:
+                # Result for an unknown id — skip
+                continue
+            # Always compute regex baseline for the comparison column
+            dl = job["description"].lower()
+            tl = job["title"].lower()
+            regex_score = (
+                calc_tech_score(dl)
+                + calc_level_bonus(tl)
+                + calc_company_bonus(job["company"])
+            )
+            job["regex_score"] = regex_score
+            regex_tier = assign_tier(regex_score)
+
+            if result.get("used_ai"):
+                job["score"] = result["legacy_score"]
+                job["tier"] = assign_tier(result["legacy_score"])
+                job["ai_reasoning"] = result["reasoning"]
+                ai_rank = _TIER_RANK.get(job["tier"], 1)
+                rx_rank = _TIER_RANK.get(regex_tier, 1)
+                with _ai_import_lock:
+                    _ai_import_status["scored_ai"] += 1
+                    # Batch API: 50% discount applied
+                    _ai_import_status["estimated_cost"] += (
+                        AI_SCORING_COST_PER_JOB * 0.5
+                    )
+                    if ai_rank == rx_rank:
+                        _ai_import_status["regex_agree"] += 1
+                    elif ai_rank > rx_rank:
+                        _ai_import_status["ai_promoted"] += 1
+                    else:
+                        _ai_import_status["ai_demoted"] += 1
+            else:
+                job["score"] = regex_score
+                job["tier"] = regex_tier
+                job["ai_reasoning"] = None
+                err = (result.get("error") or "")[:240]
+                with _ai_import_lock:
+                    _ai_import_status["scored_fallback"] += 1
+                    if err:
+                        _ai_import_status["last_error"] = err
+            scored_jobs.append(job)
+
+        with _ai_import_lock:
+            _ai_import_status["message"] = (
+                f"Inserting {len(scored_jobs)} jobs into DB\u2026"
+            )
+
+        # Insert (mirrors _run_import_csv_ai)
+        with Db() as conn:
+            cur = conn.cursor()
+            for j in scored_jobs:
+                bullets = pick_bullets(j["description"], j["title"])
+                langs, frameworks, misc = customize_skills(j["description"])
+                resume_text = generate_resume_txt(
+                    j, bullets, langs, frameworks, misc
+                )
+                cur.execute("""
+                    INSERT INTO jobs
+                        (id, company, title, location, work_type, salary,
+                         posted_date, import_date, description, score,
+                         tier, job_link, apply_link, resume_text,
+                         ai_reasoning, regex_score)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (id) DO NOTHING
+                """, (
+                    j["id"], j["company"], j["title"], j["location"],
+                    j["work_type"], j["salary"], j["posted_date"],
+                    j["import_date"], j["description"], j["score"],
+                    j["tier"], j["job_link"], j["apply_link"],
+                    resume_text, j.get("ai_reasoning"), j.get("regex_score"),
+                ))
+                cur.execute(
+                    "INSERT INTO job_state (job_id) VALUES (%s) "
+                    "ON CONFLICT DO NOTHING",
+                    (j["id"],)
+                )
+
+        tiers = {}
+        for j in scored_jobs:
+            tiers.setdefault(j["tier"], []).append(j["title"])
+        summary = ", ".join(
+            f"{t}: {len(v)}" for t, v in sorted(tiers.items())
+        )
+
+        with _ai_import_lock:
+            _ai_import_status.update({
+                "running": False,
+                "added": len(scored_jobs),
+                "message": (
+                    f"Done! Batch {batch.id[:8]}\u2026 inserted "
+                    f"{len(scored_jobs)} jobs "
+                    f"({_ai_import_status['scored_ai']} AI, "
+                    f"{_ai_import_status['scored_fallback']} fallback), "
+                    f"cost ~${_ai_import_status['estimated_cost']:.3f} "
+                    f"(50% batch discount). {summary}."
+                ),
+                "jobs_found": [
+                    {"title": j["title"], "tier": j["tier"],
+                     "score": j["score"], "location": j["location"]}
+                    for j in sorted(
+                        scored_jobs, key=lambda x: -x["score"]
+                    )[:20]
+                ],
+            })
+
+    except Exception as e:
+        with _ai_import_lock:
+            _ai_import_status.update(
+                {"running": False, "message": f"Batch error: {str(e)}"}
             )
 
 
@@ -2730,7 +3218,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             return
 
         # ── POST /api/import-csv-ai — AI scoring CSV import ─
-        # Must come BEFORE /api/import-csv since that uses startswith
+        # Must come BEFORE /api/import-csv since that uses startswith.
+        # Optional ?mode=batch query param routes to the Anthropic
+        # Batch API path (50% discount, async). Default mode is "live".
         if self.path.startswith("/api/import-csv-ai"):
             if not _ANTHROPIC_KEY:
                 _json_response(self, {
@@ -2747,17 +3237,22 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     urllib.parse.urlparse(self.path).query
                 )
                 loc = (qs.get("location", [""])[0] or "").strip() or None
+                mode = (qs.get("mode", ["live"])[0] or "live").strip().lower()
                 length = int(self.headers.get("Content-Length", 0))
                 csv_bytes = self.rfile.read(length)
                 if not csv_bytes:
                     _json_response(self, {"error": "Empty body"}, 400)
                     return
+                target = (
+                    _run_import_csv_ai_batch if mode == "batch"
+                    else _run_import_csv_ai
+                )
                 threading.Thread(
-                    target=_run_import_csv_ai,
+                    target=target,
                     args=(csv_bytes, loc),
                     daemon=True,
                 ).start()
-                _json_response(self, {"ok": True})
+                _json_response(self, {"ok": True, "mode": mode})
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
             return
