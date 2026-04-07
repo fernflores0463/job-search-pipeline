@@ -886,6 +886,24 @@ AI_SCORING_MODEL = "claude-haiku-4-5-20251001"
 AI_SCORING_COST_PER_JOB = 0.0017
 
 
+def _ai_score_to_legacy_scale(ai_score):
+    """Map Claude's 1-10 fit_score to the legacy 0-24 scale.
+
+    Preserves tier boundaries from config.json (strong>=13, match>=7):
+      AI 8-10 (Strong) -> legacy 13-24
+      AI 5-7  (Match)  -> legacy 7-12
+      AI 1-4  (Weak)   -> legacy 0-6
+    """
+    if ai_score >= 8:
+        # 8->13, 9->18 or 19, 10->24
+        return 13 + round((ai_score - 8) * 5.5)
+    if ai_score >= 5:
+        # 5->7, 6->9 or 10, 7->12
+        return 7 + round((ai_score - 5) * 2.5)
+    # 1->0, 2->2, 3->4, 4->6
+    return max(0, (ai_score - 1) * 2)
+
+
 def _build_scoring_system_prompt():
     """Build the system prompt for AI job scoring.
 
@@ -899,8 +917,7 @@ def _build_scoring_system_prompt():
         "",
         f"CANDIDATE SKILLS: {_CANDIDATE_SKILLS}",
         "",
-        "EXPERIENCE (bullets locked to company sections \u2014 cannot be "
-        "moved between companies):",
+        "EXPERIENCE BULLETS (organized by company):",
         _format_bullet_pool(),
         "",
         "SCORING CRITERIA (1-10 integer scale):",
@@ -920,16 +937,21 @@ def _build_scoring_system_prompt():
         "Return ONLY a JSON object with this exact shape (no markdown, "
         "no explanation outside the JSON):",
         '{"fit_score": <1-10 integer>,',
-        ' "tier": "<Strong Match|Match|Weak Match>",',
-        ' "reasoning": "<2-3 sentence explanation referencing specific '
-        'bullets or requirements>"}',
+        ' "reasoning": "<2 sentences max. Describe the match '
+        'qualitatively, referencing specific technologies or experience. '
+        'Do NOT mention any score numbers in the reasoning text.>"}',
     ])
 
 
 def _score_job_with_haiku(job, system_prompt):
     """Score a single job using Claude Haiku. Returns dict.
 
-    On success: {fit_score, tier, reasoning, used_ai: True}
+    On success: {legacy_score, ai_fit_score, reasoning, used_ai: True}
+      legacy_score   - integer 0-24, on the same scale as the regex
+                       scoring pipeline (caller derives tier via
+                       assign_tier)
+      ai_fit_score   - original 1-10 score from Claude (kept for
+                       debugging / analysis)
     On failure: {used_ai: False, error: str}
     """
     try:
@@ -939,7 +961,7 @@ def _score_job_with_haiku(job, system_prompt):
             job.get('description', ''), max_chars=2500
         )
         user_message = (
-            f"Score this job posting. Reasoning: 2 sentences max.\n\n"
+            f"Score this job posting.\n\n"
             f"Company: {job.get('company', '')}\n"
             f"Title: {job.get('title', '')}\n\n"
             f"DESCRIPTION (relevant excerpt):\n{relevant_desc}"
@@ -956,25 +978,14 @@ def _score_job_with_haiku(job, system_prompt):
             return {"used_ai": False, "error": "No JSON in response"}
 
         data = json.loads(match.group(0))
-        fit_score = int(data.get("fit_score", 5))
-        fit_score = max(1, min(10, fit_score))  # Clamp 1-10
-
-        # Derive tier from fit_score if missing or invalid
-        tier = data.get("tier", "")
-        valid_tiers = {"Strong Match", "Match", "Weak Match"}
-        if tier not in valid_tiers:
-            if fit_score >= 8:
-                tier = "Strong Match"
-            elif fit_score >= 5:
-                tier = "Match"
-            else:
-                tier = "Weak Match"
-
+        ai_fit_score = int(data.get("fit_score", 5))
+        ai_fit_score = max(1, min(10, ai_fit_score))  # Clamp 1-10
+        legacy_score = _ai_score_to_legacy_scale(ai_fit_score)
         reasoning = str(data.get("reasoning", "")).strip()
 
         return {
-            "fit_score": fit_score,
-            "tier": tier,
+            "legacy_score": legacy_score,
+            "ai_fit_score": ai_fit_score,
             "reasoning": reasoning,
             "used_ai": True,
         }
@@ -1412,8 +1423,11 @@ def _run_import_csv_ai(csv_bytes, location):
 
             result = _score_job_with_haiku(job, system_prompt)
             if result.get("used_ai"):
-                job["score"] = result["fit_score"]
-                job["tier"] = result["tier"]
+                # Use the legacy 0-24 scale so AI and regex jobs are
+                # comparable. Tier derived from the same scale via
+                # assign_tier (uses config.json thresholds).
+                job["score"] = result["legacy_score"]
+                job["tier"] = assign_tier(result["legacy_score"])
                 job["ai_reasoning"] = result["reasoning"]
                 with _ai_import_lock:
                     _ai_import_status["scored_ai"] += 1

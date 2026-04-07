@@ -2866,7 +2866,7 @@ function App() {
   const [view, setView, batchDetailDate, setHashBatchDate, selectedId, setHashJobId, jobDetailId, setJobDetailId, planDetailId, setPlanDetailId] = useHashRoute();
   const [loaded, setLoaded] = useState(!IS_SERVED);
   const [filters, setFilters] = useState({
-    tiers: [], statuses: [], search: "", favoritesOnly: false
+    tiers: [], statuses: [], search: "", favoritesOnly: false, aiScoredOnly: false
   });
   const [sortBy, setSortBy] = useState("score");
   const [sortDir, setSortDir] = useState("desc");
@@ -3201,6 +3201,8 @@ function App() {
     let result = jobs;
     if (filters.favoritesOnly)
       result = result.filter(j => j.favorited);
+    if (filters.aiScoredOnly)
+      result = result.filter(j => j.ai_reasoning);
     if (filters.tiers.length > 0)
       result = result.filter(j => filters.tiers.includes(j.tier));
     if (filters.statuses.length > 0)
@@ -3832,6 +3834,19 @@ function App() {
               <span className="font-medium">Shortlist Only</span>
               {favCount > 0 && <span className="text-xs text-gray-400">({favCount})</span>}
             </label>
+            <label className="flex items-center gap-2 text-sm cursor-pointer mt-1">
+              <input
+                type="checkbox"
+                checked={filters.aiScoredOnly}
+                onChange={() => setFilters(prev => ({...prev, aiScoredOnly: !prev.aiScoredOnly}))}
+              />
+              <span className="text-fuchsia-500">&#129302;</span>
+              <span className="font-medium">AI Scored Only</span>
+              {(() => {
+                const aiCount = jobs.filter(j => j.ai_reasoning).length;
+                return aiCount > 0 ? <span className="text-xs text-gray-400">({aiCount})</span> : null;
+              })()}
+            </label>
           </div>
 
           <div className="mb-4">
@@ -3863,7 +3878,7 @@ function App() {
           </div>
 
           <button
-            onClick={() => setFilters({tiers: [], statuses: [], search: "", favoritesOnly: false})}
+            onClick={() => setFilters({tiers: [], statuses: [], search: "", favoritesOnly: false, aiScoredOnly: false})}
             className="text-xs text-blue-600 hover:underline"
           >Clear All Filters</button>
         </div>
@@ -3916,7 +3931,14 @@ function App() {
                         {j.tier === "Strong Match" ? "Strong" : j.tier === "Weak Match" ? "Weak" : "Match"}
                       </span>
                     </td>
-                    <td className="px-3 py-2 text-gray-600">{j.score}</td>
+                    <td className="px-3 py-2 text-gray-600">
+                      <span className="inline-flex items-center gap-1">
+                        {j.score}
+                        {j.ai_reasoning && (
+                          <span className="text-fuchsia-500 text-xs" title="Scored by AI">&#129302;</span>
+                        )}
+                      </span>
+                    </td>
                     <td className="px-3 py-2 text-gray-600 whitespace-nowrap">{j.salary !== "N/A" ? j.salary : "-"}</td>
                     <td className="px-3 py-2">
                       <span className={"px-2 py-0.5 rounded text-xs font-medium " + (STATUS_COLORS[j.status] || "")}>
