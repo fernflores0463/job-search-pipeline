@@ -2944,6 +2944,8 @@ function App() {
   const [aiCsvFile, setAiCsvFile]               = useState(null);
   const [aiCsvLocation, setAiCsvLocation]       = useState('');
   const [aiCsvStatus, setAiCsvStatus]           = useState(null);
+  // Submit via Anthropic Batch API for 50% cost discount (async).
+  const [aiCsvUseBatch, setAiCsvUseBatch]       = useState(false);
 
   const [showAIImport, setShowAIImport] = useState(false);
   const [aiImportUrl, setAiImportUrl] = useState('');
@@ -2983,8 +2985,10 @@ function App() {
 
   const startAICsvImport = useCallback(() => {
     if (!aiCsvFile) return;
-    const qs = aiCsvLocation.trim()
-      ? `?location=${encodeURIComponent(aiCsvLocation.trim())}` : '';
+    const params = [];
+    if (aiCsvLocation.trim()) params.push('location=' + encodeURIComponent(aiCsvLocation.trim()));
+    if (aiCsvUseBatch) params.push('mode=batch');
+    const qs = params.length ? '?' + params.join('&') : '';
     fetch(`/api/import-csv-ai${qs}`, {
       method: 'POST', body: aiCsvFile,
       headers: { 'Content-Type': 'text/csv' },
@@ -2993,14 +2997,16 @@ function App() {
         setAiCsvStatus({ running: false, message: 'Error: ' + data.error });
         return;
       }
-      setAiCsvStatus({ running: true, message: 'Starting AI scoring...', progress: 0, total: 0, scored_ai: 0, scored_fallback: 0, estimated_cost: 0 });
+      setAiCsvStatus({ running: true, message: aiCsvUseBatch ? 'Submitting batch to Anthropic...' : 'Starting AI scoring...', progress: 0, total: 0, scored_ai: 0, scored_fallback: 0, estimated_cost: 0, mode: aiCsvUseBatch ? 'batch' : 'live' });
+      // Batch mode polls less frequently since updates only happen every 30s on the server side
+      const interval = aiCsvUseBatch ? 5000 : 1500;
       const poll = setInterval(() =>
         fetch('/api/ai-import-status').then(r => r.json()).then(s => {
           setAiCsvStatus(s);
           if (!s.running) clearInterval(poll);
-        }), 1500);
+        }), interval);
     });
-  }, [aiCsvFile, aiCsvLocation]);
+  }, [aiCsvFile, aiCsvLocation, aiCsvUseBatch]);
 
   const startScrape = useCallback(() => {
     if (!scrapeUrl.trim()) return;
@@ -3640,6 +3646,16 @@ function App() {
                 &#9209; Stop &amp; Finish
               </button>
             )}
+            <label className="flex items-center gap-1.5 text-xs text-pink-700 cursor-pointer ml-2"
+                   title="Submit as a Batch API job (50% discount, async processing). Trades the live progress UX for lower cost.">
+              <input
+                type="checkbox"
+                checked={aiCsvUseBatch}
+                onChange={() => setAiCsvUseBatch(!aiCsvUseBatch)}
+                disabled={aiCsvStatus?.running}
+              />
+              <span className="font-medium">Use Batch API (50% off, async)</span>
+            </label>
           </div>
           {aiCsvStatus && (
             <div className="mt-2">
@@ -3648,6 +3664,12 @@ function App() {
                 <span className={"text-xs " + (aiCsvStatus.message?.startsWith("Error") ? "text-red-600" : "text-pink-700")}>
                   {aiCsvStatus.message}
                 </span>
+                {aiCsvStatus.mode === 'batch' && aiCsvStatus.batch_id && (
+                  <span className="text-[10px] font-mono px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded border border-purple-300"
+                        title={"Batch ID: " + aiCsvStatus.batch_id}>
+                    BATCH {aiCsvStatus.batch_id.slice(0, 12)}&hellip;
+                  </span>
+                )}
                 {aiCsvStatus.running && aiCsvStatus.total > 0 && (
                   <>
                     <span className="text-xs text-gray-500">({aiCsvStatus.progress}/{aiCsvStatus.total})</span>
@@ -3658,6 +3680,30 @@ function App() {
                   </>
                 )}
               </div>
+              {/* Last error string — visible without SSH for diagnosing fallback causes */}
+              {aiCsvStatus.last_error && (
+                <div className="mt-1 text-[10px] text-orange-700 bg-orange-50 border border-orange-200 rounded px-2 py-1 font-mono break-all">
+                  Last fallback error: {aiCsvStatus.last_error}
+                </div>
+              )}
+              {/* Batch processing status block */}
+              {aiCsvStatus.mode === 'batch' && aiCsvStatus.batch_request_counts && (
+                <div className="mt-2 bg-purple-50 border border-purple-200 rounded p-2">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-xs font-semibold text-purple-700">
+                      Batch processing: {aiCsvStatus.batch_processing_status}
+                    </span>
+                    <span className="text-[10px] text-purple-500">50% discount</span>
+                  </div>
+                  <div className="grid grid-cols-5 gap-1 text-[10px] font-mono text-gray-700">
+                    <div>processing: <b>{aiCsvStatus.batch_request_counts.processing || 0}</b></div>
+                    <div>succeeded: <b className="text-green-600">{aiCsvStatus.batch_request_counts.succeeded || 0}</b></div>
+                    <div>errored: <b className="text-red-600">{aiCsvStatus.batch_request_counts.errored || 0}</b></div>
+                    <div>canceled: <b>{aiCsvStatus.batch_request_counts.canceled || 0}</b></div>
+                    <div>expired: <b>{aiCsvStatus.batch_request_counts.expired || 0}</b></div>
+                  </div>
+                </div>
+              )}
               {/* AI vs Regex Agreement Card — live during run, persists after */}
               {aiCsvStatus.scored_ai > 0 && (() => {
                 const total = aiCsvStatus.scored_ai;
@@ -3729,7 +3775,12 @@ function App() {
               )}
             </div>
           )}
-          <p className="text-xs text-pink-500 mt-1">Each job is scored 1-10 by Claude Haiku 4.5 with reasoning. Approx cost: $0.0017 per job (~$1.60 for a 925-job CSV). Description boilerplate is stripped to reduce token usage. Jobs that fail AI scoring fall back to regex automatically.</p>
+          <p className="text-xs text-pink-500 mt-1">
+            Each job is scored 1-10 by Claude Haiku 4.5 with reasoning. Approx cost: $0.0017 per job (~$1.60 for a 925-job CSV).
+            Live mode uses 2 parallel workers with 429 retry + backoff. <b>Batch mode</b> submits all jobs to the Anthropic Batch API
+            for a 50% discount (~$0.80 per 925-job CSV) but processes asynchronously \u2014 can take minutes to hours, max 24h.
+            Description boilerplate is stripped to reduce token usage. Jobs that fail AI scoring fall back to regex automatically.
+          </p>
         </div>
       )}
 
