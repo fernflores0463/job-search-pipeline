@@ -2946,6 +2946,8 @@ function App() {
   const [aiCsvStatus, setAiCsvStatus]           = useState(null);
   // Submit via Anthropic Batch API for 50% cost discount (async).
   const [aiCsvUseBatch, setAiCsvUseBatch]       = useState(false);
+  // Ref to the live EventSource so we can close it on demand.
+  const aiCsvStreamRef = useRef(null);
 
   const [showAIImport, setShowAIImport] = useState(false);
   const [aiImportUrl, setAiImportUrl] = useState('');
@@ -2998,13 +3000,19 @@ function App() {
         return;
       }
       setAiCsvStatus({ running: true, message: aiCsvUseBatch ? 'Submitting batch to Anthropic...' : 'Starting AI scoring...', progress: 0, total: 0, scored_ai: 0, scored_fallback: 0, estimated_cost: 0, mode: aiCsvUseBatch ? 'batch' : 'live' });
-      // Batch mode polls less frequently since updates only happen every 30s on the server side
-      const interval = aiCsvUseBatch ? 5000 : 1500;
-      const poll = setInterval(() =>
-        fetch('/api/ai-import-status').then(r => r.json()).then(s => {
+      // Subscribe via Server-Sent Events — no polling needed.
+      // EventSource auto-reconnects on network hiccups, and the
+      // server closes the stream when the import finishes.
+      if (aiCsvStreamRef.current) aiCsvStreamRef.current.close();
+      const es = new EventSource('/api/ai-import-stream');
+      es.onmessage = (e) => {
+        try {
+          const s = JSON.parse(e.data);
           setAiCsvStatus(s);
-          if (!s.running) clearInterval(poll);
-        }), interval);
+          if (!s.running) { es.close(); aiCsvStreamRef.current = null; }
+        } catch (_) {}
+      };
+      aiCsvStreamRef.current = es;
     });
   }, [aiCsvFile, aiCsvLocation, aiCsvUseBatch]);
 
@@ -3100,15 +3108,34 @@ function App() {
     }
   }, [liveCheckBatch]);
 
-  // Load jobs + batch stats from API on mount
+  // Load jobs + batch stats from API on mount.
+  // Also checks whether an AI import is already running (e.g. after a
+  // page refresh) and reattaches the SSE stream automatically.
   useEffect(() => {
     if (!IS_SERVED) return;
     Promise.all([
       fetch('/api/jobs-data').then(r => r.json()),
       fetch('/api/batch-stats').then(r => r.json()),
-    ]).then(([apiJobs, apiStats]) => {
+      fetch('/api/ai-import-status').then(r => r.json()).catch(() => null),
+    ]).then(([apiJobs, apiStats, aiStatus]) => {
       setJobs(initJobsFromApi(Array.isArray(apiJobs) ? apiJobs : []));
       setBatchStats(Array.isArray(apiStats) ? apiStats : []);
+      if (aiStatus) {
+        setAiCsvStatus(aiStatus);
+        // If an import was running before the page loaded, reattach SSE
+        // so the UI picks up where it left off without manual polling.
+        if (aiStatus.running) {
+          const es = new EventSource('/api/ai-import-stream');
+          es.onmessage = (e) => {
+            try {
+              const s = JSON.parse(e.data);
+              setAiCsvStatus(s);
+              if (!s.running) { es.close(); aiCsvStreamRef.current = null; }
+            } catch (_) {}
+          };
+          aiCsvStreamRef.current = es;
+        }
+      }
       setLoaded(true);
     }).catch(() => setLoaded(true));
   }, []);

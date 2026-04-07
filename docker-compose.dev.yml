@@ -29,6 +29,10 @@ services:
     build: .
     ports:
       - "8080:8080"
+    # Loads ANTHROPIC_API_KEY from .env (gitignored, dev only).
+    # Prod uses AWS SSM /job-search/anthropic-api-key — unaffected.
+    env_file:
+      - .env
     environment:
       DB_HOST: db
       DB_NAME: jobsearch
@@ -44,15 +48,7 @@ services:
       - ./process_new_postings.py:/app/process_new_postings.py
       - ./scrape_careers_page.py:/app/scrape_careers_page.py
       - ./config.json:/app/config.json:ro
-    command: >
-      bash -c "
-        pip install -q watchdog[watchmedo] &&
-        watchmedo auto-restart
-          --directory=/app/dashboard --directory=/app/db
-          --patterns='*.py'
-          --recursive
-          -- python3 dashboard/server.py
-      "
+    command: ["bash", "-c", "test -f /app/config.json || cp /app/config.example.json /app/config.json; pip install -q 'watchdog[watchmedo]' && watchmedo auto-restart --directory=/app/dashboard --directory=/app/db --patterns='*.py' --recursive -- python3 dashboard/server.py"]
 
 volumes:
   pgdata_dev:

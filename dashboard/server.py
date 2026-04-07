@@ -2511,6 +2511,42 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 _json_response(self, dict(_ai_import_status))
             return
 
+        # ── /api/ai-import-stream (Server-Sent Events) ───
+        # Holds the connection open and pushes status frames as the AI
+        # import progresses.  The browser's EventSource API auto-
+        # reconnects on page refresh, so callers don't need separate
+        # polling after a reload.
+        if self.path == "/api/ai-import-stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            # Tell nginx / AWS ALB not to buffer the stream.
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            try:
+                last_json = None
+                while True:
+                    with _ai_import_lock:
+                        snap = dict(_ai_import_status)
+                    snap_json = json.dumps(snap)
+                    if snap_json != last_json:
+                        frame = f"data: {snap_json}\n\n"
+                        self.wfile.write(frame.encode())
+                        self.wfile.flush()
+                        last_json = snap_json
+                    else:
+                        # Heartbeat keeps nginx / load-balancers from
+                        # closing an idle connection (SSE comment line).
+                        self.wfile.write(b": heartbeat\n\n")
+                        self.wfile.flush()
+                    if not snap.get("running"):
+                        break   # import done — client handles reconnect
+                    time.sleep(1)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # client disconnected, nothing to do
+            return
+
         # ── /api/refresh-job/<id> ────────────────────────
         if self.path.startswith("/api/refresh-job/"):
             job_id = self.path[len("/api/refresh-job/"):].strip()
