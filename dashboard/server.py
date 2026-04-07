@@ -878,7 +878,10 @@ def _extract_pdf_text(pdf_path):
 # ─────────────────────────────────────────────────────────
 
 AI_SCORING_MODEL = "claude-haiku-4-5-20251001"
-AI_SCORING_COST_PER_JOB = 0.0028  # Haiku 4.5: $1/MTok input, $5/MTok output
+# Haiku 4.5: $1/MTok input, $5/MTok output. With prompt caching on
+# the system prompt and trimmed descriptions (~2500 chars), avg call:
+# ~700 input tokens + ~150 output tokens = ~$0.0017/job amortized.
+AI_SCORING_COST_PER_JOB = 0.0017
 
 
 def _build_scoring_system_prompt():
@@ -928,13 +931,16 @@ def _score_job_with_haiku(job, system_prompt):
     On failure: {used_ai: False, error: str}
     """
     try:
+        # Strip boilerplate (About Us, Benefits, EEO, etc.) and cap
+        # at 2500 chars. Cuts ~60% of input tokens vs full description.
+        relevant_desc = _extract_relevant_description(
+            job.get('description', ''), max_chars=2500
+        )
         user_message = (
-            f"Score this job posting.\n\n"
+            f"Score this job posting. Reasoning: 2 sentences max.\n\n"
             f"Company: {job.get('company', '')}\n"
-            f"Title: {job.get('title', '')}\n"
-            f"Location: {job.get('location', '')}\n"
-            f"Salary: {job.get('salary', 'N/A')}\n\n"
-            f"JOB DESCRIPTION:\n{job.get('description', '')[:6000]}"
+            f"Title: {job.get('title', '')}\n\n"
+            f"DESCRIPTION (relevant excerpt):\n{relevant_desc}"
         )
         raw = _call_claude(
             system_prompt,
