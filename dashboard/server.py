@@ -2517,6 +2517,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         # reconnects on page refresh, so callers don't need separate
         # polling after a reload.
         if self.path == "/api/ai-import-stream":
+            # Force socket close after the stream ends so the connection
+            # is not reused (HTTP keep-alive would leave it half-open).
+            self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
