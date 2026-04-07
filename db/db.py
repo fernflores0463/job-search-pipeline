@@ -46,7 +46,7 @@ def _load_credentials():
     }
 
 
-def init_pool(minconn=1, maxconn=5):
+def init_pool(minconn=1, maxconn=10):
     """Initialize the connection pool. Call once at server startup."""
     global _connection_pool
     if _connection_pool is not None:

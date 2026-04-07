@@ -157,29 +157,14 @@ _scrape_status = {"running": False, "progress": 0, "total": 0, "added": 0, "mess
 _import_lock = threading.Lock()
 _import_status = {"running": False, "progress": 0, "total": 0, "added": 0, "message": "", "jobs_found": []}
 
-_ai_import_lock = threading.Lock()
-_ai_import_status = {
-    "running": False, "progress": 0, "total": 0, "added": 0,
-    "scored_ai": 0, "scored_fallback": 0,
-    "estimated_cost": 0.0, "message": "", "jobs_found": [],
-    "stopped": False,
-    # AI-vs-regex comparison counters (only counted on AI-scored jobs):
-    #   regex_agree    = AI tier matches regex tier
-    #   ai_promoted    = AI tier > regex tier (AI is more bullish)
-    #   ai_demoted     = AI tier < regex tier (AI is less bullish)
-    "regex_agree": 0, "ai_promoted": 0, "ai_demoted": 0,
-    # Most recent fallback error string (truncated to 240 chars). Used
-    # by the UI to surface why jobs are falling back without needing to
-    # SSH into the container. Cleared at the start of each new run.
-    "last_error": "",
-    # Mode and batch-API state. mode is "live" or "batch".
-    # batch_id is set only when mode == "batch".
-    "mode": "live",
-    "batch_id": None,
-    "batch_processing_status": None,
-    "batch_request_counts": None,
-}
-_ai_import_stop_event = threading.Event()
+# Per-import state keyed by batch UUID. Replaces the old singleton.
+# Each value has the same keys as the old _ai_import_status plus
+# 'id', 'status', 'mode', 'import_date', 'location'.
+_ai_imports_lock = threading.RLock()
+_ai_imports: dict = {}                    # batch_uuid -> status dict
+_ai_import_stop_events: dict = {}         # batch_uuid -> threading.Event
+_ai_live_import_running = False           # single-runner guard for live mode
+
 
 _live_check_lock = threading.Lock()
 _live_check_status = {"running": False, "progress": 0, "total": 0, "closed": 0, "live": 0, "inconclusive": 0, "auto_updated": 0, "message": ""}
@@ -192,6 +177,137 @@ _company_cache_lock = threading.Lock()
 # ─────────────────────────────────────────────────────────
 # DATABASE HELPERS
 # ─────────────────────────────────────────────────────────
+
+# ── import_batches helpers ─────────────────────────────────
+
+def _build_batch_label(mode, location, short_id):
+    """Build a unique import_date label for a new import batch."""
+    import datetime
+    base = datetime.date.today().isoformat()
+    suffix = f" \u2014 {location} (AI{' batch' if mode == 'batch' else ''})" if location \
+             else f" \u2014 AI{' batch' if mode == 'batch' else ''}"
+    return f"{base}{suffix} #{short_id}"
+
+
+def _new_import_row(mode, location, csv_filename=None):
+    """Insert a fresh import_batches row; return (batch_uuid, import_date label)."""
+    batch_uuid = str(uuid.uuid4())
+    short_id = batch_uuid.replace("-", "")[:6]
+    label = _build_batch_label(mode, location, short_id)
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO import_batches
+                    (id, import_date, mode, status, location, csv_filename, message)
+                VALUES (%s, %s, %s, 'queued', %s, %s, 'Queued')
+            """, (batch_uuid, label, mode, location, csv_filename))
+    except Exception as e:
+        print(f"Warning: could not insert import_batches row: {e}")
+    return batch_uuid, label
+
+
+_IMPORT_BATCH_COLS = {
+    "status", "anthropic_batch_id", "batch_processing_status",
+    "total", "progress", "added", "scored_ai", "scored_fallback",
+    "regex_agree", "ai_promoted", "ai_demoted", "estimated_cost",
+    "request_counts", "pending_jobs", "message", "last_error",
+    "stopped", "finished_at", "started_at",
+}
+
+
+def _update_import_row(batch_uuid, **fields):
+    """Patch-update an import_batches row with whitelisted fields."""
+    kv = {k: v for k, v in fields.items() if k in _IMPORT_BATCH_COLS}
+    if not kv:
+        return
+    sets = []
+    vals = []
+    for k, v in kv.items():
+        sets.append(f"{k} = %s")
+        if k in ("request_counts", "pending_jobs") and v is not None and not isinstance(v, str):
+            vals.append(json.dumps(v))
+        else:
+            vals.append(v)
+    vals.append(batch_uuid)
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"UPDATE import_batches SET {', '.join(sets)}, updated_at = NOW() WHERE id = %s",
+                vals,
+            )
+    except Exception as e:
+        print(f"Warning: _update_import_row failed for {batch_uuid}: {e}")
+
+
+def _mem_update(batch_uuid, patch):
+    """Atomically patch the in-memory import status dict."""
+    with _ai_imports_lock:
+        s = _ai_imports.get(batch_uuid)
+        if s is not None:
+            s.update(patch)
+
+
+def _flush_import_progress(batch_uuid):
+    """Copy current in-memory state to the DB row (all fields at once)."""
+    with _ai_imports_lock:
+        s = dict(_ai_imports.get(batch_uuid) or {})
+    if not s:
+        return
+    _update_import_row(
+        batch_uuid,
+        status=s.get("status", "running"),
+        anthropic_batch_id=s.get("batch_id"),
+        batch_processing_status=s.get("batch_processing_status"),
+        total=s.get("total") or 0,
+        progress=s.get("progress") or 0,
+        added=s.get("added") or 0,
+        scored_ai=s.get("scored_ai") or 0,
+        scored_fallback=s.get("scored_fallback") or 0,
+        regex_agree=s.get("regex_agree") or 0,
+        ai_promoted=s.get("ai_promoted") or 0,
+        ai_demoted=s.get("ai_demoted") or 0,
+        estimated_cost=s.get("estimated_cost") or 0,
+        request_counts=s.get("batch_request_counts"),
+        message=s.get("message"),
+        last_error=s.get("last_error"),
+        stopped=bool(s.get("stopped")),
+    )
+
+
+
+def _import_row_to_dict(row, desc):
+    """Convert a DB cursor row to a serialisable dict.
+
+    Merges fresher in-memory state for any import that is currently
+    tracked in _ai_imports (i.e. still active in this process).
+    """
+    keys = [c[0] for c in desc]
+    d = {}
+    for k, v in zip(keys, row):
+        if hasattr(v, "isoformat"):
+            d[k] = v.isoformat()
+        else:
+            d[k] = v
+    d["id"] = str(d.get("id", ""))
+    # Merge fresher in-memory progress fields
+    with _ai_imports_lock:
+        mem = dict(_ai_imports.get(d["id"]) or {})
+    if mem:
+        for dst, src in [
+            ("status", "status"), ("progress", "progress"), ("total", "total"),
+            ("added", "added"), ("scored_ai", "scored_ai"),
+            ("scored_fallback", "scored_fallback"),
+            ("estimated_cost", "estimated_cost"),
+            ("message", "message"), ("last_error", "last_error"),
+            ("batch_processing_status", "batch_processing_status"),
+        ]:
+            val = mem.get(src)
+            if val is not None:
+                d[dst] = val
+    return d
+
 
 def _to_uuid(val):
     """Convert any string to a valid UUID — uses uuid5 for non-UUID strings."""
@@ -1444,15 +1560,16 @@ def _run_import_csv(csv_bytes, location):
             _import_status.update({"running": False, "message": f"Error: {str(e)}"})
 
 
-def _run_import_csv_ai(csv_bytes, location):
+def _run_import_csv_ai(batch_uuid, csv_bytes, location):
     """Background thread: parse CSV and import new jobs using
-    Claude Haiku for scoring. Parallel to _run_import_csv() \u2014 does
-    not modify the existing regex import path."""
+    Claude Haiku for scoring (live mode). Single-runner — the POST
+    handler sets _ai_live_import_running before spawning this thread."""
+    global _ai_live_import_running
+    stop_event = _ai_import_stop_events.get(batch_uuid, threading.Event())
     try:
         import csv as _csv
         import io
         from concurrent.futures import ThreadPoolExecutor
-        from datetime import date as _date
         from process_new_postings import (
             is_excluded_company, is_excluded_description,
             is_excluded_title, is_excluded_role, is_swe_role,
@@ -1461,20 +1578,17 @@ def _run_import_csv_ai(csv_bytes, location):
             customize_skills, generate_resume_txt,
         )
 
-        # Reset stop event at the start of each run
-        _ai_import_stop_event.clear()
-
-        with _ai_import_lock:
-            _ai_import_status.update({
-                "running": True, "progress": 0, "total": 0,
-                "added": 0, "scored_ai": 0, "scored_fallback": 0,
-                "estimated_cost": 0.0, "stopped": False,
-                "regex_agree": 0, "ai_promoted": 0, "ai_demoted": 0,
-                "last_error": "", "mode": "live",
-                "batch_id": None, "batch_processing_status": None,
-                "batch_request_counts": None,
-                "message": "Parsing CSV\u2026", "jobs_found": [],
-            })
+        _mem_update(batch_uuid, {
+            "running": True, "status": "running", "progress": 0, "total": 0,
+            "added": 0, "scored_ai": 0, "scored_fallback": 0,
+            "estimated_cost": 0.0, "stopped": False,
+            "regex_agree": 0, "ai_promoted": 0, "ai_demoted": 0,
+            "last_error": "", "mode": "live",
+            "batch_id": None, "batch_processing_status": None,
+            "batch_request_counts": None,
+            "message": "Parsing CSV\u2026", "jobs_found": [],
+        })
+        _update_import_row(batch_uuid, status="running", started_at="NOW()")
 
         text = csv_bytes.decode("utf-8-sig")
         rows = list(_csv.DictReader(io.StringIO(text)))
@@ -1482,14 +1596,11 @@ def _run_import_csv_ai(csv_bytes, location):
         if not location and rows:
             location = (rows[0].get("Search Location") or "").strip() or None
 
-        # Distinguishable batch label so AI imports show separately
-        batch_label = _date.today().isoformat()
-        if location:
-            batch_label += f" \u2014 {location} (AI)"
-        else:
-            batch_label += " \u2014 AI"
+        # Fetch import_date label from the pre-inserted row
+        with _ai_imports_lock:
+            batch_label = _ai_imports[batch_uuid]["import_date"]
 
-        # Filter (same logic as existing import)
+        # Filter (same logic as regex import)
         seen, filtered = set(), []
         for r in rows:
             company = (r.get("Company") or "").strip()
@@ -1511,8 +1622,7 @@ def _run_import_csv_ai(csv_bytes, location):
                 continue
             filtered.append({
                 "id": make_job_id(company, title, link),
-                "company": company,
-                "title": title,
+                "company": company, "title": title,
                 "location": (r.get("Location") or "").strip(),
                 "work_type": (r.get("Work Type") or "").strip(),
                 "salary": (r.get("Salary") or "N/A").strip(),
@@ -1523,64 +1633,46 @@ def _run_import_csv_ai(csv_bytes, location):
                 "apply_link": (r.get("Application Link") or "").strip(),
             })
 
-        with _ai_import_lock:
-            _ai_import_status["total"] = len(filtered)
-            _ai_import_status["message"] = (
-                f"Found {len(filtered)} qualifying jobs. Checking DB\u2026"
-            )
+        _mem_update(batch_uuid, {
+            "total": len(filtered),
+            "message": f"Found {len(filtered)} qualifying jobs. Checking DB\u2026",
+        })
+        _flush_import_progress(batch_uuid)
 
         if not filtered:
-            with _ai_import_lock:
-                _ai_import_status.update({
-                    "running": False,
-                    "message": "No qualifying SWE jobs found in CSV.",
-                })
+            _mem_update(batch_uuid, {"running": False, "status": "completed",
+                                     "message": "No qualifying SWE jobs found in CSV."})
+            _flush_import_progress(batch_uuid)
             return
 
-        # Dedup against existing DB
         with Db() as conn:
             cur = conn.cursor()
-            cur.execute(
-                "SELECT job_link FROM jobs WHERE job_link IS NOT NULL"
-            )
+            cur.execute("SELECT job_link FROM jobs WHERE job_link IS NOT NULL")
             existing = {row[0] for row in cur.fetchall()}
 
         new_jobs = [j for j in filtered if j["job_link"] not in existing]
 
-        with _ai_import_lock:
-            _ai_import_status["total"] = len(new_jobs)
-            _ai_import_status["message"] = (
-                f"Scoring {len(new_jobs)} new jobs with Claude Haiku\u2026"
-            )
+        _mem_update(batch_uuid, {
+            "total": len(new_jobs),
+            "message": f"Scoring {len(new_jobs)} new jobs with Claude Haiku\u2026",
+        })
+        _flush_import_progress(batch_uuid)
 
         if not new_jobs:
-            with _ai_import_lock:
-                _ai_import_status.update({
-                    "running": False,
-                    "message": "No new jobs to import "
-                    "(all dedupped against existing).",
-                })
+            _mem_update(batch_uuid, {"running": False, "status": "completed",
+                                     "message": "No new jobs to import (all dedupped)."})
+            _flush_import_progress(batch_uuid)
             return
 
-        # Build system prompt once — reused across all calls, cached
         system_prompt = _build_scoring_system_prompt()
 
-        # Helper: compute regex score for a job (free, local, fast).
-        # Used for both fallback scoring AND for the AI-vs-regex
-        # comparison view shown in the dashboard.
         def _compute_regex_score(job):
             dl = job["description"].lower()
             tl = job["title"].lower()
-            return (
-                calc_tech_score(dl)
-                + calc_level_bonus(tl)
-                + calc_company_bonus(job["company"])
-            )
+            return calc_tech_score(dl) + calc_level_bonus(tl) + calc_company_bonus(job["company"])
 
-        # Tier rank for AI-vs-regex agreement comparison
         _TIER_RANK = {"Weak Match": 0, "Match": 1, "Strong Match": 2}
 
-        # Helper: regex-fallback scoring shared by stop and error paths
         def _regex_fallback(job):
             regex_score = _compute_regex_score(job)
             job["score"] = regex_score
@@ -1588,80 +1680,66 @@ def _run_import_csv_ai(csv_bytes, location):
             job["tier"] = assign_tier(regex_score)
             job["ai_reasoning"] = None
 
-        # Score in parallel (5 workers — conservative for rate limits)
         def score_one(job):
-            # If stop was requested, skip the API call entirely and
-            # use regex fallback for fast finish
-            if _ai_import_stop_event.is_set():
+            if stop_event.is_set():
                 _regex_fallback(job)
-                with _ai_import_lock:
-                    _ai_import_status["scored_fallback"] += 1
-                    _ai_import_status["progress"] += 1
+                with _ai_imports_lock:
+                    s = _ai_imports.get(batch_uuid, {})
+                    s["scored_fallback"] = s.get("scored_fallback", 0) + 1
+                    s["progress"] = s.get("progress", 0) + 1
                 return job
 
             result = _score_job_with_haiku(job, system_prompt)
             if result.get("used_ai"):
-                # Use the legacy 0-24 scale so AI and regex jobs are
-                # comparable. Tier derived from the same scale via
-                # assign_tier (uses config.json thresholds).
                 job["score"] = result["legacy_score"]
                 job["tier"] = assign_tier(result["legacy_score"])
                 job["ai_reasoning"] = result["reasoning"]
-                # Compute the regex score in parallel for comparison.
-                # Free + local — no extra API cost.
                 job["regex_score"] = _compute_regex_score(job)
                 regex_tier = assign_tier(job["regex_score"])
                 ai_rank = _TIER_RANK.get(job["tier"], 1)
                 rx_rank = _TIER_RANK.get(regex_tier, 1)
-                with _ai_import_lock:
-                    _ai_import_status["scored_ai"] += 1
-                    _ai_import_status["estimated_cost"] += (
-                        AI_SCORING_COST_PER_JOB
-                    )
+                with _ai_imports_lock:
+                    s = _ai_imports.get(batch_uuid, {})
+                    s["scored_ai"] = s.get("scored_ai", 0) + 1
+                    s["estimated_cost"] = s.get("estimated_cost", 0.0) + AI_SCORING_COST_PER_JOB
                     if ai_rank == rx_rank:
-                        _ai_import_status["regex_agree"] += 1
+                        s["regex_agree"] = s.get("regex_agree", 0) + 1
                     elif ai_rank > rx_rank:
-                        _ai_import_status["ai_promoted"] += 1
+                        s["ai_promoted"] = s.get("ai_promoted", 0) + 1
                     else:
-                        _ai_import_status["ai_demoted"] += 1
+                        s["ai_demoted"] = s.get("ai_demoted", 0) + 1
             else:
                 _regex_fallback(job)
                 err = (result.get("error") or "")[:240]
-                with _ai_import_lock:
-                    _ai_import_status["scored_fallback"] += 1
+                with _ai_imports_lock:
+                    s = _ai_imports.get(batch_uuid, {})
+                    s["scored_fallback"] = s.get("scored_fallback", 0) + 1
                     if err:
-                        _ai_import_status["last_error"] = err
-            with _ai_import_lock:
-                _ai_import_status["progress"] += 1
-                s = _ai_import_status
-                _ai_import_status["message"] = (
-                    f"AI scoring: {s['progress']}/{s['total']} "
-                    f"({s['scored_ai']} AI, "
-                    f"{s['scored_fallback']} fallback, "
-                    f"~${s['estimated_cost']:.3f})"
-                )
-            return job
+                        s["last_error"] = err
 
-        # 2 workers keeps us under Anthropic Tier 1 ITPM (50K/min)
-        # with ~2,200 input tokens/call. Was 5 — caused 27-50% 429
-        # fallbacks. Bump back to 5 once on Tier 2.
+            with _ai_imports_lock:
+                s = _ai_imports.get(batch_uuid, {})
+                s["progress"] = s.get("progress", 0) + 1
+                s["message"] = (
+                    f"AI scoring: {s['progress']}/{s.get('total', 0)} "
+                    f"({s.get('scored_ai', 0)} AI, "
+                    f"{s.get('scored_fallback', 0)} fallback, "
+                    f"~${s.get('estimated_cost', 0.0):.3f})"
+                )
+                return job
+
+        # 2 workers stays under Anthropic Tier 1 ITPM (50K/min)
         with ThreadPoolExecutor(max_workers=2) as executor:
             scored_jobs = list(executor.map(score_one, new_jobs))
 
-        with _ai_import_lock:
-            _ai_import_status["message"] = (
-                f"Inserting {len(scored_jobs)} jobs into DB\u2026"
-            )
+        _mem_update(batch_uuid, {"message": f"Inserting {len(scored_jobs)} jobs into DB\u2026"})
 
-        # Insert — same pattern as _run_import_csv but with ai_reasoning
         with Db() as conn:
             cur = conn.cursor()
-            for i, j in enumerate(scored_jobs):
+            for j in scored_jobs:
                 bullets = pick_bullets(j["description"], j["title"])
                 langs, frameworks, misc = customize_skills(j["description"])
-                resume_text = generate_resume_txt(
-                    j, bullets, langs, frameworks, misc
-                )
+                resume_text = generate_resume_txt(j, bullets, langs, frameworks, misc)
                 cur.execute("""
                     INSERT INTO jobs
                         (id, company, title, location, work_type, salary,
@@ -1678,63 +1756,63 @@ def _run_import_csv_ai(csv_bytes, location):
                     resume_text, j.get("ai_reasoning"), j.get("regex_score"),
                 ))
                 cur.execute(
-                    "INSERT INTO job_state (job_id) VALUES (%s) "
-                    "ON CONFLICT DO NOTHING",
+                    "INSERT INTO job_state (job_id) VALUES (%s) ON CONFLICT DO NOTHING",
                     (j["id"],)
                 )
 
         tiers = {}
         for j in scored_jobs:
             tiers.setdefault(j["tier"], []).append(j["title"])
-        summary = ", ".join(
-            f"{t}: {len(v)}" for t, v in sorted(tiers.items())
-        )
-        was_stopped = _ai_import_stop_event.is_set()
-        with _ai_import_lock:
-            _ai_import_status.update({
-                "running": False,
-                "added": len(scored_jobs),
-                "stopped": was_stopped,
+        summary = ", ".join(f"{t}: {len(v)}" for t, v in sorted(tiers.items()))
+        was_stopped = stop_event.is_set()
+
+        with _ai_imports_lock:
+            s = _ai_imports.get(batch_uuid, {})
+            s.update({
+                "running": False, "status": "completed" if not was_stopped else "canceled",
+                "added": len(scored_jobs), "stopped": was_stopped,
                 "message": (
                     ("Stopped early. " if was_stopped else "Done! ")
                     + f"{len(scored_jobs)} inserted "
-                    f"({_ai_import_status['scored_ai']} AI, "
-                    f"{_ai_import_status['scored_fallback']} fallback), "
-                    f"cost ~${_ai_import_status['estimated_cost']:.3f}. "
-                    f"{summary}."
+                    f"({s.get('scored_ai', 0)} AI, "
+                    f"{s.get('scored_fallback', 0)} fallback), "
+                    f"cost ~${s.get('estimated_cost', 0.0):.3f}. {summary}."
                 ),
                 "jobs_found": [
                     {"title": j["title"], "tier": j["tier"],
                      "score": j["score"], "location": j["location"]}
-                    for j in sorted(
-                        scored_jobs, key=lambda x: -x["score"]
-                    )[:20]
+                    for j in sorted(scored_jobs, key=lambda x: -x["score"])[:20]
                 ],
             })
+        _flush_import_progress(batch_uuid)
+        _update_import_row(batch_uuid, finished_at="NOW()", added=len(scored_jobs))
 
     except Exception as e:
-        with _ai_import_lock:
-            _ai_import_status.update(
-                {"running": False, "message": f"Error: {str(e)}"}
-            )
+        _mem_update(batch_uuid, {"running": False, "status": "failed",
+                                 "message": f"Error: {str(e)}", "last_error": str(e)[:240]})
+        _flush_import_progress(batch_uuid)
+        _update_import_row(batch_uuid, finished_at="NOW()")
+    finally:
+        with _ai_imports_lock:
+            global _ai_live_import_running
+            _ai_live_import_running = False
 
 
 # ─────────────────────────────────────────────────────────
 # BATCH MODE — same import flow but uses Anthropic Batches
 # ─────────────────────────────────────────────────────────
 
-def _run_import_csv_ai_batch(csv_bytes, location):
-    """Background thread: parse CSV, submit a single Batch API job to
-    Anthropic, poll until complete, retrieve results, then insert.
+def _run_import_csv_ai_batch(batch_uuid, csv_bytes, location):
+    """Background thread: parse CSV, submit to Anthropic Batch API,
+    poll until complete, retrieve results, then insert.
 
     Trades ~50% lower cost for async processing (minutes to hours).
-    Reuses _ai_import_status (with mode="batch") so the existing UI
-    polling continues to work.
+    Concurrent — the POST handler allows multiple batch imports at once.
     """
+    stop_event = _ai_import_stop_events.get(batch_uuid, threading.Event())
     try:
         import csv as _csv
         import io
-        from datetime import date as _date
         from process_new_postings import (
             is_excluded_company, is_excluded_description,
             is_excluded_title, is_excluded_role, is_swe_role,
@@ -1743,19 +1821,17 @@ def _run_import_csv_ai_batch(csv_bytes, location):
             customize_skills, generate_resume_txt,
         )
 
-        _ai_import_stop_event.clear()
-
-        with _ai_import_lock:
-            _ai_import_status.update({
-                "running": True, "progress": 0, "total": 0,
-                "added": 0, "scored_ai": 0, "scored_fallback": 0,
-                "estimated_cost": 0.0, "stopped": False,
-                "regex_agree": 0, "ai_promoted": 0, "ai_demoted": 0,
-                "last_error": "", "mode": "batch",
-                "batch_id": None, "batch_processing_status": None,
-                "batch_request_counts": None,
-                "message": "Parsing CSV\u2026", "jobs_found": [],
-            })
+        _mem_update(batch_uuid, {
+            "running": True, "status": "running", "progress": 0, "total": 0,
+            "added": 0, "scored_ai": 0, "scored_fallback": 0,
+            "estimated_cost": 0.0, "stopped": False,
+            "regex_agree": 0, "ai_promoted": 0, "ai_demoted": 0,
+            "last_error": "", "mode": "batch",
+            "batch_id": None, "batch_processing_status": None,
+            "batch_request_counts": None,
+            "message": "Parsing CSV\u2026", "jobs_found": [],
+        })
+        _update_import_row(batch_uuid, status="running", started_at="NOW()")
 
         text = csv_bytes.decode("utf-8-sig")
         rows = list(_csv.DictReader(io.StringIO(text)))
@@ -1763,13 +1839,9 @@ def _run_import_csv_ai_batch(csv_bytes, location):
         if not location and rows:
             location = (rows[0].get("Search Location") or "").strip() or None
 
-        batch_label = _date.today().isoformat()
-        if location:
-            batch_label += f" \u2014 {location} (AI batch)"
-        else:
-            batch_label += " \u2014 AI batch"
+        with _ai_imports_lock:
+            batch_label = _ai_imports[batch_uuid]["import_date"]
 
-        # Same filter pass as live mode
         seen, filtered = set(), []
         for r in rows:
             company = (r.get("Company") or "").strip()
@@ -1791,8 +1863,7 @@ def _run_import_csv_ai_batch(csv_bytes, location):
                 continue
             filtered.append({
                 "id": make_job_id(company, title, link),
-                "company": company,
-                "title": title,
+                "company": company, "title": title,
                 "location": (r.get("Location") or "").strip(),
                 "work_type": (r.get("Work Type") or "").strip(),
                 "salary": (r.get("Salary") or "N/A").strip(),
@@ -1803,91 +1874,96 @@ def _run_import_csv_ai_batch(csv_bytes, location):
                 "apply_link": (r.get("Application Link") or "").strip(),
             })
 
-        with _ai_import_lock:
-            _ai_import_status["total"] = len(filtered)
-            _ai_import_status["message"] = (
-                f"Found {len(filtered)} qualifying jobs. Checking DB\u2026"
-            )
+        _mem_update(batch_uuid, {
+            "total": len(filtered),
+            "message": f"Found {len(filtered)} qualifying jobs. Checking DB\u2026",
+        })
+        _flush_import_progress(batch_uuid)
 
         if not filtered:
-            with _ai_import_lock:
-                _ai_import_status.update({
-                    "running": False,
-                    "message": "No qualifying SWE jobs found in CSV.",
-                })
+            _mem_update(batch_uuid, {"running": False, "status": "completed",
+                                     "message": "No qualifying SWE jobs found in CSV."})
+            _flush_import_progress(batch_uuid)
+            _update_import_row(batch_uuid, finished_at="NOW()")
             return
 
-        # Dedup against existing
         with Db() as conn:
             cur = conn.cursor()
-            cur.execute(
-                "SELECT job_link FROM jobs WHERE job_link IS NOT NULL"
-            )
+            cur.execute("SELECT job_link FROM jobs WHERE job_link IS NOT NULL")
             existing = {row[0] for row in cur.fetchall()}
+
         new_jobs = [j for j in filtered if j["job_link"] not in existing]
-        # Keep an index from custom_id (job id) to job dict
         job_by_id = {j["id"]: j for j in new_jobs}
 
-        with _ai_import_lock:
-            _ai_import_status["total"] = len(new_jobs)
-            _ai_import_status["message"] = (
-                f"Submitting batch of {len(new_jobs)} jobs to Anthropic\u2026"
-            )
+        _mem_update(batch_uuid, {
+            "total": len(new_jobs),
+            "message": f"Submitting batch of {len(new_jobs)} jobs to Anthropic\u2026",
+        })
+        _flush_import_progress(batch_uuid)
 
         if not new_jobs:
-            with _ai_import_lock:
-                _ai_import_status.update({
-                    "running": False,
-                    "message": "No new jobs to import "
-                    "(all dedupped against existing).",
-                })
+            _mem_update(batch_uuid, {"running": False, "status": "completed",
+                                     "message": "No new jobs to import (all dedupped)."})
+            _flush_import_progress(batch_uuid)
+            _update_import_row(batch_uuid, finished_at="NOW()")
             return
 
+        # Persist pending_jobs so restart recovery can rebuild job_by_id
+        _update_import_row(batch_uuid, pending_jobs=new_jobs)
+
         system_prompt = _build_scoring_system_prompt()
-        requests = [
-            _build_batch_request(j["id"], system_prompt, j)
-            for j in new_jobs
-        ]
-        batch = _create_anthropic_batch(requests)
+        batch_requests = [_build_batch_request(j["id"], system_prompt, j) for j in new_jobs]
 
-        with _ai_import_lock:
-            _ai_import_status["batch_id"] = batch.id
-            _ai_import_status["batch_processing_status"] = (
-                getattr(batch, "processing_status", "in_progress")
-            )
-            _ai_import_status["message"] = (
-                f"Batch {batch.id[:8]}\u2026 submitted. "
-                f"Polling every 30s."
-            )
+        try:
+            batch = _create_anthropic_batch(batch_requests)
+        except Exception as e:
+            _mem_update(batch_uuid, {"running": False, "status": "failed",
+                                     "message": f"Batch submission failed: {str(e)[:200]}",
+                                     "last_error": str(e)[:240]})
+            _flush_import_progress(batch_uuid)
+            _update_import_row(batch_uuid, finished_at="NOW()", pending_jobs=None)
+            return
 
-        # Poll until done. The status endpoint reflects this state, so
-        # the user can keep the dashboard open and watch progress.
+        _mem_update(batch_uuid, {
+            "batch_id": batch.id,
+            "batch_processing_status": getattr(batch, "processing_status", "in_progress"),
+            "message": f"Batch {batch.id[:8]}\u2026 submitted. Polling every 30s.",
+        })
+        _update_import_row(batch_uuid, anthropic_batch_id=batch.id,
+                           batch_processing_status=getattr(batch, "processing_status", "in_progress"))
+        _flush_import_progress(batch_uuid)
+
+        # Poll until ended
         poll_interval = 30
+        consecutive_errors = 0
         while True:
-            if _ai_import_stop_event.is_set():
-                # User requested stop. We don't cancel the Anthropic
-                # batch (it's already paid for) — just exit and let
-                # them retrieve results manually later if they want.
-                with _ai_import_lock:
-                    _ai_import_status.update({
-                        "running": False,
-                        "stopped": True,
-                        "message": (
-                            f"Stopped polling batch {batch.id[:8]}\u2026. "
-                            f"Results will still be available from "
-                            f"Anthropic when complete."
-                        ),
-                    })
+            if stop_event.is_set():
+                _mem_update(batch_uuid, {
+                    "running": False, "status": "canceled", "stopped": True,
+                    "message": (
+                        f"Stopped polling batch {batch.id[:8]}\u2026. "
+                        "Anthropic batch still running — results preserved."
+                    ),
+                })
+                _flush_import_progress(batch_uuid)
+                _update_import_row(batch_uuid, finished_at="NOW()")
                 return
 
             time.sleep(poll_interval)
             try:
                 batch = _get_anthropic_batch(batch.id)
+                consecutive_errors = 0
             except Exception as e:
-                with _ai_import_lock:
-                    _ai_import_status["last_error"] = (
-                        f"poll error: {str(e)[:200]}"
-                    )
+                consecutive_errors += 1
+                err = f"poll error: {str(e)[:200]}"
+                _mem_update(batch_uuid, {"last_error": err})
+                _flush_import_progress(batch_uuid)
+                if consecutive_errors >= 20:
+                    _mem_update(batch_uuid, {"running": False, "status": "failed",
+                                             "message": f"Polling failed 20 times: {err}"})
+                    _flush_import_progress(batch_uuid)
+                    _update_import_row(batch_uuid, finished_at="NOW()")
+                    return
                 continue
 
             counts = getattr(batch, "request_counts", None)
@@ -1900,96 +1976,73 @@ def _run_import_csv_ai_batch(csv_bytes, location):
                     "canceled": getattr(counts, "canceled", 0),
                     "expired": getattr(counts, "expired", 0),
                 }
-
-            with _ai_import_lock:
-                _ai_import_status["batch_processing_status"] = (
-                    batch.processing_status
-                )
-                _ai_import_status["batch_request_counts"] = counts_dict
+            with _ai_imports_lock:
+                s = _ai_imports.get(batch_uuid, {})
+                s["batch_processing_status"] = batch.processing_status
+                s["batch_request_counts"] = counts_dict
                 if counts_dict:
-                    finished = (
-                        counts_dict["succeeded"]
-                        + counts_dict["errored"]
-                        + counts_dict["canceled"]
-                        + counts_dict["expired"]
-                    )
-                    _ai_import_status["progress"] = finished
-                    _ai_import_status["message"] = (
-                        f"Batch {batch.id[:8]}\u2026 "
-                        f"{batch.processing_status} "
+                    finished = (counts_dict["succeeded"] + counts_dict["errored"]
+                                + counts_dict["canceled"] + counts_dict["expired"])
+                    s["progress"] = finished
+                    s["message"] = (
+                        f"Batch {batch.id[:8]}\u2026 {batch.processing_status} "
                         f"({finished}/{len(new_jobs)} processed)"
                     )
-
+            _flush_import_progress(batch_uuid)
+    
             if batch.processing_status == "ended":
                 break
 
-        # Retrieve and parse results
-        with _ai_import_lock:
-            _ai_import_status["message"] = (
-                f"Batch {batch.id[:8]}\u2026 ended. Retrieving results\u2026"
-            )
+        _mem_update(batch_uuid, {"message": f"Batch {batch.id[:8]}\u2026 ended. Retrieving results\u2026"})
 
         _TIER_RANK = {"Weak Match": 0, "Match": 1, "Strong Match": 2}
         scored_jobs = []
         for custom_id, result in _retrieve_anthropic_batch_results(batch.id):
             job = job_by_id.get(custom_id)
             if not job:
-                # Result for an unknown id — skip
                 continue
-            # Always compute regex baseline for the comparison column
             dl = job["description"].lower()
             tl = job["title"].lower()
-            regex_score = (
-                calc_tech_score(dl)
-                + calc_level_bonus(tl)
-                + calc_company_bonus(job["company"])
-            )
+            regex_score = (calc_tech_score(dl) + calc_level_bonus(tl)
+                           + calc_company_bonus(job["company"]))
             job["regex_score"] = regex_score
             regex_tier = assign_tier(regex_score)
-
             if result.get("used_ai"):
                 job["score"] = result["legacy_score"]
                 job["tier"] = assign_tier(result["legacy_score"])
                 job["ai_reasoning"] = result["reasoning"]
                 ai_rank = _TIER_RANK.get(job["tier"], 1)
                 rx_rank = _TIER_RANK.get(regex_tier, 1)
-                with _ai_import_lock:
-                    _ai_import_status["scored_ai"] += 1
-                    # Batch API: 50% discount applied
-                    _ai_import_status["estimated_cost"] += (
-                        AI_SCORING_COST_PER_JOB * 0.5
-                    )
+                with _ai_imports_lock:
+                    s = _ai_imports.get(batch_uuid, {})
+                    s["scored_ai"] = s.get("scored_ai", 0) + 1
+                    s["estimated_cost"] = s.get("estimated_cost", 0.0) + AI_SCORING_COST_PER_JOB * 0.5
                     if ai_rank == rx_rank:
-                        _ai_import_status["regex_agree"] += 1
+                        s["regex_agree"] = s.get("regex_agree", 0) + 1
                     elif ai_rank > rx_rank:
-                        _ai_import_status["ai_promoted"] += 1
+                        s["ai_promoted"] = s.get("ai_promoted", 0) + 1
                     else:
-                        _ai_import_status["ai_demoted"] += 1
+                        s["ai_demoted"] = s.get("ai_demoted", 0) + 1
             else:
                 job["score"] = regex_score
                 job["tier"] = regex_tier
                 job["ai_reasoning"] = None
                 err = (result.get("error") or "")[:240]
-                with _ai_import_lock:
-                    _ai_import_status["scored_fallback"] += 1
+                with _ai_imports_lock:
+                    s = _ai_imports.get(batch_uuid, {})
+                    s["scored_fallback"] = s.get("scored_fallback", 0) + 1
                     if err:
-                        _ai_import_status["last_error"] = err
+                        s["last_error"] = err
             scored_jobs.append(job)
 
-        with _ai_import_lock:
-            _ai_import_status["message"] = (
-                f"Inserting {len(scored_jobs)} jobs into DB\u2026"
-            )
+        _mem_update(batch_uuid, {"message": f"Inserting {len(scored_jobs)} jobs into DB\u2026"})
 
-        # Insert (mirrors _run_import_csv_ai)
         with Db() as conn:
             cur = conn.cursor()
             for j in scored_jobs:
                 bullets = pick_bullets(j["description"], j["title"])
                 langs, frameworks, misc = customize_skills(j["description"])
-                resume_text = generate_resume_txt(
-                    j, bullets, langs, frameworks, misc
-                )
+                resume_text = generate_resume_txt(j, bullets, langs, frameworks, misc)
                 cur.execute("""
                     INSERT INTO jobs
                         (id, company, title, location, work_type, salary,
@@ -2006,44 +2059,282 @@ def _run_import_csv_ai_batch(csv_bytes, location):
                     resume_text, j.get("ai_reasoning"), j.get("regex_score"),
                 ))
                 cur.execute(
-                    "INSERT INTO job_state (job_id) VALUES (%s) "
-                    "ON CONFLICT DO NOTHING",
+                    "INSERT INTO job_state (job_id) VALUES (%s) ON CONFLICT DO NOTHING",
                     (j["id"],)
                 )
 
         tiers = {}
         for j in scored_jobs:
             tiers.setdefault(j["tier"], []).append(j["title"])
-        summary = ", ".join(
-            f"{t}: {len(v)}" for t, v in sorted(tiers.items())
-        )
+        summary = ", ".join(f"{t}: {len(v)}" for t, v in sorted(tiers.items()))
 
-        with _ai_import_lock:
-            _ai_import_status.update({
-                "running": False,
-                "added": len(scored_jobs),
+        with _ai_imports_lock:
+            s = _ai_imports.get(batch_uuid, {})
+            s.update({
+                "running": False, "status": "completed", "added": len(scored_jobs),
                 "message": (
-                    f"Done! Batch {batch.id[:8]}\u2026 inserted "
-                    f"{len(scored_jobs)} jobs "
-                    f"({_ai_import_status['scored_ai']} AI, "
-                    f"{_ai_import_status['scored_fallback']} fallback), "
-                    f"cost ~${_ai_import_status['estimated_cost']:.3f} "
-                    f"(50% batch discount). {summary}."
+                    f"Done! Batch {batch.id[:8]}\u2026 inserted {len(scored_jobs)} jobs "
+                    f"({s.get('scored_ai', 0)} AI, {s.get('scored_fallback', 0)} fallback), "
+                    f"cost ~${s.get('estimated_cost', 0.0):.3f} (50% batch discount). {summary}."
                 ),
                 "jobs_found": [
                     {"title": j["title"], "tier": j["tier"],
                      "score": j["score"], "location": j["location"]}
-                    for j in sorted(
-                        scored_jobs, key=lambda x: -x["score"]
-                    )[:20]
+                    for j in sorted(scored_jobs, key=lambda x: -x["score"])[:20]
                 ],
             })
+        _flush_import_progress(batch_uuid)
+        _update_import_row(batch_uuid, finished_at="NOW()", added=len(scored_jobs), pending_jobs=None)
 
     except Exception as e:
-        with _ai_import_lock:
-            _ai_import_status.update(
-                {"running": False, "message": f"Batch error: {str(e)}"}
+        _mem_update(batch_uuid, {"running": False, "status": "failed",
+                                 "message": f"Batch error: {str(e)}", "last_error": str(e)[:240]})
+        _flush_import_progress(batch_uuid)
+        _update_import_row(batch_uuid, finished_at="NOW()")
+
+
+def _run_import_csv_ai_batch_resume(batch_uuid, anthropic_batch_id):
+    """Resume polling an in-flight Anthropic batch after a server restart.
+
+    Reads pending_jobs from the DB to reconstruct job_by_id, then runs
+    the same poll → retrieve → insert logic as the original batch worker.
+    """
+    from process_new_postings import (
+        calc_tech_score, calc_level_bonus, calc_company_bonus,
+        assign_tier, pick_bullets, customize_skills, generate_resume_txt,
+    )
+
+    stop_event = _ai_import_stop_events.get(batch_uuid, threading.Event())
+
+    # Load pending_jobs from DB so we can map custom_ids back to job dicts
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT pending_jobs, import_date, location FROM import_batches WHERE id = %s",
+                (batch_uuid,)
             )
+            row = cur.fetchone()
+    except Exception as e:
+        print(f"Resume {batch_uuid}: DB error reading pending_jobs: {e}")
+        _mem_update(batch_uuid, {"running": False, "status": "failed",
+                                 "message": f"Resume failed: {e}"})
+        _flush_import_progress(batch_uuid)
+        return
+
+    if not row:
+        print(f"Resume {batch_uuid}: import_batches row gone, aborting resume")
+        return
+
+    pending_jobs_data, import_date_label, _ = row
+    if not pending_jobs_data:
+        _mem_update(batch_uuid, {"running": False, "status": "failed",
+                                 "message": "Resume failed: pending_jobs missing from DB"})
+        _flush_import_progress(batch_uuid)
+        return
+
+    new_jobs = pending_jobs_data if isinstance(pending_jobs_data, list) else []
+    job_by_id = {j["id"]: j for j in new_jobs}
+
+    _mem_update(batch_uuid, {"running": True, "status": "running",
+                              "batch_id": anthropic_batch_id,
+                              "message": f"Resumed — polling Anthropic batch {anthropic_batch_id[:8]}\u2026"})
+    _flush_import_progress(batch_uuid)
+
+    # First check if the batch already ended while the server was down
+    try:
+        batch = _get_anthropic_batch(anthropic_batch_id)
+    except Exception as e:
+        _mem_update(batch_uuid, {"running": False, "status": "failed",
+                                 "message": f"Resume poll error: {e}"})
+        _flush_import_progress(batch_uuid)
+        _update_import_row(batch_uuid, finished_at="NOW()")
+        return
+
+    poll_interval = 30
+    consecutive_errors = 0
+
+    while batch.processing_status != "ended":
+        if stop_event.is_set():
+            _mem_update(batch_uuid, {"running": False, "status": "canceled", "stopped": True,
+                                     "message": f"Stopped resumed polling of {anthropic_batch_id[:8]}\u2026"})
+            _flush_import_progress(batch_uuid)
+            _update_import_row(batch_uuid, finished_at="NOW()")
+            return
+
+        time.sleep(poll_interval)
+        try:
+            batch = _get_anthropic_batch(anthropic_batch_id)
+            consecutive_errors = 0
+        except Exception as e:
+            consecutive_errors += 1
+            if consecutive_errors >= 20:
+                _mem_update(batch_uuid, {"running": False, "status": "failed",
+                                         "message": f"Resume poll failed 20 times: {e}"})
+                _flush_import_progress(batch_uuid)
+                _update_import_row(batch_uuid, finished_at="NOW()")
+                return
+            continue
+
+        counts = getattr(batch, "request_counts", None)
+        counts_dict = None
+        if counts is not None:
+            counts_dict = {
+                "processing": getattr(counts, "processing", 0),
+                "succeeded": getattr(counts, "succeeded", 0),
+                "errored": getattr(counts, "errored", 0),
+                "canceled": getattr(counts, "canceled", 0),
+                "expired": getattr(counts, "expired", 0),
+            }
+        with _ai_imports_lock:
+            s = _ai_imports.get(batch_uuid, {})
+            s["batch_processing_status"] = batch.processing_status
+            s["batch_request_counts"] = counts_dict
+            if counts_dict:
+                finished = (counts_dict["succeeded"] + counts_dict["errored"]
+                            + counts_dict["canceled"] + counts_dict["expired"])
+                s["progress"] = finished
+                s["total"] = sum(counts_dict.values())
+                s["message"] = (
+                    f"(Resumed) Batch {anthropic_batch_id[:8]}\u2026 "
+                    f"{batch.processing_status} ({finished} processed)"
+                )
+        _flush_import_progress(batch_uuid)
+
+    # Batch ended — retrieve results and insert
+    _mem_update(batch_uuid, {"message": f"(Resumed) Batch ended. Retrieving results\u2026"})
+
+    _TIER_RANK = {"Weak Match": 0, "Match": 1, "Strong Match": 2}
+    scored_jobs = []
+    for custom_id, result in _retrieve_anthropic_batch_results(anthropic_batch_id):
+        job = job_by_id.get(custom_id)
+        if not job:
+            continue
+        dl = job["description"].lower()
+        tl = job["title"].lower()
+        regex_score = (calc_tech_score(dl) + calc_level_bonus(tl)
+                       + calc_company_bonus(job["company"]))
+        job["regex_score"] = regex_score
+        regex_tier = assign_tier(regex_score)
+        if result.get("used_ai"):
+            job["score"] = result["legacy_score"]
+            job["tier"] = assign_tier(result["legacy_score"])
+            job["ai_reasoning"] = result["reasoning"]
+            with _ai_imports_lock:
+                s = _ai_imports.get(batch_uuid, {})
+                s["scored_ai"] = s.get("scored_ai", 0) + 1
+                s["estimated_cost"] = s.get("estimated_cost", 0.0) + AI_SCORING_COST_PER_JOB * 0.5
+        else:
+            job["score"] = regex_score
+            job["tier"] = regex_tier
+            job["ai_reasoning"] = None
+            with _ai_imports_lock:
+                s = _ai_imports.get(batch_uuid, {})
+                s["scored_fallback"] = s.get("scored_fallback", 0) + 1
+                if result.get("error"):
+                    s["last_error"] = str(result["error"])[:240]
+        scored_jobs.append(job)
+
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            for j in scored_jobs:
+                bullets = pick_bullets(j["description"], j["title"])
+                langs, frameworks, misc = customize_skills(j["description"])
+                resume_text = generate_resume_txt(j, bullets, langs, frameworks, misc)
+                cur.execute("""
+                    INSERT INTO jobs
+                        (id, company, title, location, work_type, salary,
+                         posted_date, import_date, description, score,
+                         tier, job_link, apply_link, resume_text,
+                         ai_reasoning, regex_score)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (id) DO NOTHING
+                """, (
+                    j["id"], j["company"], j["title"], j["location"],
+                    j["work_type"], j["salary"], j["posted_date"],
+                    j["import_date"], j["description"], j["score"],
+                    j["tier"], j["job_link"], j["apply_link"],
+                    resume_text, j.get("ai_reasoning"), j.get("regex_score"),
+                ))
+                cur.execute(
+                    "INSERT INTO job_state (job_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                    (j["id"],)
+                )
+    except Exception as e:
+        _mem_update(batch_uuid, {"running": False, "status": "failed",
+                                 "message": f"Resume DB insert error: {e}"})
+        _flush_import_progress(batch_uuid)
+        _update_import_row(batch_uuid, finished_at="NOW()")
+        return
+
+    with _ai_imports_lock:
+        s = _ai_imports.get(batch_uuid, {})
+        s.update({
+            "running": False, "status": "completed", "added": len(scored_jobs),
+            "message": f"(Resumed) Done! Inserted {len(scored_jobs)} jobs.",
+        })
+    _flush_import_progress(batch_uuid)
+    _update_import_row(batch_uuid, finished_at="NOW()", added=len(scored_jobs), pending_jobs=None)
+
+
+def _resume_in_flight_imports():
+    """Called at server startup — respawn polling threads for any
+    batch-mode imports that were running when the server last stopped.
+    Live-mode running rows are force-marked failed (can't resume)."""
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, import_date, mode, location, anthropic_batch_id
+                FROM import_batches
+                WHERE status IN ('queued', 'running')
+            """)
+            rows = cur.fetchall()
+    except Exception as e:
+        print(f"_resume_in_flight_imports: DB error: {e}")
+        return
+
+    for batch_uuid, import_date, mode, location, anthropic_batch_id in rows:
+        if mode == "live":
+            # Live import can't be resumed — job list is gone
+            _update_import_row(batch_uuid, status="failed",
+                               message="Interrupted by server restart (live mode)",
+                               finished_at="NOW()")
+            print(f"Resume: marked live import {batch_uuid[:8]} as failed")
+            continue
+
+        if not anthropic_batch_id:
+            # Batch was queued but never submitted
+            _update_import_row(batch_uuid, status="failed",
+                               message="Abandoned before Anthropic batch was submitted",
+                               finished_at="NOW()")
+            print(f"Resume: marked unsubmitted batch {batch_uuid[:8]} as failed")
+            continue
+
+        # Rebuild in-memory state
+        with _ai_imports_lock:
+            _ai_imports[batch_uuid] = {
+                "id": batch_uuid, "status": "running", "mode": "batch",
+                "import_date": import_date, "location": location,
+                "running": True, "progress": 0, "total": 0, "added": 0,
+                "scored_ai": 0, "scored_fallback": 0, "estimated_cost": 0.0,
+                "regex_agree": 0, "ai_promoted": 0, "ai_demoted": 0,
+                "stopped": False, "last_error": "",
+                "batch_id": anthropic_batch_id, "batch_processing_status": None,
+                "batch_request_counts": None,
+                "message": f"Resuming after restart — polling {anthropic_batch_id[:8]}\u2026",
+                "jobs_found": [],
+            }
+            _ai_import_stop_events[batch_uuid] = threading.Event()
+
+        threading.Thread(
+            target=_run_import_csv_ai_batch_resume,
+            args=(batch_uuid, anthropic_batch_id),
+            daemon=True,
+        ).start()
+        print(f"Resume: spawned polling thread for batch {batch_uuid[:8]} "
+              f"(anthropic={anthropic_batch_id[:8]})")
 
 
 # ─────────────────────────────────────────────────────────
@@ -2505,51 +2796,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 _json_response(self, dict(_import_status))
             return
 
-        # ── /api/ai-import-status ────────────────────────
-        if self.path == "/api/ai-import-status":
-            with _ai_import_lock:
-                _json_response(self, dict(_ai_import_status))
-            return
-
-        # ── /api/ai-import-stream (Server-Sent Events) ───
-        # Holds the connection open and pushes status frames as the AI
-        # import progresses.  The browser's EventSource API auto-
-        # reconnects on page refresh, so callers don't need separate
-        # polling after a reload.
-        if self.path == "/api/ai-import-stream":
-            # Force socket close after the stream ends so the connection
-            # is not reused (HTTP keep-alive would leave it half-open).
-            self.close_connection = True
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            # Tell nginx / AWS ALB not to buffer the stream.
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-            try:
-                last_json = None
-                while True:
-                    with _ai_import_lock:
-                        snap = dict(_ai_import_status)
-                    snap_json = json.dumps(snap)
-                    if snap_json != last_json:
-                        frame = f"data: {snap_json}\n\n"
-                        self.wfile.write(frame.encode())
-                        self.wfile.flush()
-                        last_json = snap_json
-                    else:
-                        # Heartbeat keeps nginx / load-balancers from
-                        # closing an idle connection (SSE comment line).
-                        self.wfile.write(b": heartbeat\n\n")
-                        self.wfile.flush()
-                    if not snap.get("running"):
-                        break   # import done — client handles reconnect
-                    time.sleep(1)
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass  # client disconnected, nothing to do
-            return
-
         # ── /api/refresh-job/<id> ────────────────────────
         if self.path.startswith("/api/refresh-job/"):
             job_id = self.path[len("/api/refresh-job/"):].strip()
@@ -2663,6 +2909,136 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 with open(pdf_path, "rb") as f:
                     self.wfile.write(f.read())
                 os.remove(pdf_path)
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── /api/imports-stream (SSE) — live updates for all batches ─
+        if self.path == "/api/imports-stream":
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            try:
+                def _fetch_all_imports():
+                    with Db() as conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            "SELECT * FROM import_batches "
+                            "ORDER BY created_at DESC LIMIT 200"
+                        )
+                        rows = cur.fetchall()
+                        desc = cur.description
+                    return [_import_row_to_dict(r, desc) for r in rows]
+
+                imports = _fetch_all_imports()
+                frame = json.dumps({"type": "snapshot", "imports": imports})
+                self.wfile.write(f"data: {frame}\n\n".encode())
+                self.wfile.flush()
+
+                # Track last-seen signature per UUID to detect changes
+                last_sig = {
+                    imp["id"]: (imp.get("status"), imp.get("progress"),
+                                imp.get("message"))
+                    for imp in imports
+                }
+
+                while True:
+                    time.sleep(1)
+                    with _ai_imports_lock:
+                        active_ids = list(_ai_imports.keys())
+                    sent_any = False
+                    for uid in active_ids:
+                        with _ai_imports_lock:
+                            mem = dict(_ai_imports.get(uid) or {})
+                        if not mem:
+                            continue
+                        sig = (mem.get("status"), mem.get("progress"),
+                               mem.get("message"))
+                        if last_sig.get(uid) == sig:
+                            continue
+                        last_sig[uid] = sig
+                        update = {
+                            "id": uid,
+                            "import_date": mem.get("import_date"),
+                            "mode": mem.get("mode"),
+                            "location": mem.get("location"),
+                            "status": mem.get("status"),
+                            "progress": mem.get("progress"),
+                            "total": mem.get("total"),
+                            "added": mem.get("added"),
+                            "scored_ai": mem.get("scored_ai"),
+                            "scored_fallback": mem.get("scored_fallback"),
+                            "estimated_cost": mem.get("estimated_cost"),
+                            "message": mem.get("message"),
+                            "last_error": mem.get("last_error"),
+                            "batch_processing_status": mem.get(
+                                "batch_processing_status"
+                            ),
+                        }
+                        frame = json.dumps({"type": "update", "import": update})
+                        self.wfile.write(f"data: {frame}\n\n".encode())
+                        sent_any = True
+                    if sent_any:
+                        self.wfile.flush()
+                    else:
+                        self.wfile.write(b": heartbeat\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return
+
+        # ── /api/imports — list or single import batch ────────────
+        if self.path == "/api/imports" or \
+                self.path.startswith("/api/imports?") or \
+                self.path.startswith("/api/imports/"):
+            parsed = urllib.parse.urlparse(self.path)
+            parts = parsed.path.rstrip("/").split("/")
+            # /api/imports/<uuid>
+            if len(parts) >= 4 and parts[3]:
+                batch_uuid = parts[3]
+                try:
+                    with Db() as conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            "SELECT * FROM import_batches WHERE id = %s",
+                            (batch_uuid,)
+                        )
+                        row = cur.fetchone()
+                        if not row:
+                            _json_response(self, {"error": "Not found"}, 404)
+                            return
+                        d = _import_row_to_dict(row, cur.description)
+                    _json_response(self, d)
+                except Exception as e:
+                    _json_response(self, {"error": str(e)}, 500)
+                return
+            # /api/imports[?status=...]
+            qs = urllib.parse.parse_qs(parsed.query)
+            status_filter = qs.get("status", [None])[0]
+            try:
+                with Db() as conn:
+                    cur = conn.cursor()
+                    if status_filter:
+                        statuses = [s.strip() for s in status_filter.split(",")]
+                        cur.execute(
+                            "SELECT * FROM import_batches "
+                            "WHERE status = ANY(%s) "
+                            "ORDER BY created_at DESC LIMIT 200",
+                            (statuses,)
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT * FROM import_batches "
+                            "ORDER BY created_at DESC LIMIT 200"
+                        )
+                    rows = cur.fetchall()
+                    desc = cur.description
+                result = [_import_row_to_dict(r, desc) for r in rows]
+                _json_response(self, result)
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
             return
@@ -2815,6 +3191,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         (job_ids,)
                     )
                     deleted = cur.rowcount
+                    cur.execute(
+                        "DELETE FROM import_batches WHERE import_date = %s",
+                        (batch,)
+                    )
                 _json_response(
                     self, {"ok": True, "deleted": deleted}
                 )
@@ -3240,41 +3620,34 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 _json_response(self, {"error": str(e)}, 500)
             return
 
-        # ── POST /api/ai-import-stop — graceful stop ─────
+        # ── POST /api/ai-import-stop — legacy stop (targets live import)
         if self.path == "/api/ai-import-stop":
-            if not _ai_import_status.get("running"):
-                _json_response(self, {
-                    "ok": True, "message": "Not running"
-                })
-                return
-            _ai_import_stop_event.set()
-            with _ai_import_lock:
-                _ai_import_status["message"] = (
-                    "Stop requested \u2014 finishing remaining "
-                    "jobs with regex fallback..."
-                )
-            _json_response(self, {"ok": True})
+            # Find the most recently started running live import and stop it
+            target_id = None
+            with _ai_imports_lock:
+                running = [(bid, s) for bid, s in _ai_imports.items()
+                           if s.get("running") and s.get("mode") == "live"]
+            if running:
+                target_id = running[-1][0]
+                ev = _ai_import_stop_events.get(target_id)
+                if ev:
+                    ev.set()
+                _mem_update(target_id, {"message":
+                    "Stop requested \u2014 finishing remaining jobs with regex fallback\u2026"})
+                _json_response(self, {"ok": True})
+            else:
+                _json_response(self, {"ok": True, "message": "Not running"})
             return
 
         # ── POST /api/import-csv-ai — AI scoring CSV import ─
-        # Must come BEFORE /api/import-csv since that uses startswith.
-        # Optional ?mode=batch query param routes to the Anthropic
-        # Batch API path (50% discount, async). Default mode is "live".
+        # Optional ?mode=batch allows concurrent batch imports.
+        # Live mode stays single-runner (rate-limit safety).
         if self.path.startswith("/api/import-csv-ai"):
             if not _ANTHROPIC_KEY:
-                _json_response(self, {
-                    "error": "Anthropic API key not configured"
-                }, 500)
-                return
-            if _ai_import_status.get("running"):
-                _json_response(self, {
-                    "ok": True, "message": "Already running"
-                })
+                _json_response(self, {"error": "Anthropic API key not configured"}, 500)
                 return
             try:
-                qs = urllib.parse.parse_qs(
-                    urllib.parse.urlparse(self.path).query
-                )
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 loc = (qs.get("location", [""])[0] or "").strip() or None
                 mode = (qs.get("mode", ["live"])[0] or "live").strip().lower()
                 length = int(self.headers.get("Content-Length", 0))
@@ -3282,16 +3655,44 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 if not csv_bytes:
                     _json_response(self, {"error": "Empty body"}, 400)
                     return
-                target = (
-                    _run_import_csv_ai_batch if mode == "batch"
-                    else _run_import_csv_ai
-                )
+
+                # Live mode: single-runner guard
+                if mode == "live":
+                    with _ai_imports_lock:
+                        global _ai_live_import_running
+                        if _ai_live_import_running:
+                            _json_response(self, {
+                                "error": "A live-mode AI import is already running. "
+                                         "Use batch mode for concurrent imports."
+                            }, 409)
+                            return
+                        _ai_live_import_running = True
+
+                batch_uuid, label = _new_import_row(mode=mode, location=loc)
+                stop_event = threading.Event()
+                with _ai_imports_lock:
+                    _ai_imports[batch_uuid] = {
+                        "id": batch_uuid, "status": "queued", "mode": mode,
+                        "import_date": label, "location": loc,
+                        "running": False, "progress": 0, "total": 0, "added": 0,
+                        "scored_ai": 0, "scored_fallback": 0, "estimated_cost": 0.0,
+                        "regex_agree": 0, "ai_promoted": 0, "ai_demoted": 0,
+                        "stopped": False, "last_error": "",
+                        "batch_id": None, "batch_processing_status": None,
+                        "batch_request_counts": None, "message": "Queued",
+                        "jobs_found": [],
+                    }
+                    _ai_import_stop_events[batch_uuid] = stop_event
+
+                target = (_run_import_csv_ai_batch if mode == "batch"
+                          else _run_import_csv_ai)
                 threading.Thread(
                     target=target,
-                    args=(csv_bytes, loc),
+                    args=(batch_uuid, csv_bytes, loc),
                     daemon=True,
                 ).start()
-                _json_response(self, {"ok": True, "mode": mode})
+                _json_response(self, {"ok": True, "mode": mode, "id": batch_uuid,
+                                      "import_date": label})
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
             return
@@ -3504,6 +3905,52 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 _json_response(self, {"ok": True, "message": "Started"})
             return
 
+        # ── POST /api/imports/:id/cancel ─────────────────
+        if self.path.startswith("/api/imports/") and self.path.endswith("/cancel"):
+            parts = self.path.rstrip("/").split("/")
+            # expect ["", "api", "imports", "<uuid>", "cancel"]
+            if len(parts) >= 5:
+                batch_uuid = parts[3]
+                try:
+                    with Db() as conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            "SELECT status, mode, anthropic_batch_id "
+                            "FROM import_batches WHERE id = %s",
+                            (batch_uuid,)
+                        )
+                        row = cur.fetchone()
+                    if not row:
+                        _json_response(self, {"error": "Not found"}, 404)
+                        return
+                    db_status, mode, anthropic_batch_id = row
+                    if db_status not in ("queued", "running"):
+                        _json_response(self, {
+                            "error": f"Import is already {db_status}"
+                        }, 409)
+                        return
+                    # Best-effort Anthropic cancel for batch mode
+                    if mode == "batch" and anthropic_batch_id:
+                        try:
+                            _get_anthropic_client().messages.batches.cancel(
+                                anthropic_batch_id
+                            )
+                        except Exception as ce:
+                            logger.warning(
+                                "Anthropic batch cancel failed: %s", ce
+                            )
+                    # Signal the worker to stop
+                    with _ai_imports_lock:
+                        ev = _ai_import_stop_events.get(batch_uuid)
+                    if ev:
+                        ev.set()
+                    _json_response(self, {"ok": True, "status": "canceling"})
+                except Exception as e:
+                    _json_response(self, {"error": str(e)}, 500)
+            else:
+                _json_response(self, {"error": "Invalid path"}, 400)
+            return
+
         # ── POST /api/run-update-applicants ─────────────
         if self.path == "/api/run-update-applicants":
             if _update_status["running"]:
@@ -3535,10 +3982,99 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+    def do_DELETE(self):
+        if not _is_authenticated(self):
+            self.send_response(401)
+            self.end_headers()
+            return
+
+        # ── DELETE /api/imports/:id — delete batch + all its jobs ──
+        if self.path.startswith("/api/imports/"):
+            parsed = urllib.parse.urlparse(self.path)
+            parts = parsed.path.rstrip("/").split("/")
+            if len(parts) < 4 or not parts[3]:
+                _json_response(self, {"error": "Missing import id"}, 400)
+                return
+            batch_uuid = parts[3]
+            qs = urllib.parse.parse_qs(parsed.query)
+            force = qs.get("force", ["0"])[0] == "1"
+            try:
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT status, mode, anthropic_batch_id, import_date "
+                        "FROM import_batches WHERE id = %s",
+                        (batch_uuid,)
+                    )
+                    row = cur.fetchone()
+                if not row:
+                    _json_response(self, {"error": "Not found"}, 404)
+                    return
+                db_status, mode, anthropic_batch_id, import_date = row
+                if db_status in ("queued", "running") and not force:
+                    _json_response(self, {
+                        "error": "Import is still running. Add ?force=1 to delete anyway."
+                    }, 409)
+                    return
+                # Stop the worker if active
+                if db_status in ("queued", "running"):
+                    if mode == "batch" and anthropic_batch_id:
+                        try:
+                            _get_anthropic_client().messages.batches.cancel(
+                                anthropic_batch_id
+                            )
+                        except Exception as ce:
+                            logger.warning(
+                                "Anthropic batch cancel on delete failed: %s", ce
+                            )
+                    with _ai_imports_lock:
+                        ev = _ai_import_stop_events.get(batch_uuid)
+                    if ev:
+                        ev.set()
+                # Cascade delete
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT id FROM jobs WHERE import_date = %s",
+                        (import_date,)
+                    )
+                    job_ids = [r[0] for r in cur.fetchall()]
+                    if job_ids:
+                        cur.execute(
+                            "DELETE FROM application_plan_jobs "
+                            "WHERE job_id = ANY(%s)", (job_ids,)
+                        )
+                        cur.execute(
+                            "DELETE FROM job_state "
+                            "WHERE job_id = ANY(%s)", (job_ids,)
+                        )
+                        cur.execute(
+                            "DELETE FROM jobs WHERE id = ANY(%s)",
+                            (job_ids,)
+                        )
+                    cur.execute(
+                        "DELETE FROM import_batches WHERE id = %s",
+                        (batch_uuid,)
+                    )
+                # Remove from memory
+                with _ai_imports_lock:
+                    _ai_imports.pop(batch_uuid, None)
+                    _ai_import_stop_events.pop(batch_uuid, None)
+                _json_response(self, {
+                    "ok": True,
+                    "deleted_jobs": len(job_ids) if job_ids else 0
+                })
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
@@ -3554,6 +4090,7 @@ if __name__ == "__main__":
     print(f"Starting Job Dashboard server on port {PORT}...")
     print(f"Open http://localhost:{PORT} in your browser")
     print("Press Ctrl+C to stop\n")
+    _resume_in_flight_imports()
     server = http.server.HTTPServer(("", PORT), DashboardHandler)
     try:
         server.serve_forever()

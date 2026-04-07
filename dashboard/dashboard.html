@@ -67,7 +67,7 @@ function renderMarkdown(text) {
 }
 
 // ── Hash-based routing ───────────────────────────────────────────────
-const VALID_ROUTES = ['jobs', 'stats', 'pipeline', 'sankey', 'plans', 'profile'];
+const VALID_ROUTES = ['jobs', 'stats', 'imports', 'pipeline', 'sankey', 'plans', 'profile'];
 function parseHash() {
   const raw = decodeURIComponent(window.location.hash.replace(/^#\/?/, ''));
   const r = { view: 'jobs', batchDate: null, jobId: null, jobDetailId: null, planId: null };
@@ -2895,6 +2895,138 @@ function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans 
   );
 }
 
+// ── ImportsView ────────────────────────────────────────────────────────
+function ImportsView({ imports, onRefresh, onViewJobs, onSwitchView }) {
+  const { useState, useCallback } = React;
+  const [busy, setBusy] = useState({});
+
+  const STATUS_BADGE = {
+    queued:    "bg-gray-100 text-gray-600",
+    running:   "bg-amber-100 text-amber-800",
+    completed: "bg-green-100 text-green-700",
+    failed:    "bg-red-100 text-red-700",
+    canceled:  "bg-zinc-100 text-zinc-600",
+  };
+
+  const cancelImport = useCallback(async (id) => {
+    setBusy(b => ({ ...b, [id]: true }));
+    try {
+      await fetch(`/api/imports/${id}/cancel`, { method: "POST" });
+      onRefresh();
+    } finally {
+      setBusy(b => ({ ...b, [id]: false }));
+    }
+  }, [onRefresh]);
+
+  const deleteImport = useCallback(async (id, status, importDate) => {
+    const isActive = status === "queued" || status === "running";
+    if (!window.confirm(
+      isActive
+        ? "This import is still running. Force-delete it and all its jobs?"
+        : `Delete this import batch and all ${importDate} jobs?`
+    )) return;
+    setBusy(b => ({ ...b, [id]: true }));
+    try {
+      await fetch(`/api/imports/${id}${isActive ? "?force=1" : ""}`, { method: "DELETE" });
+      onRefresh();
+    } finally {
+      setBusy(b => ({ ...b, [id]: false }));
+    }
+  }, [onRefresh]);
+
+  if (!imports.length) {
+    return (
+      <div className="flex flex-col items-center justify-center h-64 text-gray-400">
+        <div className="text-4xl mb-3">&#128230;</div>
+        <p>No import batches yet. Upload a CSV from the toolbar to get started.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6 overflow-auto" style={{ height: "calc(100vh - 100px)" }}>
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-lg font-semibold text-gray-800">&#128230; Import Batches</h2>
+        <button onClick={onRefresh} className="text-xs text-blue-600 hover:underline">Refresh</button>
+      </div>
+      <table className="w-full text-sm border-collapse">
+        <thead>
+          <tr className="text-left text-xs text-gray-500 border-b">
+            <th className="pb-2 pr-4 font-medium">When</th>
+            <th className="pb-2 pr-4 font-medium">Batch Label</th>
+            <th className="pb-2 pr-4 font-medium">Mode</th>
+            <th className="pb-2 pr-4 font-medium">Status</th>
+            <th className="pb-2 pr-4 font-medium">Progress</th>
+            <th className="pb-2 pr-4 font-medium">Added</th>
+            <th className="pb-2 pr-4 font-medium">$ Est</th>
+            <th className="pb-2 font-medium">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {imports.map(imp => {
+            const isActive = imp.status === "queued" || imp.status === "running";
+            const pct = imp.total > 0 ? Math.round((imp.progress / imp.total) * 100) : 0;
+            const cost = typeof imp.estimated_cost === "number" ? imp.estimated_cost : parseFloat(imp.estimated_cost || 0);
+            const when = imp.created_at ? new Date(imp.created_at).toLocaleString() : "—";
+            return (
+              <tr key={imp.id} className="border-b last:border-0 hover:bg-gray-50">
+                <td className="py-2 pr-4 text-gray-500 whitespace-nowrap text-xs">{when}</td>
+                <td className="py-2 pr-4 max-w-xs">
+                  <div className="font-medium text-gray-800 truncate" title={imp.import_date}>{imp.import_date}</div>
+                  {imp.message && <div className="text-xs text-gray-400 truncate mt-0.5" title={imp.message}>{imp.message}</div>}
+                  {imp.last_error && <div className="text-xs text-red-500 truncate mt-0.5" title={imp.last_error}>{imp.last_error}</div>}
+                </td>
+                <td className="py-2 pr-4">
+                  <span className="px-1.5 py-0.5 rounded text-xs bg-gray-100 text-gray-600 uppercase tracking-wide">{imp.mode}</span>
+                </td>
+                <td className="py-2 pr-4">
+                  <span className={"px-2 py-0.5 rounded-full text-xs font-medium " + (STATUS_BADGE[imp.status] || "bg-gray-100 text-gray-600")}>
+                    {imp.status}
+                  </span>
+                </td>
+                <td className="py-2 pr-4">
+                  {imp.total > 0 ? (
+                    <div>
+                      <div className="w-28 bg-gray-200 rounded-full h-1.5 mb-1">
+                        <div className="bg-blue-500 h-1.5 rounded-full" style={{ width: pct + "%" }} />
+                      </div>
+                      <div className="text-xs text-gray-500">{imp.progress}/{imp.total}</div>
+                    </div>
+                  ) : <span className="text-gray-400">—</span>}
+                </td>
+                <td className="py-2 pr-4 text-gray-700 font-medium">{imp.added > 0 ? imp.added : "—"}</td>
+                <td className="py-2 pr-4 text-gray-600">{cost > 0 ? "$" + cost.toFixed(3) : "—"}</td>
+                <td className="py-2">
+                  <div className="flex gap-1 flex-wrap">
+                    {imp.added > 0 && (
+                      <button
+                        onClick={() => onViewJobs(imp.import_date)}
+                        className="px-2 py-1 text-xs bg-blue-50 text-blue-700 rounded hover:bg-blue-100"
+                      >View Jobs</button>
+                    )}
+                    {isActive && (
+                      <button
+                        onClick={() => cancelImport(imp.id)}
+                        disabled={busy[imp.id]}
+                        className="px-2 py-1 text-xs bg-yellow-50 text-yellow-700 rounded hover:bg-yellow-100 disabled:opacity-50"
+                      >Cancel</button>
+                    )}
+                    <button
+                      onClick={() => deleteImport(imp.id, imp.status, imp.import_date)}
+                      disabled={busy[imp.id]}
+                      className="px-2 py-1 text-xs bg-red-50 text-red-700 rounded hover:bg-red-100 disabled:opacity-50"
+                    >Delete</button>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function App() {
   const [jobs, setJobs] = useState([]);
   const [batchStats, setBatchStats] = useState([]);
@@ -2948,6 +3080,23 @@ function App() {
   const [aiCsvUseBatch, setAiCsvUseBatch]       = useState(false);
   // Ref to the live EventSource so we can close it on demand.
   const aiCsvStreamRef = useRef(null);
+  // UUID of the most recently submitted AI CSV import (drives panel updates).
+  const [lastStartedImportId, setLastStartedImportId] = useState(null);
+
+  // ── Imports tab state ─────────────────────────────────
+  const [imports, setImports] = useState([]);
+  const importsStreamRef = useRef(null);
+  const importsBadgeCount = useMemo(
+    () => imports.filter(i => i.status === "running" || i.status === "queued").length,
+    [imports]
+  );
+  const refreshImports = useCallback(async () => {
+    if (!IS_SERVED) return;
+    try {
+      const r = await fetch("/api/imports");
+      if (r.ok) setImports(await r.json());
+    } catch (_) {}
+  }, []);
 
   const [showAIImport, setShowAIImport] = useState(false);
   const [aiImportUrl, setAiImportUrl] = useState('');
@@ -2999,22 +3148,13 @@ function App() {
         setAiCsvStatus({ running: false, message: 'Error: ' + data.error });
         return;
       }
+      // Store the batch UUID so the sync useEffect can drive panel updates
+      // from the global imports state instead of a dedicated SSE stream.
+      setLastStartedImportId(data.id);
+      refreshImports();
       setAiCsvStatus({ running: true, message: aiCsvUseBatch ? 'Submitting batch to Anthropic...' : 'Starting AI scoring...', progress: 0, total: 0, scored_ai: 0, scored_fallback: 0, estimated_cost: 0, mode: aiCsvUseBatch ? 'batch' : 'live' });
-      // Subscribe via Server-Sent Events — no polling needed.
-      // EventSource auto-reconnects on network hiccups, and the
-      // server closes the stream when the import finishes.
-      if (aiCsvStreamRef.current) aiCsvStreamRef.current.close();
-      const es = new EventSource('/api/ai-import-stream');
-      es.onmessage = (e) => {
-        try {
-          const s = JSON.parse(e.data);
-          setAiCsvStatus(s);
-          if (!s.running) { es.close(); aiCsvStreamRef.current = null; }
-        } catch (_) {}
-      };
-      aiCsvStreamRef.current = es;
     });
-  }, [aiCsvFile, aiCsvLocation, aiCsvUseBatch]);
+  }, [aiCsvFile, aiCsvLocation, aiCsvUseBatch, refreshImports]);
 
   const startScrape = useCallback(() => {
     if (!scrapeUrl.trim()) return;
@@ -3116,29 +3256,73 @@ function App() {
     Promise.all([
       fetch('/api/jobs-data').then(r => r.json()),
       fetch('/api/batch-stats').then(r => r.json()),
-      fetch('/api/ai-import-status').then(r => r.json()).catch(() => null),
-    ]).then(([apiJobs, apiStats, aiStatus]) => {
+    ]).then(([apiJobs, apiStats]) => {
       setJobs(initJobsFromApi(Array.isArray(apiJobs) ? apiJobs : []));
       setBatchStats(Array.isArray(apiStats) ? apiStats : []);
-      if (aiStatus) {
-        setAiCsvStatus(aiStatus);
-        // If an import was running before the page loaded, reattach SSE
-        // so the UI picks up where it left off without manual polling.
-        if (aiStatus.running) {
-          const es = new EventSource('/api/ai-import-stream');
-          es.onmessage = (e) => {
-            try {
-              const s = JSON.parse(e.data);
-              setAiCsvStatus(s);
-              if (!s.running) { es.close(); aiCsvStreamRef.current = null; }
-            } catch (_) {}
-          };
-          aiCsvStreamRef.current = es;
-        }
-      }
       setLoaded(true);
     }).catch(() => setLoaded(true));
   }, []);
+
+  // ── /api/imports-stream subscription ──────────────────
+  useEffect(() => {
+    if (!IS_SERVED) return;
+    refreshImports();
+    const es = new EventSource("/api/imports-stream");
+    es.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "snapshot") {
+          setImports(msg.imports);
+        } else if (msg.type === "update") {
+          setImports(prev => {
+            const idx = prev.findIndex(x => x.id === msg.import.id);
+            if (idx < 0) return [msg.import, ...prev];
+            const next = prev.slice();
+            next[idx] = { ...next[idx], ...msg.import };
+            return next;
+          });
+        }
+      } catch (_) {}
+    };
+    importsStreamRef.current = es;
+    return () => es.close();
+  }, [refreshImports]);
+
+  // On page load, auto-track the most recently started running import so the
+  // inline panel resumes showing progress after a browser refresh.
+  useEffect(() => {
+    if (lastStartedImportId) return;
+    const active = imports.find(i => i.status === "running" || i.status === "queued");
+    if (active) setLastStartedImportId(active.id);
+  }, [imports]);  // intentionally omit lastStartedImportId to run only until one is found
+
+  // Sync the inline AI CSV panel from global imports state whenever the
+  // tracked import changes (avoids needing a dedicated /api/ai-import-stream).
+  useEffect(() => {
+    if (!lastStartedImportId) return;
+    const imp = imports.find(i => i.id === lastStartedImportId);
+    if (!imp) return;
+    setAiCsvStatus({
+      running: imp.status === "running" || imp.status === "queued",
+      message: imp.message || "",
+      progress: imp.progress || 0,
+      total: imp.total || 0,
+      added: imp.added || 0,
+      scored_ai: imp.scored_ai || 0,
+      scored_fallback: imp.scored_fallback || 0,
+      estimated_cost: imp.estimated_cost || 0,
+      regex_agree: imp.regex_agree || 0,
+      ai_promoted: imp.ai_promoted || 0,
+      ai_demoted: imp.ai_demoted || 0,
+      last_error: imp.last_error || "",
+      mode: imp.mode || "live",
+      batch_id: imp.anthropic_batch_id || null,
+      batch_processing_status: imp.batch_processing_status || null,
+      batch_request_counts: imp.request_counts || null,
+      jobs_found: [],
+      stopped: imp.status === "canceled",
+    });
+  }, [lastStartedImportId, imports]);
 
   const updateJob = useCallback((id, updates) => {
     setJobs(prev => prev.map(j => {
@@ -3363,6 +3547,15 @@ function App() {
               onClick={() => setView("stats")}
               className={"px-3 py-1.5 border-l " + (view === "stats" ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50")}
             >&#128202; Stats</button>
+            <button
+              onClick={() => setView("imports")}
+              className={"px-3 py-1.5 border-l relative " + (view === "imports" ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50")}
+            >
+              &#128230; Imports
+              {importsBadgeCount > 0 && (
+                <span className="ml-1 inline-flex items-center justify-center text-[10px] font-bold rounded-full bg-amber-400 text-amber-900 px-1.5">{importsBadgeCount}</span>
+              )}
+            </button>
             <button
               onClick={() => setView("pipeline")}
               className={"px-3 py-1.5 border-l " + (view === "pipeline" ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50")}
@@ -3665,7 +3858,10 @@ function App() {
             {aiCsvStatus?.running && (
               <button
                 onClick={() => {
-                  fetch('/api/ai-import-stop', { method: 'POST' });
+                  const endpoint = lastStartedImportId
+                    ? `/api/imports/${lastStartedImportId}/cancel`
+                    : '/api/ai-import-stop';
+                  fetch(endpoint, { method: 'POST' });
                 }}
                 className="px-4 py-1.5 bg-red-600 text-white rounded text-sm font-medium hover:bg-red-700"
                 title="Stop AI scoring and finish remaining jobs with regex fallback"
@@ -3798,6 +3994,12 @@ function App() {
                 <button onClick={() => window.location.reload()}
                   className="mt-2 px-3 py-1 bg-pink-600 text-white rounded text-xs font-medium hover:bg-pink-700">
                   Reload Dashboard
+                </button>
+              )}
+              {lastStartedImportId && (
+                <button onClick={() => setView('imports')}
+                  className="mt-2 ml-2 px-3 py-1 bg-white border border-pink-400 text-pink-700 rounded text-xs font-medium hover:bg-pink-50">
+                  View in Imports tab &#8594;
                 </button>
               )}
             </div>
@@ -3951,7 +4153,7 @@ function App() {
       )}
       </>}
 
-      {jobDetailId ? <JobDetailPage job={jobs.find(j => j.id === jobDetailId)} appPlans={appPlans} saveAppPlans={saveAppPlans} changeStatus={changeStatus} onBack={() => { if (window.history.length > 1) window.history.back(); else window.location.hash = '#/jobs'; }} /> : batchDetailDate ? <BatchDetailView jobs={jobs} batchDate={batchDetailDate} onBack={() => setBatchDetailDate(null)} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "stats" ? <StatsPanel jobs={jobs} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "pipeline" ? <PipelineView jobs={jobs} changeStatus={changeStatus} /> : view === "sankey" ? <SankeyView jobs={jobs} /> : view === "plans" ? <PlansView jobs={jobs} planDetailId={planDetailId} /> : view === "profile" ? <ProfileView /> : <>
+      {jobDetailId ? <JobDetailPage job={jobs.find(j => j.id === jobDetailId)} appPlans={appPlans} saveAppPlans={saveAppPlans} changeStatus={changeStatus} onBack={() => { if (window.history.length > 1) window.history.back(); else window.location.hash = '#/jobs'; }} /> : batchDetailDate ? <BatchDetailView jobs={jobs} batchDate={batchDetailDate} onBack={() => setBatchDetailDate(null)} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "stats" ? <StatsPanel jobs={jobs} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "imports" ? <ImportsView imports={imports} onRefresh={refreshImports} onViewJobs={(date) => { setBatchDetailDate(date); }} onSwitchView={setView} /> : view === "pipeline" ? <PipelineView jobs={jobs} changeStatus={changeStatus} /> : view === "sankey" ? <SankeyView jobs={jobs} /> : view === "plans" ? <PlansView jobs={jobs} planDetailId={planDetailId} /> : view === "profile" ? <ProfileView /> : <>
       {/* Metrics Bar */}
       <div className="bg-white border-b px-6 py-3 flex gap-3 flex-wrap">
         {STATUSES.filter(s => metrics.byStatus[s] > 0 || s === "Applied").map(s => (

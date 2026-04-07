@@ -75,3 +75,40 @@ CREATE INDEX IF NOT EXISTS idx_job_state_status ON job_state(status);
 
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ai_reasoning TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS regex_score  INTEGER;
+
+-- ─────────────────────────────────────────────────────────
+-- import_batches: tracks every AI CSV import submission
+-- ─────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS import_batches (
+  id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  import_date              VARCHAR(100) NOT NULL,   -- matches jobs.import_date
+  mode                     VARCHAR(10)  NOT NULL,   -- 'live' | 'batch'
+  status                   VARCHAR(20)  NOT NULL,   -- 'queued'|'running'|'completed'|'failed'|'canceled'
+  location                 VARCHAR(255),
+  csv_filename             VARCHAR(255),
+  anthropic_batch_id       VARCHAR(128),
+  batch_processing_status  VARCHAR(32),
+  total                    INTEGER NOT NULL DEFAULT 0,
+  progress                 INTEGER NOT NULL DEFAULT 0,
+  added                    INTEGER NOT NULL DEFAULT 0,
+  scored_ai                INTEGER NOT NULL DEFAULT 0,
+  scored_fallback          INTEGER NOT NULL DEFAULT 0,
+  regex_agree              INTEGER NOT NULL DEFAULT 0,
+  ai_promoted              INTEGER NOT NULL DEFAULT 0,
+  ai_demoted               INTEGER NOT NULL DEFAULT 0,
+  estimated_cost           NUMERIC(10,4) NOT NULL DEFAULT 0,
+  request_counts           JSONB,                   -- {"processing":n,"succeeded":n,...}
+  pending_jobs             JSONB,                   -- filtered new_jobs list for restart recovery
+  message                  TEXT,
+  last_error               TEXT,
+  stopped                  BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at               TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at               TIMESTAMP NOT NULL DEFAULT NOW(),
+  started_at               TIMESTAMP,
+  finished_at              TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_import_batches_status     ON import_batches(status);
+CREATE INDEX IF NOT EXISTS idx_import_batches_created_at ON import_batches(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_import_batches_import_dt  ON import_batches(import_date);
+CREATE INDEX IF NOT EXISTS idx_import_batches_anthropic  ON import_batches(anthropic_batch_id);
