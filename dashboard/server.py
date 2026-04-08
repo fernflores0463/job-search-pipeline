@@ -5165,6 +5165,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 loc = (qs.get("location", [""])[0] or "").strip() or None
                 mode = (qs.get("mode", ["live"])[0] or "live").strip().lower()
+                # CSV filename — captured so the Imports view can show
+                # the original filename instead of the synthesized
+                # composite label. Optional for backward compat.
+                fname = (qs.get("filename", [""])[0] or "").strip() or None
                 length = int(self.headers.get("Content-Length", 0))
                 csv_bytes = self.rfile.read(length)
                 if not csv_bytes:
@@ -5183,7 +5187,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                             return
                         _ai_live_import_running = True
 
-                batch_uuid, label = _new_import_row(mode=mode, location=loc)
+                batch_uuid, label = _new_import_row(
+                    mode=mode, location=loc, csv_filename=fname
+                )
                 stop_event = threading.Event()
                 with _ai_imports_lock:
                     _ai_imports[batch_uuid] = {
