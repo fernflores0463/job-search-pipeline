@@ -3131,6 +3131,14 @@ def _run_import_csv_ai(batch_uuid, csv_bytes, location):
                 bullets = pick_bullets(j["description"], j["title"])
                 langs, frameworks, misc = customize_skills(j["description"])
                 resume_text = generate_resume_txt(j, bullets, langs, frameworks, misc)
+                # ON CONFLICT strategy: if a job with the same ID already
+                # exists, ONLY upgrade its scoring fields when (1) the
+                # existing row is regex-only (ai_reasoning IS NULL) AND
+                # (2) the incoming row has AI data. This handles the case
+                # where a job was regex-fallback-scored in an earlier batch
+                # and later re-scored successfully by Sonnet — without
+                # clobbering any manual edits, notes, or AI-generated
+                # resumes on pre-existing rows.
                 cur.execute("""
                     INSERT INTO jobs
                         (id, company, title, location, work_type, salary,
@@ -3138,7 +3146,13 @@ def _run_import_csv_ai(batch_uuid, csv_bytes, location):
                          tier, job_link, apply_link, resume_text,
                          ai_reasoning, regex_score)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (id) DO NOTHING
+                    ON CONFLICT (id) DO UPDATE SET
+                        score        = EXCLUDED.score,
+                        tier         = EXCLUDED.tier,
+                        ai_reasoning = EXCLUDED.ai_reasoning,
+                        regex_score  = EXCLUDED.regex_score
+                    WHERE jobs.ai_reasoning IS NULL
+                      AND EXCLUDED.ai_reasoning IS NOT NULL
                 """, (
                     j["id"], j["company"], j["title"], j["location"],
                     j["work_type"], j["salary"], j["posted_date"],
@@ -3434,6 +3448,14 @@ def _run_import_csv_ai_batch(batch_uuid, csv_bytes, location):
                 bullets = pick_bullets(j["description"], j["title"])
                 langs, frameworks, misc = customize_skills(j["description"])
                 resume_text = generate_resume_txt(j, bullets, langs, frameworks, misc)
+                # ON CONFLICT strategy: if a job with the same ID already
+                # exists, ONLY upgrade its scoring fields when (1) the
+                # existing row is regex-only (ai_reasoning IS NULL) AND
+                # (2) the incoming row has AI data. This handles the case
+                # where a job was regex-fallback-scored in an earlier batch
+                # and later re-scored successfully by Sonnet — without
+                # clobbering any manual edits, notes, or AI-generated
+                # resumes on pre-existing rows.
                 cur.execute("""
                     INSERT INTO jobs
                         (id, company, title, location, work_type, salary,
@@ -3441,7 +3463,13 @@ def _run_import_csv_ai_batch(batch_uuid, csv_bytes, location):
                          tier, job_link, apply_link, resume_text,
                          ai_reasoning, regex_score)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (id) DO NOTHING
+                    ON CONFLICT (id) DO UPDATE SET
+                        score        = EXCLUDED.score,
+                        tier         = EXCLUDED.tier,
+                        ai_reasoning = EXCLUDED.ai_reasoning,
+                        regex_score  = EXCLUDED.regex_score
+                    WHERE jobs.ai_reasoning IS NULL
+                      AND EXCLUDED.ai_reasoning IS NOT NULL
                 """, (
                     j["id"], j["company"], j["title"], j["location"],
                     j["work_type"], j["salary"], j["posted_date"],
@@ -3633,6 +3661,14 @@ def _run_import_csv_ai_batch_resume(batch_uuid, anthropic_batch_id):
                 bullets = pick_bullets(j["description"], j["title"])
                 langs, frameworks, misc = customize_skills(j["description"])
                 resume_text = generate_resume_txt(j, bullets, langs, frameworks, misc)
+                # ON CONFLICT strategy: if a job with the same ID already
+                # exists, ONLY upgrade its scoring fields when (1) the
+                # existing row is regex-only (ai_reasoning IS NULL) AND
+                # (2) the incoming row has AI data. This handles the case
+                # where a job was regex-fallback-scored in an earlier batch
+                # and later re-scored successfully by Sonnet — without
+                # clobbering any manual edits, notes, or AI-generated
+                # resumes on pre-existing rows.
                 cur.execute("""
                     INSERT INTO jobs
                         (id, company, title, location, work_type, salary,
@@ -3640,7 +3676,13 @@ def _run_import_csv_ai_batch_resume(batch_uuid, anthropic_batch_id):
                          tier, job_link, apply_link, resume_text,
                          ai_reasoning, regex_score)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (id) DO NOTHING
+                    ON CONFLICT (id) DO UPDATE SET
+                        score        = EXCLUDED.score,
+                        tier         = EXCLUDED.tier,
+                        ai_reasoning = EXCLUDED.ai_reasoning,
+                        regex_score  = EXCLUDED.regex_score
+                    WHERE jobs.ai_reasoning IS NULL
+                      AND EXCLUDED.ai_reasoning IS NOT NULL
                 """, (
                     j["id"], j["company"], j["title"], j["location"],
                     j["work_type"], j["salary"], j["posted_date"],
