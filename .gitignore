@@ -17,3 +17,6 @@ historical_resumes/
 infra/secrets.sh
 infra/.terraform/
 infra/terraform.tfstate*
+
+# Local Claude context file (commands, IPs, keys — never commit)
+CLAUDE.md
