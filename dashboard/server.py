@@ -1192,8 +1192,17 @@ def _build_scoring_system_prompt():
         "  - Deep domain expertise required in healthcare EMR systems",
         "    (Epic, Cerner) or insurance actuarial/P&C pricing models",
         "",
-        "Return ONLY a JSON object with this exact shape (no markdown, "
-        "no explanation outside the JSON):",
+        "ALWAYS RETURN A SCORE. If the job description is short, sparse, "
+        "vague, or missing technical details, DO NOT refuse, DO NOT ask "
+        "for more information, and DO NOT return natural-language text. "
+        "Instead, use fit_score = 3 and state in the reasoning that the "
+        "posting lacked sufficient detail to assess fit confidently. "
+        "Score based on whatever signal is available (company name, title "
+        "level, any technology keywords, etc.). You must return the JSON "
+        "object below no matter what.",
+        "",
+        "Return ONLY a JSON object with this exact shape (no markdown "
+        "fences, no explanation outside the JSON):",
         '{"fit_score": <1-10 integer>,',
         ' "reasoning": "<2 sentences max. Describe the match '
         'qualitatively, referencing specific technologies or experience. '
@@ -1233,7 +1242,14 @@ def _score_job_with_haiku(job, system_prompt):
         # Extract the JSON block from the response
         match = re.search(r'\{[\s\S]*\}', raw)
         if not match:
-            return {"used_ai": False, "error": "No JSON in response"}
+            preview = (raw or "").strip().replace("\n", " ")[:160]
+            return {
+                "used_ai": False,
+                "error": (
+                    "Sonnet returned non-JSON (likely refused to score "
+                    "a sparse description): " + (preview or "empty")
+                ),
+            }
 
         data = json.loads(match.group(0))
         ai_fit_score = int(data.get("fit_score", 5))
@@ -1325,9 +1341,18 @@ def _retrieve_anthropic_batch_results(batch_id):
                 raw = msg.content[0].text
                 m = re.search(r'\{[\s\S]*\}', raw)
                 if not m:
+                    # Sonnet returned natural language instead of JSON.
+                    # Happens when the job description is too sparse and
+                    # the model refuses to guess. Include a preview of
+                    # what it said so the fallback reason is obvious.
+                    preview = (raw or "").strip().replace("\n", " ")[:160]
                     yield custom_id, {
                         "used_ai": False,
-                        "error": "No JSON in batch response"
+                        "error": (
+                            "Sonnet returned non-JSON (likely refused "
+                            "to score a sparse description): "
+                            + (preview or "empty response")
+                        ),
                     }
                     continue
                 data = json.loads(m.group(0))
