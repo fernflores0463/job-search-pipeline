@@ -70,7 +70,11 @@ function renderMarkdown(text) {
 const VALID_ROUTES = ['jobs', 'stats', 'imports', 'pipeline', 'sankey', 'plans', 'profile'];
 function parseHash() {
   const raw = decodeURIComponent(window.location.hash.replace(/^#\/?/, ''));
-  const r = { view: 'jobs', batchDate: null, jobId: null, jobDetailId: null, planId: null };
+  const r = { view: 'jobs', batchDate: null, jobId: null, jobDetailId: null, planId: null, statsBatch: null };
+  // Check for stats-inline-batch route: #/stats/batch/<date>
+  // (separate from #/batch/<date> which is the dedicated full-page view)
+  const statsBatchMatch = raw.match(/^stats\/batch\/(.+)$/i);
+  if (statsBatchMatch) return { ...r, view: 'stats', statsBatch: statsBatchMatch[1] };
   // Check for batch route: #/batch/<date>
   const batchMatch = raw.match(/^batch\/(.+)$/i);
   if (batchMatch) return { ...r, view: 'stats', batchDate: batchMatch[1] };
@@ -94,6 +98,7 @@ function useHashRoute() {
   const [hashJobId, setHashJobId] = useState(initial.jobId);
   const [hashJobDetailId, setHashJobDetailId] = useState(initial.jobDetailId);
   const [hashPlanId, setHashPlanId] = useState(initial.planId);
+  const [hashStatsBatch, setHashStatsBatchState] = useState(initial.statsBatch);
   const suppressHash = useRef(false);
 
   useEffect(() => {
@@ -105,6 +110,7 @@ function useHashRoute() {
       setHashJobId(parsed.jobId);
       setHashJobDetailId(parsed.jobDetailId);
       setHashPlanId(parsed.planId);
+      setHashStatsBatchState(parsed.statsBatch);
     };
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
@@ -116,11 +122,26 @@ function useHashRoute() {
     setHashJobId(null);
     setHashJobDetailId(null);
     setHashPlanId(null);
+    setHashStatsBatchState(null);
     suppressHash.current = true;
     window.location.hash = '#/' + v;
   }, []);
 
-  return [view, setView, hashBatchDate, setHashBatchDate, hashJobId, setHashJobId, hashJobDetailId, setHashJobDetailId, hashPlanId, setHashPlanId];
+  // Setter for the inline expanded batch in the Stats view. Pass null
+  // to collapse and return to #/stats; pass a batch date to expand and
+  // route to #/stats/batch/<date>.
+  const setHashStatsBatch = useCallback((date) => {
+    setHashStatsBatchState(date);
+    setViewState('stats');
+    suppressHash.current = true;
+    if (date) {
+      window.location.hash = '#/stats/batch/' + encodeURIComponent(date);
+    } else {
+      window.location.hash = '#/stats';
+    }
+  }, []);
+
+  return [view, setView, hashBatchDate, setHashBatchDate, hashJobId, setHashJobId, hashJobDetailId, setHashJobDetailId, hashPlanId, setHashPlanId, hashStatsBatch, setHashStatsBatch];
 }
 
 const STATUSES = [
@@ -795,7 +816,9 @@ function PlansView({ jobs, planDetailId }) {
                               )}
                               {job.resume_path && (
                                 <button onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title, job.id)}
-                                  className="text-xs text-blue-600 hover:underline">View Resume</button>
+                                  className={"text-xs hover:underline " + (job.ai_resume_status === 'ready' ? 'text-fuchsia-600' : 'text-blue-600')}>
+                                  {job.ai_resume_status === 'ready' ? '\u{1F916} View AI Resume' : 'View Resume'}
+                                </button>
                               )}
                               {job.pdf_path && (
                                 <a href={'/' + job.pdf_path} target="_blank" rel="noopener"
@@ -1487,10 +1510,29 @@ function SankeyView({ jobs }) {
   );
 }
 
-function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
+function StatsPanel({ jobs, appPlans = [], saveAppPlans, expandedBatch, setExpandedBatch }) {
   const { useMemo, useState } = React;
-  const [expandedBatch, setExpandedBatch] = useState(null);
+  // Local fallback when not used inside the routed App (e.g., in tests
+  // or future embeddings). Inside the dashboard, App always passes
+  // expandedBatch / setExpandedBatch from useHashRoute so the URL
+  // stays in sync with which batch row is expanded inline.
+  const [localExpandedBatch, setLocalExpandedBatch] = useState(null);
+  const effectiveExpandedBatch = expandedBatch !== undefined
+    ? expandedBatch
+    : localExpandedBatch;
+  const effectiveSetExpandedBatch = setExpandedBatch || setLocalExpandedBatch;
   const [batchTierFilter, setBatchTierFilter] = useState('all');
+  // Auto-scroll the expanded batch row into view when arriving from a
+  // deep link (#/stats/batch/<date>) or after the user clicks a row
+  // that was scrolled below the fold.
+  const expandedBatchRowRef = React.useRef(null);
+  React.useEffect(() => {
+    if (effectiveExpandedBatch && expandedBatchRowRef.current) {
+      expandedBatchRowRef.current.scrollIntoView({
+        behavior: 'smooth', block: 'start',
+      });
+    }
+  }, [effectiveExpandedBatch]);
   const [selectedBatchJobId, setSelectedBatchJobId] = useState(null);
   const [descCache, setDescCache] = useState({});
   const [companyCache, setCompanyCache] = useState({});
@@ -1603,7 +1645,7 @@ function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
             </thead>
             <tbody>
               {batchStats.map(b => {
-                const isExpanded = expandedBatch === b.date;
+                const isExpanded = effectiveExpandedBatch === b.date;
                 const batchJobs = isExpanded ? jobs.filter(j => (j.import_date || 'Unknown') === b.date) : [];
                 const batchCompanies = isExpanded ? (() => {
                   const cc = {};
@@ -1627,8 +1669,9 @@ function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
 
                 return (
                   <React.Fragment key={b.date}>
-                    <tr className={"border-b cursor-pointer transition-colors " + (b.date === 'AI Import' ? (isExpanded ? "bg-purple-100" : "bg-purple-50 hover:bg-purple-100") : (isExpanded ? "bg-blue-50" : "hover:bg-gray-50"))}
-                        onClick={() => { setExpandedBatch(isExpanded ? null : b.date); setBatchTierFilter('all'); setSelectedBatchJobId(null); }}>
+                    <tr ref={isExpanded ? expandedBatchRowRef : null}
+                        className={"border-b cursor-pointer transition-colors " + (b.date === 'AI Import' ? (isExpanded ? "bg-purple-100" : "bg-purple-50 hover:bg-purple-100") : (isExpanded ? "bg-blue-50" : "hover:bg-gray-50"))}
+                        onClick={() => { effectiveSetExpandedBatch(isExpanded ? null : b.date); setBatchTierFilter('all'); setSelectedBatchJobId(null); }}>
                       <td className={"py-2 pr-4 font-medium " + (b.date === 'AI Import' ? "text-purple-700" : "text-gray-700")}>
                         <span className={"inline-block mr-2 text-xs transition-transform " + (isExpanded ? "transform rotate-90" : "")}>&#9654;</span>
                         {b.date === 'AI Import' ? '\u{1F916} AI Import' : b.date}
@@ -1730,7 +1773,9 @@ function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
                                       return (
                                         <React.Fragment key={j.id}>
                                           <tr className={"border-b border-gray-100 cursor-pointer " + (isJobExpanded ? "bg-blue-50" : "hover:bg-gray-50")}
-                                              onClick={() => { if (!isJobExpanded) { fetchDescription(j.id); fetchCompanyInfo(j.company); } setSelectedBatchJobId(isJobExpanded ? null : j.id); }}>
+                                              onClick={() => { if (!isJobExpanded) { fetchDescription(j.id); fetchCompanyInfo(j.company); } setSelectedBatchJobId(isJobExpanded ? null : j.id); }}
+                                              onDoubleClick={() => window._openJobDetail && window._openJobDetail(j.id)}
+                                              title="Click to expand inline · double-click for full page">
                                             <td className="py-1.5 pr-2 font-bold text-gray-700">{j.score}</td>
                                             <td className="py-1.5 pr-2">
                                               <span className={"px-1.5 py-0.5 rounded text-xs font-medium " + tc}>
@@ -1882,8 +1927,8 @@ function StatsPanel({ jobs, appPlans = [], saveAppPlans }) {
                                                     {j.resume_path && (
                                                       <button
                                                         onClick={e => { e.stopPropagation(); window._showResume && window._showResume(j.resume_path, j.company, j.title, j.id); }}
-                                                        className="px-2.5 py-1 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">
-                                                        View Resume
+                                                        className={"px-2.5 py-1 rounded text-xs font-medium border " + (j.ai_resume_status === 'ready' ? 'bg-fuchsia-100 text-fuchsia-700 hover:bg-fuchsia-200 border-fuchsia-300' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')}>
+                                                        {j.ai_resume_status === 'ready' ? '\u{1F916} View AI Resume' : 'View Resume'}
                                                       </button>
                                                     )}
                                                     {j.pdf_path && (
@@ -2283,7 +2328,10 @@ function JobDetailPage({ job, appPlans = [], saveAppPlans, changeStatus, onBack 
           <div className="flex items-start justify-between">
             <div>
               <h1 className="text-2xl font-bold text-gray-900">{job.company}</h1>
-              <p className="text-lg text-gray-600 mt-1">{job.title}</p>
+              <p className="text-lg text-gray-600 mt-1">
+                {job.title}
+                <AiResumeBadge job={job} />
+              </p>
             </div>
             <span className={"px-3 py-1 rounded text-sm font-medium " + TIER_COLORS[job.tier]}>
               {job.tier} (Score: {job.score})
@@ -2339,9 +2387,24 @@ function JobDetailPage({ job, appPlans = [], saveAppPlans, changeStatus, onBack 
             </a>
           )}
           <button onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title, job.id)}
-            className="px-4 py-2 bg-gray-100 text-gray-700 rounded text-sm font-medium hover:bg-gray-200 border">
-            View Resume
+            className={"px-4 py-2 rounded text-sm font-medium border " + (job.ai_resume_status === 'ready' ? 'bg-fuchsia-100 text-fuchsia-700 hover:bg-fuchsia-200 border-fuchsia-300' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')}>
+            {job.ai_resume_status === 'ready' ? '\u{1F916} View AI Resume' : 'View Resume'}
           </button>
+          {job.ai_resume_status !== 'pending' && (() => {
+            const selected = !!(window._isAiResumeSelected && window._isAiResumeSelected(job.id));
+            return (
+              <button onClick={() => window._toggleAiResumeSelection && window._toggleAiResumeSelection(job.id)}
+                className={"px-4 py-2 rounded text-sm font-medium border " + (selected ? 'bg-fuchsia-600 text-white hover:bg-fuchsia-700 border-fuchsia-600' : 'bg-fuchsia-50 text-fuchsia-700 hover:bg-fuchsia-100 border-fuchsia-300')}>
+                {selected ? '\u2713 In AI Batch' : '\u{1F916} Add to AI Batch'}
+              </button>
+            );
+          })()}
+          {job.ai_resume_status === 'pending' && (
+            <span className="px-4 py-2 rounded text-sm font-medium bg-fuchsia-50 text-fuchsia-700 border border-fuchsia-200 inline-flex items-center gap-2">
+              <span className="inline-block w-2 h-2 rounded-full bg-fuchsia-500 animate-pulse"></span>
+              AI resume generating
+            </span>
+          )}
           <button onClick={() => window._openAIChat && window._openAIChat(job.id, job.company + ' \u2014 ' + job.title)}
             className="px-4 py-2 bg-purple-600 text-white rounded text-sm font-medium hover:bg-purple-700">
             Ask AI
@@ -2694,6 +2757,9 @@ function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans 
         <table className="w-full text-sm">
           <thead>
             <tr className="bg-gray-50 border-b text-left text-xs text-gray-500">
+              <th className="py-2 px-2 w-6 text-center" title="Select for AI Resume batch">
+                <span className="text-pink-500">&#129302;</span>
+              </th>
               <th className="py-2 px-3 cursor-pointer hover:text-gray-800" onClick={() => toggleSort('score')}>Score{sortArrow('score')}</th>
               <th className="py-2 px-3 cursor-pointer hover:text-gray-800" onClick={() => toggleSort('tier')}>Tier{sortArrow('tier')}</th>
               <th className="py-2 px-3 cursor-pointer hover:text-gray-800" onClick={() => toggleSort('company')}>Company{sortArrow('company')}</th>
@@ -2711,7 +2777,19 @@ function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans 
               return (
                 <React.Fragment key={j.id}>
                   <tr className={"border-b cursor-pointer " + (isExpanded ? "bg-blue-50" : "hover:bg-gray-50")}
-                      onClick={() => { if (!isExpanded) { fetchDescription(j.id); fetchCompanyInfo(j.company); } setExpandedJobId(isExpanded ? null : j.id); }}>
+                      onClick={() => { if (!isExpanded) { fetchDescription(j.id); fetchCompanyInfo(j.company); } setExpandedJobId(isExpanded ? null : j.id); }}
+                      onDoubleClick={() => window._openJobDetail && window._openJobDetail(j.id)}
+                      title="Click to expand inline · double-click for full page">
+                    <td className="py-2 px-2 text-center" onClick={e => e.stopPropagation()}>
+                      <input
+                        type="checkbox"
+                        checked={!!(window._isAiResumeSelected && window._isAiResumeSelected(j.id))}
+                        disabled={j.ai_resume_status === 'pending'}
+                        onChange={() => window._toggleAiResumeSelection && window._toggleAiResumeSelection(j.id)}
+                        className="cursor-pointer"
+                        title={j.ai_resume_status === 'pending' ? 'AI resume currently generating' : 'Add to AI resume batch'}
+                      />
+                    </td>
                     <td className="py-2 px-3 font-bold text-gray-700">{j.score}</td>
                     <td className="py-2 px-3">
                       <span className={"px-1.5 py-0.5 rounded text-xs font-medium " + tc}>
@@ -2719,7 +2797,10 @@ function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans 
                       </span>
                     </td>
                     <td className="py-2 px-3 font-medium text-gray-800 truncate" style={{maxWidth: '180px'}} title={j.company}>{j.company}</td>
-                    <td className="py-2 px-3 text-gray-600 truncate" style={{maxWidth: '250px'}} title={j.title}>{j.title}</td>
+                    <td className="py-2 px-3 text-gray-600 truncate" style={{maxWidth: '250px'}} title={j.title}>
+                      {j.title}
+                      <AiResumeBadge job={j} />
+                    </td>
                     <td className="py-2 px-3 text-gray-600 text-xs">{j.salary !== 'N/A' ? j.salary : ''}</td>
                     <td className="py-2 px-3">
                       <select value={j.status || 'New'}
@@ -2740,7 +2821,7 @@ function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans 
                   </tr>
                   {isExpanded && (
                     <tr>
-                      <td colSpan="7" className="p-0">
+                      <td colSpan="8" className="p-0">
                         <div className="bg-white border-t border-b border-blue-100 p-4">
                           <div className="flex justify-between items-start mb-3">
                             <div>
@@ -2840,7 +2921,9 @@ function BatchDetailView({ jobs, batchDate, onBack, appPlans = [], saveAppPlans 
                             )}
                             {j.resume_path && (
                               <button onClick={e => { e.stopPropagation(); window._showResume && window._showResume(j.resume_path, j.company, j.title, j.id); }}
-                                className="px-2.5 py-1 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">View Resume</button>
+                                className={"px-2.5 py-1 rounded text-xs font-medium border " + (j.ai_resume_status === 'ready' ? 'bg-fuchsia-100 text-fuchsia-700 hover:bg-fuchsia-200 border-fuchsia-300' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')}>
+                                {j.ai_resume_status === 'ready' ? '\u{1F916} View AI Resume' : 'View Resume'}
+                              </button>
                             )}
                             {j.pdf_path && (
                               <a href={'/' + j.pdf_path} target="_blank" rel="noopener" onClick={e => e.stopPropagation()}
@@ -3029,10 +3112,58 @@ function ImportsView({ imports, onRefresh, onViewJobs, onSwitchView }) {
   );
 }
 
+// ── AI Resume status badge ─────────────────────────────────
+// Renders a small inline pill next to a job's title showing whether
+// the job is awaiting an AI resume, has one ready, or failed. Hidden
+// for jobs that have never gone through the Sonnet pipeline.
+//
+// The 'failed' variant is clickable — it opens the AiResumeFailureModal
+// which shows the validator errors plus a best-effort preview of what
+// Sonnet produced, with Edit-as-text and Retry escape hatches.
+function AiResumeBadge({ job }) {
+  const status = job?.ai_resume_status;
+  if (!status) return null;
+  if (status === 'pending') {
+    return (
+      <span className="ml-2 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-fuchsia-50 text-fuchsia-700 border border-fuchsia-200"
+            title="AI resume is being generated">
+        <span className="inline-block w-2 h-2 rounded-full bg-fuchsia-500 animate-pulse"></span>
+        Generating
+      </span>
+    );
+  }
+  if (status === 'ready') {
+    return (
+      <span className="ml-2 inline-block px-1.5 py-0.5 rounded text-[10px] font-medium bg-fuchsia-100 text-fuchsia-700 border border-fuchsia-300"
+            title="AI-tailored resume ready">
+        &#129302; AI Resume
+      </span>
+    );
+  }
+  if (status === 'failed') {
+    return (
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          if (window._showAiResumeFailure) {
+            window._showAiResumeFailure(job.id);
+          }
+        }}
+        className="ml-2 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 cursor-pointer"
+        title="Click to inspect what Sonnet produced and recover">
+        <span>&#9888;</span> AI Failed
+      </button>
+    );
+  }
+  return null;
+}
+
+
 function App() {
   const [jobs, setJobs] = useState([]);
   const [batchStats, setBatchStats] = useState([]);
-  const [view, setView, batchDetailDate, setHashBatchDate, selectedId, setHashJobId, jobDetailId, setJobDetailId, planDetailId, setPlanDetailId] = useHashRoute();
+  const [view, setView, batchDetailDate, setHashBatchDate, selectedId, setHashJobId, jobDetailId, setJobDetailId, planDetailId, setPlanDetailId, statsExpandedBatch, setStatsExpandedBatch] = useHashRoute();
   const [loaded, setLoaded] = useState(!IS_SERVED);
   const [filters, setFilters] = useState({
     tiers: [], statuses: [], search: "", favoritesOnly: false, aiScoredOnly: false
@@ -3080,7 +3211,8 @@ function App() {
   const [aiCsvLocation, setAiCsvLocation]       = useState('');
   const [aiCsvStatus, setAiCsvStatus]           = useState(null);
   // Submit via Anthropic Batch API for 50% cost discount (async).
-  const [aiCsvUseBatch, setAiCsvUseBatch]       = useState(false);
+  // Defaults to true — batch mode is the recommended path.
+  const [aiCsvUseBatch, setAiCsvUseBatch]       = useState(true);
   // Ref to the live EventSource so we can close it on demand.
   const aiCsvStreamRef = useRef(null);
   // UUID of the most recently submitted AI CSV import (drives panel updates).
@@ -3109,6 +3241,169 @@ function App() {
   const [showManualAdd, setShowManualAdd] = useState(false);
   const [manualJob, setManualJob] = useState({ company: '', title: '', description: '', job_link: '', apply_link: '', location: '', salary: '', work_type: '' });
   const [manualAddStatus, setManualAddStatus] = useState(null);
+
+  // ── AI Resume bullet generation (Phase 2) ─────────────
+  // Multi-select state for jobs the user wants to generate
+  // tailored AI resumes for. Submitted as a single Anthropic batch.
+  const [aiResumeSelection, setAiResumeSelection] = useState(() => new Set());
+  const [aiResumeBatches, setAiResumeBatches] = useState([]);
+  const [showAiResumeCostPreview, setShowAiResumeCostPreview] = useState(false);
+  const [aiResumeCostPreview, setAiResumeCostPreview] = useState(null);
+  const [aiResumeSubmitStatus, setAiResumeSubmitStatus] = useState(null);
+
+  const toggleAiResumeSelection = useCallback((jobId) => {
+    setAiResumeSelection(prev => {
+      const next = new Set(prev);
+      if (next.has(jobId)) next.delete(jobId); else next.add(jobId);
+      return next;
+    });
+  }, []);
+
+  const clearAiResumeSelection = useCallback(() => {
+    setAiResumeSelection(new Set());
+  }, []);
+
+  // Expose toggle on window so deeply-nested table rows can call it
+  // without prop-drilling through every component.
+  useEffect(() => {
+    window._toggleAiResumeSelection = toggleAiResumeSelection;
+    window._isAiResumeSelected = (id) => aiResumeSelection.has(id);
+    return () => {
+      delete window._toggleAiResumeSelection;
+      delete window._isAiResumeSelected;
+    };
+  }, [toggleAiResumeSelection, aiResumeSelection]);
+
+  // Open the cost preview modal — fetches estimate from server.
+  const openAiResumeCostPreview = useCallback(async () => {
+    if (!IS_SERVED || aiResumeSelection.size === 0) return;
+    const ids = Array.from(aiResumeSelection);
+    try {
+      const r = await fetch('/api/ai-resume/estimate', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({job_ids: ids}),
+      });
+      const data = await r.json();
+      setAiResumeCostPreview(data);
+      setShowAiResumeCostPreview(true);
+    } catch (e) {
+      setAiResumeCostPreview({error: String(e)});
+      setShowAiResumeCostPreview(true);
+    }
+  }, [aiResumeSelection]);
+
+  const submitAiResumeBatch = useCallback(async () => {
+    if (!IS_SERVED || aiResumeSelection.size === 0) return;
+    const ids = Array.from(aiResumeSelection);
+    setAiResumeSubmitStatus({submitting: true});
+    try {
+      const r = await fetch('/api/ai-resume/batch', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({job_ids: ids}),
+      });
+      const data = await r.json();
+      if (data.error) {
+        setAiResumeSubmitStatus({submitting: false, error: data.error});
+        return;
+      }
+      setAiResumeSubmitStatus({submitting: false, ok: true, count: data.count});
+      setShowAiResumeCostPreview(false);
+      clearAiResumeSelection();
+      // Trigger an immediate refresh of jobs so badges flip to pending,
+      // and refresh the batches list so the in-flight tray shows it.
+      refreshAiResumeBatches();
+      if (window._refreshJobs) window._refreshJobs();
+    } catch (e) {
+      setAiResumeSubmitStatus({submitting: false, error: String(e)});
+    }
+  }, [aiResumeSelection, clearAiResumeSelection]);
+
+  const refreshAiResumeBatches = useCallback(async () => {
+    if (!IS_SERVED) return;
+    try {
+      const r = await fetch('/api/ai-resume/batches');
+      if (!r.ok) return;
+      const data = await r.json();
+      setAiResumeBatches(prev => {
+        // Detect any batch that just transitioned to completed so we
+        // can trigger a jobs refresh (badges flip ready/failed).
+        const prevById = Object.fromEntries(prev.map(b => [b.id, b.status]));
+        const newlyDone = data.filter(b =>
+          (b.status === 'completed' || b.status === 'failed')
+          && prevById[b.id] && prevById[b.id] !== b.status
+        );
+        if (newlyDone.length && window._refreshJobs) {
+          window._refreshJobs();
+        }
+        return data;
+      });
+    } catch (_) {}
+  }, []);
+
+  // Background polling at 60s while any batch is in flight, plus an
+  // immediate fetch on mount so the in-flight tray populates.
+  useEffect(() => {
+    if (!IS_SERVED) return;
+    refreshAiResumeBatches();
+    const id = setInterval(refreshAiResumeBatches, 60000);
+    return () => clearInterval(id);
+  }, [refreshAiResumeBatches]);
+
+  // Cancel a single in-flight batch
+  const cancelAiResumeBatch = useCallback(async (batchUuid) => {
+    if (!IS_SERVED) return;
+    try {
+      await fetch(`/api/ai-resume/batches/${encodeURIComponent(batchUuid)}/cancel`, {
+        method: 'POST',
+      });
+      refreshAiResumeBatches();
+    } catch (_) {}
+  }, [refreshAiResumeBatches]);
+
+  // Live regenerate (sync) for the resume modal
+  const regenerateAiResume = useCallback(async (jobId) => {
+    if (!IS_SERVED || !jobId) return {ok: false, message: 'no job'};
+    try {
+      const r = await fetch('/api/ai-resume/regenerate', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({job_id: jobId}),
+      });
+      const data = await r.json();
+      if (data.ok && window._refreshJobs) window._refreshJobs();
+      return data;
+    } catch (e) {
+      return {ok: false, message: String(e)};
+    }
+  }, []);
+
+  // Plain-text edit save (no AI involved)
+  const saveAiResumeEdit = useCallback(async (jobId, resumeText) => {
+    if (!IS_SERVED || !jobId) return {ok: false};
+    try {
+      const r = await fetch('/api/ai-resume/edit', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({job_id: jobId, resume_text: resumeText}),
+      });
+      return await r.json();
+    } catch (e) {
+      return {ok: false, error: String(e)};
+    }
+  }, []);
+
+  // Expose the regenerate + save handlers on window so the global
+  // ResumePreviewModal (rendered as a sibling of <App />) can call them.
+  useEffect(() => {
+    window._regenerateAiResume = regenerateAiResume;
+    window._saveAiResumeEdit = saveAiResumeEdit;
+    return () => {
+      delete window._regenerateAiResume;
+      delete window._saveAiResumeEdit;
+    };
+  }, [regenerateAiResume, saveAiResumeEdit]);
 
   const inferLocationFromFilename = (filename) => {
     const STOP_WORDS = /\b(jobs?|export|linkedin|easy|apply|results?|search|csv|import)\b/gi;
@@ -3265,6 +3560,23 @@ function App() {
       setLoaded(true);
     }).catch(() => setLoaded(true));
   }, []);
+
+  // Re-fetch /api/jobs-data on demand. Used by the AI resume batch
+  // polling code so badges update when a batch completes.
+  const refreshJobs = useCallback(async () => {
+    if (!IS_SERVED) return;
+    try {
+      const r = await fetch('/api/jobs-data');
+      if (!r.ok) return;
+      const apiJobs = await r.json();
+      setJobs(initJobsFromApi(Array.isArray(apiJobs) ? apiJobs : []));
+    } catch (_) {}
+  }, []);
+
+  useEffect(() => {
+    window._refreshJobs = refreshJobs;
+    return () => { delete window._refreshJobs; };
+  }, [refreshJobs]);
 
   // ── /api/imports-stream subscription ──────────────────
   useEffect(() => {
@@ -3544,13 +3856,170 @@ function App() {
 
   return (
     <div className="min-h-screen">
+      {/* AI Resume floating action bar — appears when any job is
+          checked. Bottom-center so it does NOT collide with the
+          AI Assistant FAB in the bottom-right. zIndex 9999 (inline)
+          keeps it above the FAB and modals (Tailwind v2 caps z-50). */}
+      {aiResumeSelection.size > 0 && (
+        <div
+          className="fixed bottom-6 flex items-center gap-4 px-6 py-4 rounded-full"
+          style={{
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 9999,
+            backgroundColor: '#a21caf',     /* fuchsia-700 — solid, vivid */
+            color: '#ffffff',
+            border: '4px solid #ffffff',
+            boxShadow: '0 12px 36px rgba(168, 85, 247, 0.65), 0 6px 18px rgba(0,0,0,0.30)',
+            minWidth: '380px',
+          }}>
+          <span style={{fontSize: '24px'}}>&#129302;</span>
+          <span style={{
+            fontSize: '15px',
+            fontWeight: 800,
+            color: '#ffffff',
+            whiteSpace: 'nowrap',
+          }}>
+            {aiResumeSelection.size} job{aiResumeSelection.size === 1 ? '' : 's'} selected
+          </span>
+          <button
+            onClick={openAiResumeCostPreview}
+            style={{
+              backgroundColor: '#ffffff',
+              color: '#a21caf',
+              fontWeight: 800,
+              fontSize: '14px',
+              padding: '8px 18px',
+              borderRadius: '9999px',
+              border: 'none',
+              cursor: 'pointer',
+              whiteSpace: 'nowrap',
+              boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
+            }}
+            onMouseEnter={e => { e.currentTarget.style.backgroundColor = '#fdf4ff'; }}
+            onMouseLeave={e => { e.currentTarget.style.backgroundColor = '#ffffff'; }}>
+            Generate AI Resumes &rarr;
+          </button>
+          <button
+            onClick={clearAiResumeSelection}
+            title="Clear selection"
+            style={{
+              color: '#ffffff',
+              backgroundColor: 'transparent',
+              border: 'none',
+              cursor: 'pointer',
+              fontSize: '22px',
+              lineHeight: 1,
+              width: '28px',
+              height: '28px',
+              borderRadius: '9999px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+            onMouseEnter={e => { e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.2)'; }}
+            onMouseLeave={e => { e.currentTarget.style.backgroundColor = 'transparent'; }}>
+            &times;
+          </button>
+        </div>
+      )}
+
+      {/* Cost preview modal */}
+      {showAiResumeCostPreview && (
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-40 flex items-center justify-center"
+             onClick={() => setShowAiResumeCostPreview(false)}>
+          <div className="bg-white rounded-lg shadow-2xl max-w-md w-full p-6 m-4"
+               onClick={e => e.stopPropagation()}>
+            <h2 className="text-lg font-bold text-gray-900 mb-2 flex items-center gap-2">
+              <span className="text-fuchsia-500">&#129302;</span>
+              Generate AI Resumes
+            </h2>
+            {aiResumeCostPreview?.error ? (
+              <p className="text-sm text-red-600 mt-2">Error: {aiResumeCostPreview.error}</p>
+            ) : aiResumeCostPreview ? (
+              <>
+                <p className="text-sm text-gray-700 mt-2">
+                  Submitting <span className="font-semibold">{aiResumeCostPreview.count}</span> job
+                  {aiResumeCostPreview.count === 1 ? '' : 's'} to Claude Sonnet via the
+                  Anthropic Batch API.
+                </p>
+                <div className="mt-3 bg-gray-50 rounded p-3 text-sm space-y-1">
+                  <div className="flex justify-between">
+                    <span className="text-gray-500">Estimated cost (batch, 50% off):</span>
+                    <span className="font-mono font-semibold text-fuchsia-700">
+                      ~${(aiResumeCostPreview.cost_batch ?? 0).toFixed(3)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-xs text-gray-400">
+                    <span>(live regenerate cost would be)</span>
+                    <span className="font-mono">
+                      ~${(aiResumeCostPreview.cost_live ?? 0).toFixed(3)}
+                    </span>
+                  </div>
+                </div>
+                <p className="text-xs text-gray-500 mt-2">
+                  Anthropic batches usually finish in well under 24 hours. You can close
+                  the dashboard — results land in the background and the badges flip
+                  when each job is ready.
+                </p>
+              </>
+            ) : (
+              <p className="text-sm text-gray-500">Loading estimate&hellip;</p>
+            )}
+            {aiResumeSubmitStatus?.error && (
+              <p className="text-sm text-red-600 mt-2">Error: {aiResumeSubmitStatus.error}</p>
+            )}
+            <div className="flex justify-end gap-2 mt-5">
+              <button
+                onClick={() => setShowAiResumeCostPreview(false)}
+                className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded">
+                Cancel
+              </button>
+              <button
+                onClick={submitAiResumeBatch}
+                disabled={!aiResumeCostPreview || aiResumeSubmitStatus?.submitting}
+                className="px-4 py-2 text-sm font-semibold bg-fuchsia-600 text-white rounded hover:bg-fuchsia-700 disabled:opacity-50">
+                {aiResumeSubmitStatus?.submitting ? 'Submitting...' : 'Submit Batch'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* AI Resume in-flight batches tray */}
+      {aiResumeBatches.filter(b => b.status === 'queued' || b.status === 'running').length > 0 && (
+        <div className="fixed bottom-6 left-6 z-30 bg-white border border-fuchsia-200 rounded-lg shadow-md max-w-sm">
+          <div className="px-3 py-2 border-b bg-fuchsia-50 text-xs font-semibold text-fuchsia-700 flex items-center gap-2">
+            <span>&#129302;</span> AI Resume Batches
+          </div>
+          <div className="max-h-48 overflow-y-auto divide-y">
+            {aiResumeBatches.filter(b => b.status === 'queued' || b.status === 'running').map(b => (
+              <div key={b.id} className="px-3 py-2 text-xs flex items-center justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="text-gray-700 truncate">
+                    {b.message || (b.status + ' · ' + (b.total || 0) + ' jobs')}
+                  </div>
+                  <div className="text-gray-400">
+                    {b.succeeded || 0} ok · {b.failed || 0} failed · {b.total || 0} total
+                  </div>
+                </div>
+                <button
+                  onClick={() => cancelAiResumeBatch(b.id)}
+                  className="text-gray-400 hover:text-red-500 text-xs"
+                  title="Cancel polling">&times;</button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Header — hidden when job detail page is active */}
       {!jobDetailId && <>
-      <div className="bg-white border-b px-6 py-4 flex items-center justify-between">
-        <div>
-          <div className="flex items-center gap-3">
-          <h1 className="text-xl font-bold text-gray-900">Job Search Dashboard</h1>
-          <div className="flex rounded-lg border overflow-hidden text-xs font-medium">
+      <div className="bg-white border-b px-6 py-4 flex flex-wrap items-center justify-between gap-y-3 gap-x-4">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <h1 className="text-xl font-bold text-gray-900 whitespace-nowrap">Job Search Dashboard</h1>
+          <div className="flex flex-wrap rounded-lg border overflow-hidden text-xs font-medium">
             <button
               onClick={() => setView("jobs")}
               className={"px-3 py-1.5 " + (view === "jobs" ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50")}
@@ -3586,55 +4055,55 @@ function App() {
             >&#128100; Profile</button>
           </div>
         </div>
-          <p className="text-sm text-gray-500">{metrics.total} positions | {metrics.applied} applied</p>
+          <p className="text-sm text-gray-500 mt-1">{metrics.total} positions | {metrics.applied} applied</p>
         </div>
-        <div className="flex gap-4 text-sm items-center">
+        <div className="flex flex-wrap gap-2 text-sm items-center">
           {["Strong Match", "Match", "Weak Match"].map(t => (
-            <span key={t} className={"px-2 py-1 rounded text-xs font-medium " + TIER_COLORS[t]}>
+            <span key={t} className={"px-2 py-1 rounded text-xs font-medium whitespace-nowrap flex-shrink-0 " + TIER_COLORS[t]}>
               {t}: {metrics.byTier[t]}
             </span>
           ))}
           {IS_SERVED && (
             updateStatus?.running ? (
-              <span className="ml-2 text-xs text-gray-500">
+              <span className="text-xs text-gray-500 whitespace-nowrap">
                 Updating applicants: {updateStatus.progress}/{updateStatus.total} ({updateStatus.updated} done)
               </span>
             ) : (
               <>
               <button
                 onClick={startApplicantUpdate}
-                className="ml-2 px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border"
+                className="px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border whitespace-nowrap"
               >
                 Update Applicants
               </button>
               <button
                 onClick={() => setShowScrape(!showScrape)}
-                className={"ml-2 px-3 py-1.5 rounded text-xs font-medium border " + (showScrape ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}
+                className={"px-3 py-1.5 rounded text-xs font-medium border whitespace-nowrap " + (showScrape ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}
               >
                 &#128279; Import URL
               </button>
               <button
                 onClick={() => setShowImport(!showImport)}
-                className={"ml-2 px-3 py-1.5 rounded text-xs font-medium border " + (showImport ? "bg-green-600 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}
+                className={"px-3 py-1.5 rounded text-xs font-medium border whitespace-nowrap " + (showImport ? "bg-green-600 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}
               >
                 &#128196; Import CSV
               </button>
               <button
                 onClick={() => setShowAICsvImport(!showAICsvImport)}
-                className={"ml-2 px-3 py-1.5 rounded text-xs font-semibold border-2 transition-colors " + (showAICsvImport ? "bg-pink-600 text-white border-pink-700 shadow-md" : "bg-pink-100 text-pink-800 border-pink-500 hover:bg-pink-200")}
+                className={"px-3 py-1.5 rounded text-xs font-semibold border-2 transition-colors whitespace-nowrap " + (showAICsvImport ? "bg-pink-600 text-white border-pink-700 shadow-md" : "bg-pink-100 text-pink-800 border-pink-500 hover:bg-pink-200")}
                 title="Score a CSV with Claude AI instead of regex"
               >
                 &#129302; AI Import CSV
               </button>
               <button
                 onClick={() => setShowAIImport(!showAIImport)}
-                className={"ml-2 px-3 py-1.5 rounded text-xs font-medium border " + (showAIImport ? "bg-purple-600 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}
+                className={"px-3 py-1.5 rounded text-xs font-medium border whitespace-nowrap " + (showAIImport ? "bg-purple-600 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}
               >
                 &#129302; AI Import URL
               </button>
               <button
                 onClick={() => setShowManualAdd(!showManualAdd)}
-                className={"ml-2 px-3 py-1.5 rounded text-xs font-medium border " + (showManualAdd ? "bg-gray-800 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}
+                className={"px-3 py-1.5 rounded text-xs font-medium border whitespace-nowrap " + (showManualAdd ? "bg-gray-800 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}
               >
                 &#43; Add Job
               </button>
@@ -3642,15 +4111,15 @@ function App() {
             )
           )}
           {updateStatus && !updateStatus.running && updateStatus.message && (
-            <span className="ml-2 text-xs text-green-600">{updateStatus.message}</span>
+            <span className="text-xs text-green-600 whitespace-nowrap">{updateStatus.message}</span>
           )}
           {IS_SERVED && (
             liveCheckStatus?.running ? (
-              <span className="ml-2 text-xs text-gray-500">
+              <span className="text-xs text-gray-500 whitespace-nowrap">
                 Checking live: {liveCheckStatus.progress}/{liveCheckStatus.total} ({liveCheckStatus.closed} closed, {liveCheckStatus.auto_updated} auto-updated)
               </span>
             ) : (
-              <span className="ml-2 inline-flex items-center gap-1">
+              <span className="inline-flex items-center gap-1">
                 <select
                   value={liveCheckBatch}
                   onChange={e => setLiveCheckBatch(e.target.value)}
@@ -3663,7 +4132,7 @@ function App() {
                 </select>
                 <button
                   onClick={startLiveCheck}
-                  className="px-3 py-1.5 bg-orange-100 text-orange-700 rounded text-xs font-medium hover:bg-orange-200 border border-orange-300"
+                  className="px-3 py-1.5 bg-orange-100 text-orange-700 rounded text-xs font-medium hover:bg-orange-200 border border-orange-300 whitespace-nowrap"
                 >
                   Check Live Status
                 </button>
@@ -3671,10 +4140,10 @@ function App() {
             )
           )}
           {liveCheckStatus && !liveCheckStatus.running && liveCheckStatus.message && (
-            <span className="ml-2 text-xs text-green-600">{liveCheckStatus.message}</span>
+            <span className="text-xs text-green-600 whitespace-nowrap">{liveCheckStatus.message}</span>
           )}
           {IS_SERVED && (
-            <a href="/api/logout" className="ml-3 text-xs text-gray-400 hover:text-gray-600">Sign out</a>
+            <a href="/api/logout" className="text-xs text-gray-400 hover:text-gray-600 whitespace-nowrap">Sign out</a>
           )}
         </div>
       </div>
@@ -4164,7 +4633,7 @@ function App() {
       )}
       </>}
 
-      {jobDetailId ? <JobDetailPage job={jobs.find(j => j.id === jobDetailId)} appPlans={appPlans} saveAppPlans={saveAppPlans} changeStatus={changeStatus} onBack={() => { if (window.history.length > 1) window.history.back(); else window.location.hash = '#/jobs'; }} /> : batchDetailDate ? <BatchDetailView jobs={jobs} batchDate={batchDetailDate} onBack={() => setBatchDetailDate(null)} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "stats" ? <StatsPanel jobs={jobs} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "imports" ? <ImportsView imports={imports} onRefresh={refreshImports} onViewJobs={(date) => { setBatchDetailDate(date); }} onSwitchView={setView} /> : view === "pipeline" ? <PipelineView jobs={jobs} changeStatus={changeStatus} /> : view === "sankey" ? <SankeyView jobs={jobs} /> : view === "plans" ? <PlansView jobs={jobs} planDetailId={planDetailId} /> : view === "profile" ? <ProfileView /> : <>
+      {jobDetailId ? <JobDetailPage job={jobs.find(j => j.id === jobDetailId)} appPlans={appPlans} saveAppPlans={saveAppPlans} changeStatus={changeStatus} onBack={() => { if (window.history.length > 1) window.history.back(); else window.location.hash = '#/jobs'; }} /> : batchDetailDate ? <BatchDetailView jobs={jobs} batchDate={batchDetailDate} onBack={() => setBatchDetailDate(null)} appPlans={appPlans} saveAppPlans={saveAppPlans} /> : view === "stats" ? <StatsPanel jobs={jobs} appPlans={appPlans} saveAppPlans={saveAppPlans} expandedBatch={statsExpandedBatch} setExpandedBatch={setStatsExpandedBatch} /> : view === "imports" ? <ImportsView imports={imports} onRefresh={refreshImports} onViewJobs={(date) => { setBatchDetailDate(date); }} onSwitchView={setView} /> : view === "pipeline" ? <PipelineView jobs={jobs} changeStatus={changeStatus} /> : view === "sankey" ? <SankeyView jobs={jobs} /> : view === "plans" ? <PlansView jobs={jobs} planDetailId={planDetailId} /> : view === "profile" ? <ProfileView /> : <>
       {/* Metrics Bar */}
       <div className="bg-white border-b px-6 py-3 flex gap-3 flex-wrap">
         {STATUSES.filter(s => metrics.byStatus[s] > 0 || s === "Applied").map(s => (
@@ -4259,6 +4728,9 @@ function App() {
             <table className="w-full text-sm">
               <thead className="bg-gray-50 sticky top-0 z-10">
                 <tr className="border-b">
+                  <th className="px-1 py-2 w-6 text-center" title="Select for AI Resume batch">
+                    <span className="text-pink-500">&#129302;</span>
+                  </th>
                   <th className="px-2 py-2 w-8"></th>
                   {[
                     ["company", "Company"],
@@ -4288,13 +4760,26 @@ function App() {
                     onDoubleClick={() => window._openJobDetail && window._openJobDetail(j.id)}
                     className={"job-row border-b cursor-pointer text-sm " + (selectedId === j.id ? "selected" : "")}
                   >
+                    <td className="px-1 py-2 text-center" onClick={e => e.stopPropagation()}>
+                      <input
+                        type="checkbox"
+                        checked={aiResumeSelection.has(j.id)}
+                        disabled={j.ai_resume_status === 'pending'}
+                        onChange={() => toggleAiResumeSelection(j.id)}
+                        className="cursor-pointer"
+                        title={j.ai_resume_status === 'pending' ? 'AI resume currently generating' : 'Add to AI resume batch'}
+                      />
+                    </td>
                     <td className="px-2 py-2 text-center" onClick={e => toggleFavorite(j.id, e)}>
                       <span className={"text-lg " + (j.favorited ? "text-yellow-400" : "text-gray-300 hover:text-yellow-300")} style={{cursor:"pointer"}}>
                         {j.favorited ? "\u2605" : "\u2606"}
                       </span>
                     </td>
                     <td className="px-3 py-2 font-medium text-gray-900 whitespace-nowrap">{j.company}</td>
-                    <td className="px-3 py-2 text-gray-700 max-w-xs truncate">{j.title}</td>
+                    <td className="px-3 py-2 text-gray-700 max-w-xs truncate">
+                      {j.title}
+                      <AiResumeBadge job={j} />
+                    </td>
                     <td className="px-3 py-2">
                       <span className={"px-1.5 py-0.5 rounded text-xs font-medium " + TIER_COLORS[j.tier]}>
                         {j.tier === "Strong Match" ? "Strong" : j.tier === "Weak Match" ? "Weak" : "Match"}
@@ -4501,8 +4986,8 @@ function App() {
                   </a>
                 )}
                 <button onClick={() => window._showResume && window._showResume(selectedJob.resume_path, selectedJob.company, selectedJob.title, selectedJob.id)}
-                  className="px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">
-                  View Resume
+                  className={"px-3 py-1.5 rounded text-xs font-medium border " + (selectedJob.ai_resume_status === 'ready' ? 'bg-fuchsia-100 text-fuchsia-700 hover:bg-fuchsia-200 border-fuchsia-300' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')}>
+                  {selectedJob.ai_resume_status === 'ready' ? '\u{1F916} View AI Resume' : 'View Resume'}
                 </button>
                 <button onClick={() => window._openAIChat && window._openAIChat(selectedJob.id, selectedJob.company + ' — ' + selectedJob.title)}
                   className="px-3 py-1.5 bg-purple-600 text-white rounded text-xs font-medium hover:bg-purple-700">
@@ -4830,8 +5315,8 @@ function JobDetailModal() {
             )}
             {job.resume_path && (
               <button onClick={() => window._showResume && window._showResume(job.resume_path, job.company, job.title, job.id)}
-                className="px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-xs font-medium hover:bg-gray-200 border">
-                View Resume
+                className={"px-3 py-1.5 rounded text-xs font-medium border " + (job.ai_resume_status === 'ready' ? 'bg-fuchsia-100 text-fuchsia-700 hover:bg-fuchsia-200 border-fuchsia-300' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')}>
+                {job.ai_resume_status === 'ready' ? '\u{1F916} View AI Resume' : 'View Resume'}
               </button>
             )}
             <button
@@ -4882,38 +5367,103 @@ function JobDetailModal() {
 function ResumePreviewModal() {
   const [data, setData] = useState(null);
   const [copiedIdx, setCopiedIdx] = useState(null);
+  const [editMode, setEditMode] = useState(false);
+  const [editText, setEditText] = useState('');
+  const [actionStatus, setActionStatus] = useState(null);
+
+  // Look up the current AI resume status for the modal's job (used to
+  // decide whether the Regenerate / Edit buttons should appear).
+  const currentJob = (data?.jobId && window._getJobById)
+    ? window._getJobById(data.jobId)
+    : null;
+  const isAiResume = currentJob?.ai_resume_status === 'ready';
+  const aiPending = currentJob?.ai_resume_status === 'pending';
+  // Sonnet's self-explanation for this resume (only present on AI resumes
+  // that succeeded; cleared whenever the user manually edits the text).
+  const aiReasoning = isAiResume ? currentJob?.ai_resume_reasoning : null;
+
+  const fetchResumeText = (jobId, path) => {
+    const apiUrl = (IS_SERVED && jobId) ? '/api/resume-text/' + encodeURIComponent(jobId) : null;
+    const fileUrl = path ? '/' + path : null;
+    const fetchUrl = apiUrl || fileUrl;
+    if (!fetchUrl) return Promise.reject(new Error('No resume available'));
+    return fetch(fetchUrl).then(r => {
+      if (!r.ok) {
+        if (apiUrl && fileUrl) {
+          return fetch(fileUrl).then(r2 => {
+            if (!r2.ok) throw new Error('Failed to load');
+            return r2.text();
+          });
+        }
+        throw new Error('Failed to load');
+      }
+      return r.text();
+    });
+  };
 
   React.useEffect(() => {
     window._showResume = (path, company, title, jobId) => {
       setCopiedIdx(null);
-      setData({ path, company, title, text: null, loading: true, error: null });
-      // If we have a job ID and the server is running, fetch resume_text from DB
-      const apiUrl = (IS_SERVED && jobId) ? '/api/resume-text/' + encodeURIComponent(jobId) : null;
-      const fileUrl = path ? '/' + path : null;
-      const fetchUrl = apiUrl || fileUrl;
-      if (!fetchUrl) {
-        setData(prev => ({ ...prev, error: 'No resume available', loading: false }));
-        return;
-      }
-      fetch(fetchUrl)
-        .then(r => {
-          if (!r.ok) {
-            // If API failed and we have a file path, try that as fallback
-            if (apiUrl && fileUrl) {
-              return fetch(fileUrl).then(r2 => {
-                if (!r2.ok) throw new Error('Failed to load');
-                return r2.text();
-              });
-            }
-            throw new Error('Failed to load');
-          }
-          return r.text();
-        })
+      setEditMode(false);
+      setEditText('');
+      setActionStatus(null);
+      setData({ path, company, title, jobId, text: null, loading: true, error: null });
+      fetchResumeText(jobId, path)
         .then(text => setData(prev => ({ ...prev, text, loading: false })))
         .catch(err => setData(prev => ({ ...prev, error: err.message, loading: false })));
     };
     return () => { delete window._showResume; };
   }, []);
+
+  // Reload the resume text after a regenerate or save so the modal
+  // shows the new content without the user closing and reopening it.
+  const reloadCurrent = useCallback(() => {
+    if (!data?.jobId) return;
+    setData(prev => ({ ...prev, text: null, loading: true, error: null }));
+    fetchResumeText(data.jobId, data.path)
+      .then(text => setData(prev => ({ ...prev, text, loading: false })))
+      .catch(err => setData(prev => ({ ...prev, error: err.message, loading: false })));
+  }, [data?.jobId, data?.path]);
+
+  const handleRegenerate = useCallback(async () => {
+    if (!data?.jobId || !window._regenerateAiResume) return;
+    const cost = '~$' + (0.022).toFixed(3);
+    if (!confirm(`Regenerate the AI resume for this job? This runs Sonnet live (about ${cost}).`)) return;
+    setActionStatus({ type: 'regenerating', message: 'Calling Sonnet live...' });
+    const result = await window._regenerateAiResume(data.jobId);
+    if (result.ok) {
+      setActionStatus({ type: 'ok', message: 'Regenerated successfully' });
+      reloadCurrent();
+    } else {
+      setActionStatus({ type: 'error', message: result.message || result.error || 'Failed' });
+    }
+  }, [data?.jobId, reloadCurrent]);
+
+  const handleStartEdit = useCallback(() => {
+    if (!data?.text) return;
+    setEditText(data.text);
+    setEditMode(true);
+    setActionStatus(null);
+  }, [data?.text]);
+
+  const handleCancelEdit = useCallback(() => {
+    setEditMode(false);
+    setEditText('');
+  }, []);
+
+  const handleSaveEdit = useCallback(async () => {
+    if (!data?.jobId || !window._saveAiResumeEdit) return;
+    setActionStatus({ type: 'saving', message: 'Saving...' });
+    const result = await window._saveAiResumeEdit(data.jobId, editText);
+    if (result.ok) {
+      setActionStatus({ type: 'ok', message: 'Saved' });
+      setEditMode(false);
+      setData(prev => ({ ...prev, text: editText }));
+      if (window._refreshJobs) window._refreshJobs();
+    } else {
+      setActionStatus({ type: 'error', message: result.error || 'Save failed' });
+    }
+  }, [data?.jobId, editText]);
 
   // Parse resume text into named sections
   // Format: "SECTION NAME\n------ (or ======)\ncontent..."
@@ -4963,10 +5513,22 @@ function ResumePreviewModal() {
       <div className="bg-white rounded-lg shadow-xl w-full max-w-5xl flex flex-col"
            style={{maxHeight: '90vh'}}
            onClick={e => e.stopPropagation()}>
-        <div className="flex justify-between items-center p-4 border-b bg-gray-50 rounded-t-lg">
-          <div>
-            <h3 className="font-bold text-gray-900 text-sm">{data.company}</h3>
-            <p className="text-xs text-gray-500">{data.title}</p>
+        <div className={"flex justify-between items-center p-4 border-b rounded-t-lg " + (isAiResume ? 'bg-fuchsia-50' : 'bg-gray-50')}>
+          <div className="flex items-center gap-3">
+            <div>
+              <h3 className="font-bold text-gray-900 text-sm">{data.company}</h3>
+              <p className="text-xs text-gray-500">{data.title}</p>
+            </div>
+            {isAiResume && (
+              <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-fuchsia-100 text-fuchsia-700 border border-fuchsia-300">
+                &#129302; AI-generated
+              </span>
+            )}
+            {aiPending && (
+              <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-fuchsia-50 text-fuchsia-700 border border-fuchsia-200">
+                Generating&hellip;
+              </span>
+            )}
           </div>
           <button onClick={() => setData(null)}
             className="text-gray-400 hover:text-gray-600 text-xl leading-none">&times;</button>
@@ -4974,7 +5536,13 @@ function ResumePreviewModal() {
         <div className="flex-1 overflow-auto p-4 space-y-3" style={{minHeight: 0}}>
           {data.loading && <p className="text-sm text-gray-400 text-center py-8">Loading resume...</p>}
           {data.error && <p className="text-sm text-red-500 text-center py-8">{data.error}</p>}
-          {data.text && sections.map((sec, idx) => {
+          {/* Sonnet's self-explanation, shown above the resume text on
+              AI resumes. Collapsed by default so the resume stays front
+              and center — click to expand and audit. */}
+          {data.text && !editMode && aiReasoning && (
+            <AiResumeReasoningPanel reasoning={aiReasoning} defaultOpen={false} />
+          )}
+          {data.text && !editMode && sections.map((sec, idx) => {
             const lineCount = sec.content.split('\n').length;
             const rows = Math.min(Math.max(lineCount + 1, 3), 14);
             return (
@@ -4994,11 +5562,450 @@ function ResumePreviewModal() {
               </div>
             );
           })}
+          {data.text && editMode && (
+            <textarea
+              value={editText}
+              onChange={e => setEditText(e.target.value)}
+              className="w-full text-sm text-gray-800 font-mono bg-gray-50 p-3 border rounded-lg focus:outline-none focus:ring-2 focus:ring-fuchsia-300"
+              style={{minHeight: '50vh'}}
+              spellCheck={false}
+            />
+          )}
+        </div>
+        {/* Footer — regenerate / edit / save controls */}
+        <div className="border-t p-3 flex items-center justify-between gap-2 bg-gray-50 rounded-b-lg">
+          <div className="text-xs">
+            {actionStatus && (
+              <span className={
+                actionStatus.type === 'error' ? 'text-red-600' :
+                actionStatus.type === 'ok' ? 'text-green-600' :
+                'text-gray-500'
+              }>
+                {actionStatus.message}
+              </span>
+            )}
+          </div>
+          <div className="flex gap-2">
+            {editMode ? (
+              <>
+                <button
+                  onClick={handleCancelEdit}
+                  className="px-3 py-1.5 text-xs text-gray-600 bg-white border rounded hover:bg-gray-100">
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSaveEdit}
+                  disabled={actionStatus?.type === 'saving'}
+                  className="px-3 py-1.5 text-xs font-semibold text-white bg-fuchsia-600 rounded hover:bg-fuchsia-700 disabled:opacity-50">
+                  {actionStatus?.type === 'saving' ? 'Saving...' : 'Save'}
+                </button>
+              </>
+            ) : (
+              <>
+                {data.text && data.jobId && (
+                  <button
+                    onClick={handleStartEdit}
+                    className="px-3 py-1.5 text-xs text-gray-700 bg-white border rounded hover:bg-gray-100">
+                    Edit as text
+                  </button>
+                )}
+                {data.text && data.jobId && IS_SERVED && !aiPending && (
+                  <button
+                    onClick={handleRegenerate}
+                    disabled={actionStatus?.type === 'regenerating'}
+                    className="px-3 py-1.5 text-xs font-semibold text-fuchsia-700 bg-fuchsia-100 border border-fuchsia-300 rounded hover:bg-fuchsia-200 disabled:opacity-50">
+                    {actionStatus?.type === 'regenerating' ? 'Regenerating...' : '\u{1F916} Regenerate (Sonnet)'}
+                  </button>
+                )}
+                {aiPending && (
+                  <span className="px-3 py-1.5 text-xs text-fuchsia-700 bg-fuchsia-50 border border-fuchsia-200 rounded">
+                    Regenerate disabled while batch is running
+                  </span>
+                )}
+              </>
+            )}
+          </div>
         </div>
       </div>
     </div>
   );
 }
+
+// ── AI Resume Reasoning Panel ────────────────────────────────────
+// Shared component used by both the ResumePreviewModal (for ready
+// resumes) and the AiResumeFailureModal (for failed ones). Renders
+// Sonnet's self-explanation: what the job emphasizes, what was
+// kept/edited/merged per company, and which pool bullets were
+// dropped. Collapsed by default so it doesn't dominate the modal —
+// the user clicks to expand when they want to audit Sonnet's work.
+function AiResumeReasoningPanel({ reasoning, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen);
+  if (!reasoning || typeof reasoning !== 'object') return null;
+
+  const jobFocus = reasoning.job_focus;
+  const perCompany = reasoning.per_company || {};
+  const dropped = reasoning.dropped || {};
+
+  const companyNames = ['Compass', 'Mastercard', 'JP Morgan', 'Leidos'];
+  const hasAny = jobFocus
+    || Object.values(perCompany).some(v => v && typeof v === 'string')
+    || Object.values(dropped).some(arr => Array.isArray(arr) && arr.length > 0);
+
+  if (!hasAny) return null;
+
+  // Summary count for the collapsed header — gives the user a sense
+  // of scope without having to expand.
+  const totalDropped = companyNames.reduce(
+    (acc, c) => acc + (Array.isArray(dropped[c]) ? dropped[c].length : 0),
+    0
+  );
+  const summary = totalDropped > 0
+    ? ` \u00b7 ${totalDropped} dropped`
+    : '';
+
+  return (
+    <div
+      style={{
+        border: '1px solid #e9d5ff',
+        borderRadius: '6px',
+        backgroundColor: '#faf5ff',
+        marginBottom: '10px',
+      }}>
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        style={{
+          width: '100%',
+          padding: '6px 12px',
+          backgroundColor: 'transparent',
+          border: 'none',
+          cursor: 'pointer',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          textAlign: 'left',
+        }}>
+        <span style={{
+          fontSize: '11px',
+          fontWeight: 600,
+          color: '#7e22ce',
+        }}>
+          &#129302; Why these bullets?{summary}
+        </span>
+        <span style={{ color: '#a855f7', fontSize: '10px' }}>
+          {open ? '\u25B2 hide' : '\u25BC show'}
+        </span>
+      </button>
+      {open && (
+        <div style={{
+          padding: '0 12px 10px',
+          fontSize: '11px',
+          color: '#374151',
+          lineHeight: 1.45,
+        }}>
+          {jobFocus && (
+            <div style={{ marginBottom: '8px' }}>
+              <span style={{
+                fontSize: '9px',
+                fontWeight: 700,
+                color: '#7e22ce',
+                textTransform: 'uppercase',
+                letterSpacing: '0.04em',
+                marginRight: '6px',
+              }}>
+                Focus:
+              </span>
+              <span>{jobFocus}</span>
+            </div>
+          )}
+          {companyNames.map(c => {
+            const note = perCompany[c];
+            const drops = Array.isArray(dropped[c]) ? dropped[c] : [];
+            if (!note && drops.length === 0) return null;
+            return (
+              <div key={c} style={{ marginBottom: '6px' }}>
+                <span style={{
+                  fontSize: '9px',
+                  fontWeight: 700,
+                  color: '#7e22ce',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.04em',
+                  marginRight: '6px',
+                }}>
+                  {c}:
+                </span>
+                {note && <span>{note}</span>}
+                {drops.length > 0 && (
+                  <span style={{ color: '#9ca3af', marginLeft: note ? '4px' : 0 }}>
+                    {note ? ' ' : ''}
+                    <span style={{ fontStyle: 'italic' }}>
+                      Dropped: {drops.join('; ')}
+                    </span>
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ── AI Resume Failure Inspection Modal ───────────────────────────
+// Opens when the user clicks the red "AI Failed" badge on a job.
+// Loads /api/ai-resume/failure/<job_id> and shows:
+//   - the validator errors that rejected Sonnet's output
+//   - a best-effort rendered preview (or the raw JSON if parse failed)
+//     in an editable textarea
+//   - Save (calls /api/ai-resume/edit which promotes failed -> ready)
+//   - Retry (calls /api/ai-resume/regenerate live)
+function AiResumeFailureModal() {
+  const [data, setData] = useState(null);
+  const [editText, setEditText] = useState('');
+  const [actionStatus, setActionStatus] = useState(null);
+
+  React.useEffect(() => {
+    window._showAiResumeFailure = (jobId) => {
+      if (!jobId) return;
+      setData({ jobId, loading: true, error: null });
+      setEditText('');
+      setActionStatus(null);
+      fetch('/api/ai-resume/failure/' + encodeURIComponent(jobId))
+        .then(r => r.json())
+        .then(payload => {
+          if (payload.error) {
+            setData({ jobId, loading: false, error: payload.error });
+          } else {
+            setData({ jobId, loading: false, ...payload });
+            setEditText(payload.preview || payload.raw || '');
+          }
+        })
+        .catch(err => {
+          setData({ jobId, loading: false, error: err.message });
+        });
+    };
+    return () => { delete window._showAiResumeFailure; };
+  }, []);
+
+  const close = useCallback(() => {
+    setData(null);
+    setEditText('');
+    setActionStatus(null);
+  }, []);
+
+  const handleSave = useCallback(async () => {
+    if (!data?.jobId || !window._saveAiResumeEdit) return;
+    if (!editText.trim()) {
+      setActionStatus({ type: 'error', message: 'Resume text cannot be empty' });
+      return;
+    }
+    setActionStatus({ type: 'saving', message: 'Saving and promoting to ready...' });
+    const result = await window._saveAiResumeEdit(data.jobId, editText);
+    if (result.ok) {
+      setActionStatus({ type: 'ok', message: 'Saved — job is now Ready' });
+      if (window._refreshJobs) window._refreshJobs();
+      setTimeout(close, 800);
+    } else {
+      setActionStatus({ type: 'error', message: result.error || 'Save failed' });
+    }
+  }, [data?.jobId, editText, close]);
+
+  const handleRetry = useCallback(async () => {
+    if (!data?.jobId || !window._regenerateAiResume) return;
+    if (!confirm('Retry generation with a live Sonnet call (~$0.022)?')) return;
+    setActionStatus({ type: 'regenerating', message: 'Calling Sonnet live — this can take 10-30s...' });
+    const result = await window._regenerateAiResume(data.jobId);
+    if (result.ok) {
+      setActionStatus({ type: 'ok', message: 'Regenerated successfully' });
+      if (window._refreshJobs) window._refreshJobs();
+      setTimeout(close, 800);
+    } else {
+      setActionStatus({ type: 'error', message: result.message || result.error || 'Retry failed' });
+      // Re-fetch failure details so the user sees the new error list
+      if (window._showAiResumeFailure) {
+        setTimeout(() => window._showAiResumeFailure(data.jobId), 500);
+      }
+    }
+  }, [data?.jobId, close]);
+
+  if (!data) return null;
+
+  const isPreview = data.preview_source === 'rendered';
+  const isRaw = data.preview_source === 'raw';
+  const noOutput = !data.preview && !data.raw;
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center p-4"
+         style={{zIndex: 9998}}
+         onClick={close}>
+      <div className="bg-white rounded-lg shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col"
+           onClick={e => e.stopPropagation()}>
+        {/* Header */}
+        <div className="border-b p-4 bg-red-50 rounded-t-lg flex items-start justify-between">
+          <div>
+            <h2 className="text-lg font-bold text-red-700 flex items-center gap-2">
+              <span>&#9888;</span> AI Resume Generation Failed
+            </h2>
+            {(data.company || data.title) && (
+              <p className="text-sm text-gray-700 mt-0.5">
+                {data.company}{data.title ? ' \u2014 ' + data.title : ''}
+              </p>
+            )}
+          </div>
+          <button onClick={close}
+                  className="text-gray-400 hover:text-gray-700 text-2xl leading-none">&times;</button>
+        </div>
+
+        {/* Body */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {data.loading && (
+            <div className="text-sm text-gray-500 text-center py-12">Loading failure details...</div>
+          )}
+          {data.error && (
+            <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded p-3">
+              Error loading failure details: {data.error}
+            </div>
+          )}
+          {!data.loading && !data.error && (
+            <>
+              {/* Validator errors FIRST — the primary concern on a failure */}
+              {data.errors && data.errors.length > 0 && (
+                <div className="bg-red-50 border border-red-200 rounded p-3">
+                  <h3 className="text-xs font-bold uppercase tracking-wide text-red-700 mb-2">
+                    Validator rejected Sonnet's output
+                  </h3>
+                  <ul className="text-xs text-red-800 space-y-1 list-disc list-inside font-mono">
+                    {data.errors.map((err, idx) => (
+                      <li key={idx}>{err}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Sonnet's self-explanation (collapsed by default) */}
+              {data.reasoning && (
+                <AiResumeReasoningPanel reasoning={data.reasoning} defaultOpen={false} />
+              )}
+
+              {noOutput && (
+                <div className="text-sm text-gray-600 bg-gray-50 border rounded p-4">
+                  No raw Sonnet output was captured for this failure
+                  (the batch likely failed before Sonnet returned, or
+                  this job predates the failure-capture feature). Use
+                  Retry to run a fresh live Sonnet call.
+                </div>
+              )}
+
+              {/* Editable preview */}
+              {!noOutput && (
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <h3 className="text-xs font-bold uppercase tracking-wide text-gray-700">
+                      {isPreview ? "Rendered preview (editable)" : "Raw Sonnet output (editable)"}
+                    </h3>
+                    {isPreview && (
+                      <span className="text-[10px] text-gray-500">
+                        Sonnet's bullets rendered through the resume template.
+                        Edit and Save to use as-is, or click Retry.
+                      </span>
+                    )}
+                    {isRaw && (
+                      <span className="text-[10px] text-amber-600">
+                        Could not parse as JSON — showing raw text.
+                      </span>
+                    )}
+                  </div>
+                  <textarea
+                    value={editText}
+                    onChange={e => setEditText(e.target.value)}
+                    className="w-full text-xs text-gray-800 font-mono bg-gray-50 p-3 border rounded focus:outline-none focus:ring-2 focus:ring-fuchsia-300"
+                    style={{minHeight: '40vh'}}
+                    spellCheck={false}
+                  />
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="border-t p-3 flex items-center justify-between gap-2 bg-gray-50 rounded-b-lg">
+          <div className="text-xs">
+            {actionStatus && (
+              <span className={
+                actionStatus.type === 'error' ? 'text-red-600' :
+                actionStatus.type === 'ok' ? 'text-green-600' :
+                'text-gray-500'
+              }>
+                {actionStatus.message}
+              </span>
+            )}
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={close}
+              className="px-3 py-1.5 text-xs text-gray-600 bg-white border rounded hover:bg-gray-100">
+              Close
+            </button>
+            {!noOutput && (
+              <button
+                onClick={handleSave}
+                disabled={actionStatus?.type === 'saving' || data.loading}
+                style={{
+                  padding: '6px 14px',
+                  fontSize: '12px',
+                  fontWeight: 600,
+                  color: '#ffffff',
+                  backgroundColor: '#a21caf',
+                  border: '1px solid #86198f',
+                  borderRadius: '4px',
+                  cursor: (actionStatus?.type === 'saving' || data.loading) ? 'not-allowed' : 'pointer',
+                  opacity: (actionStatus?.type === 'saving' || data.loading) ? 0.5 : 1,
+                }}
+                onMouseEnter={e => {
+                  if (!(actionStatus?.type === 'saving' || data.loading)) {
+                    e.currentTarget.style.backgroundColor = '#86198f';
+                  }
+                }}
+                onMouseLeave={e => {
+                  e.currentTarget.style.backgroundColor = '#a21caf';
+                }}>
+                {actionStatus?.type === 'saving' ? 'Saving...' : 'Save as resume (Ready)'}
+              </button>
+            )}
+            <button
+              onClick={handleRetry}
+              disabled={actionStatus?.type === 'regenerating' || data.loading}
+              style={{
+                padding: '6px 14px',
+                fontSize: '12px',
+                fontWeight: 600,
+                color: '#6b21a8',
+                backgroundColor: '#f3e8ff',
+                border: '1px solid #d8b4fe',
+                borderRadius: '4px',
+                cursor: (actionStatus?.type === 'regenerating' || data.loading) ? 'not-allowed' : 'pointer',
+                opacity: (actionStatus?.type === 'regenerating' || data.loading) ? 0.5 : 1,
+              }}
+              onMouseEnter={e => {
+                if (!(actionStatus?.type === 'regenerating' || data.loading)) {
+                  e.currentTarget.style.backgroundColor = '#e9d5ff';
+                }
+              }}
+              onMouseLeave={e => {
+                e.currentTarget.style.backgroundColor = '#f3e8ff';
+              }}>
+              {actionStatus?.type === 'regenerating' ? 'Regenerating...' : '\u{1F916} Retry (live Sonnet)'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 
 // ── AI Chat Panel (Ollama-powered local assistant) ──
 function AIChatPanel() {
@@ -5069,21 +6076,24 @@ function AIChatPanel() {
     return (
       <button
         onClick={() => { setOpen(true); setMinimized(false); setTimeout(() => inputRef.current?.focus(), 100); }}
-        className="fixed bottom-6 right-6 w-14 h-14 bg-purple-600 text-white rounded-full shadow-lg hover:bg-purple-700 flex items-center justify-center text-2xl z-40"
+        className="fixed bottom-6 right-6 w-20 h-20 bg-gradient-to-br from-fuchsia-500 to-purple-700 text-white rounded-full shadow-2xl hover:from-fuchsia-400 hover:to-purple-600 flex flex-col items-center justify-center font-extrabold ring-4 ring-white ring-offset-2 ring-offset-transparent z-50 transition-transform hover:scale-105"
+        style={{boxShadow: '0 10px 30px rgba(168, 85, 247, 0.55), 0 4px 12px rgba(0,0,0,0.25)'}}
         title="AI Assistant">
-        AI
+        <span className="text-2xl leading-none">AI</span>
+        <span className="text-[9px] leading-tight uppercase tracking-wider mt-0.5">Assistant</span>
       </button>
     );
   }
 
   if (minimized) {
     return (
-      <div className="fixed bottom-6 right-6 bg-purple-600 text-white rounded-lg shadow-lg z-50 flex items-center gap-2 px-4 py-2 cursor-pointer hover:bg-purple-700"
+      <div className="fixed bottom-6 right-6 bg-gradient-to-br from-fuchsia-500 to-purple-700 text-white rounded-full shadow-2xl ring-4 ring-white z-50 flex items-center gap-2 px-5 py-3 cursor-pointer hover:from-fuchsia-400 hover:to-purple-600 transition-transform hover:scale-105"
+        style={{boxShadow: '0 10px 30px rgba(168, 85, 247, 0.55), 0 4px 12px rgba(0,0,0,0.25)'}}
         onClick={() => { setMinimized(false); setTimeout(() => inputRef.current?.focus(), 100); }}>
-        <span className="font-bold text-sm">AI Assistant</span>
-        {jobLabel && <span className="text-xs text-purple-200 truncate" style={{maxWidth:'150px'}}>— {jobLabel}</span>}
-        {thinking && <span className="text-xs text-purple-200 animate-pulse">thinking...</span>}
-        {messages.length > 0 && <span className="bg-purple-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">{messages.length}</span>}
+        <span className="font-extrabold text-sm">AI Assistant</span>
+        {jobLabel && <span className="text-xs text-fuchsia-100 truncate" style={{maxWidth:'150px'}}>— {jobLabel}</span>}
+        {thinking && <span className="text-xs text-fuchsia-100 animate-pulse">thinking...</span>}
+        {messages.length > 0 && <span className="bg-white text-purple-700 text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">{messages.length}</span>}
       </div>
     );
   }
@@ -5187,7 +6197,7 @@ function AIChatPanel() {
   );
 }
 
-ReactDOM.render(<><App /><JobDetailModal /><ResumePreviewModal /><AIChatPanel /></>, document.getElementById("root"));
+ReactDOM.render(<><App /><JobDetailModal /><ResumePreviewModal /><AiResumeFailureModal /><AIChatPanel /></>, document.getElementById("root"));
 </script>
 </body>
 </html>

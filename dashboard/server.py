@@ -283,11 +283,17 @@ def _import_row_to_dict(row, desc):
     Merges fresher in-memory state for any import that is currently
     tracked in _ai_imports (i.e. still active in this process).
     """
+    from decimal import Decimal
     keys = [c[0] for c in desc]
     d = {}
     for k, v in zip(keys, row):
         if hasattr(v, "isoformat"):
             d[k] = v.isoformat()
+        elif isinstance(v, Decimal):
+            # NUMERIC columns (e.g. estimated_cost) come back as
+            # Decimal which json.dumps can't serialize. Cast to float
+            # so SSE frames and JSON responses don't blow up.
+            d[k] = float(v)
         else:
             d[k] = v
     d["id"] = str(d.get("id", ""))
@@ -365,7 +371,8 @@ def load_job(job_id):
             cur.execute("""
                 SELECT id, company, title, location, work_type, salary,
                        posted_date, import_date, description, score, tier,
-                       job_link, apply_link, resume_text
+                       job_link, apply_link, resume_text,
+                       ai_reasoning, ai_resume_generated_at, ai_resume_status
                 FROM jobs WHERE id = %s
             """, (job_id,))
             row = cur.fetchone()
@@ -1055,6 +1062,52 @@ AI_SCORING_MODEL = "claude-haiku-4-5-20251001"
 AI_SCORING_COST_PER_JOB = 0.0017
 
 
+# ─────────────────────────────────────────────────────────
+# AI RESUME BULLET GENERATION (Claude Sonnet — Phase 2)
+# ─────────────────────────────────────────────────────────
+
+AI_RESUME_MODEL = "claude-sonnet-4-20250514"
+# NOTE: Phase 2 PRD targets "Sonnet 4.6" (claude-sonnet-4-6). When the
+# 4.6 model ID is available in the Anthropic API, swap this constant
+# (and ideally the existing _call_claude default at the top of this
+# file) to the new ID. Until then we use the same Sonnet 4 model as
+# the existing /api/ai-chat endpoint to guarantee a valid model ID.
+# Sonnet: $3/MTok input, $15/MTok output. Batch API gives 50% off.
+# Per-job token budget (amortized with prompt caching):
+#   ~3,500 input (cached system ~2,000 + user ~1,500)
+#   ~800 output
+# Live: ~$0.022/job. Batch: ~$0.011/job.
+AI_RESUME_COST_PER_JOB_LIVE = 0.022
+AI_RESUME_COST_PER_JOB_BATCH = 0.011
+
+# Per-company rendered-line budgets. Mastercard is a hard equality.
+# Total must land in [AI_RESUME_TOTAL_LINES_MIN, AI_RESUME_TOTAL_LINES_MAX].
+AI_RESUME_LINE_BUDGET = {
+    "Compass":    (9, 10),
+    "Mastercard": (5, 5),   # fixed
+    "JP Morgan":  (9, 10),
+    "Leidos":     (6, 7),
+}
+AI_RESUME_TOTAL_LINES_MIN = 27
+AI_RESUME_TOTAL_LINES_MAX = 31
+
+# Character thresholds for rendered-line counting. Derived from
+# measured examples in the target resume template:
+#   131-char bullet renders as 1 line, 139-char renders as 2 lines
+#   longest observed 2-line bullet ≈ 253 chars
+# 135 (was 130) gives Sonnet a 4-char safety margin so near-misses
+# (e.g. 134-char bullets) don't tip a single-line into a 2-liner.
+AI_RESUME_ONE_LINE_MAX_CHARS = 135
+AI_RESUME_TWO_LINE_MAX_CHARS = 265
+
+# In-memory state for the AI resume batch runner + poller. Mirrors
+# the _ai_imports / _ai_import_stop_events pattern used by Phase 1
+# CSV batch imports.
+_ai_resume_batches_state = {}
+_ai_resume_batches_lock = threading.Lock()
+_ai_resume_batch_stop_events = {}
+
+
 def _ai_score_to_legacy_scale(ai_score):
     """Map Claude's 1-10 fit_score to the legacy 0-24 scale.
 
@@ -1300,6 +1353,1290 @@ def _retrieve_anthropic_batch_results(batch_id):
             yield custom_id, {"used_ai": False, "error": "batch request canceled"}
         else:
             yield custom_id, {"used_ai": False, "error": f"unknown result type: {rtype}"}
+
+
+# ─────────────────────────────────────────────────────────
+# AI RESUME BULLET GENERATION — helpers (Phase 2)
+# ─────────────────────────────────────────────────────────
+
+# Canonical company order and list used by the Sonnet prompt and
+# validator. This is the SAME order that generate_resume_txt() uses
+# when emitting sections, which is controlled by config.json's
+# experience dict insertion order.
+def _ai_resume_company_order():
+    """Return the list of company display_names in the order they
+    appear in the bullet pool (matches generate_resume_txt output)."""
+    return list(_BULLET_POOL.keys())
+
+
+def _count_lines(bullet_text):
+    """Return the rendered-line count for a single bullet.
+
+    1 line if <= AI_RESUME_ONE_LINE_MAX_CHARS
+    2 lines if <= AI_RESUME_TWO_LINE_MAX_CHARS
+    3 (forbidden) otherwise — callers treat this as a validation failure
+    """
+    n = len((bullet_text or "").strip())
+    if n <= AI_RESUME_ONE_LINE_MAX_CHARS:
+        return 1
+    if n <= AI_RESUME_TWO_LINE_MAX_CHARS:
+        return 2
+    return 3
+
+
+def _build_ai_resume_system_prompt():
+    """Build the Sonnet system prompt for tailored bullet generation.
+
+    Reads _BULLET_POOL and _CANDIDATE_SKILLS at call time so Profile
+    page edits are picked up without a server restart. Returns a
+    string that will be sent with cache_control: ephemeral so the
+    ~2000 token prompt is cached across calls.
+    """
+    name = _config["candidate"].get("name", "the candidate")
+    yoe = _config["candidate"].get("years_of_experience", 5)
+
+    # Format the full bullet pool so Sonnet sees every candidate
+    # source bullet, numbered per company for clarity in its
+    # reasoning.
+    pool_lines = []
+    for company in _ai_resume_company_order():
+        pool_lines.append("")
+        pool_lines.append(f"{company}:")
+        for i, b in enumerate(_BULLET_POOL[company], 1):
+            pool_lines.append(f"  {i}. {b}")
+    pool_block = "\n".join(pool_lines).strip("\n")
+
+    # Per-company budgets, with concrete bullet-count targets so the
+    # model has an unambiguous goal. The math is: target ~3 single-line
+    # bullets + a couple of 2-line bullets per company. Mastercard is
+    # the strict case (exactly 5 lines = exactly 5 single-line bullets).
+    budget_lines = []
+    target_lines = []
+    for company in _ai_resume_company_order():
+        lo, hi = AI_RESUME_LINE_BUDGET.get(company, (0, 0))
+        if lo == hi:
+            budget_lines.append(
+                f"   - {company}: exactly {lo} rendered lines"
+            )
+            target_lines.append(
+                f"   - {company}: write EXACTLY {lo} bullets, "
+                f"each <= {AI_RESUME_ONE_LINE_MAX_CHARS} characters "
+                f"(single-line). No 2-line bullets."
+            )
+        else:
+            budget_lines.append(
+                f"   - {company}: {lo}-{hi} rendered lines"
+            )
+            target_lines.append(
+                f"   - {company}: write 4-6 bullets totaling {lo}-{hi} "
+                f"rendered lines. Aim for ~3 single-line bullets "
+                f"(<= {AI_RESUME_ONE_LINE_MAX_CHARS} chars) plus "
+                f"~2 two-line bullets ({AI_RESUME_ONE_LINE_MAX_CHARS + 1}-"
+                f"{AI_RESUME_TWO_LINE_MAX_CHARS} chars). No bullet may "
+                f"exceed {AI_RESUME_TWO_LINE_MAX_CHARS} characters."
+            )
+    budget_block = "\n".join(budget_lines)
+    target_block = "\n".join(target_lines)
+
+    return "\n".join([
+        f"You are a resume tailoring assistant for {name}, a software "
+        f"engineer with {yoe} years of experience. Your job is to choose "
+        "and tailor the candidate's existing bullets so the resume "
+        "highlights the work most relevant to the specific job posting "
+        "you are given. You are NOT a creative writer — you are an "
+        "editor who rearranges and refocuses TRUE statements.",
+        "",
+        "TWO RULES ABOVE ALL OTHERS:",
+        "  (a) Truth: NEVER invent or embellish. Every fact in your "
+        "      output must come from the candidate's pool, unchanged "
+        "      in substance. If the source doesn't say it, you can't "
+        "      say it.",
+        "  (b) Relevance: when a pool bullet has clauses or sub-phrases "
+        "      that aren't relevant to this job, drop or de-emphasize "
+        "      them. When the job uses different vocabulary for the "
+        "      same concept the source describes, you may use the "
+        "      job's vocabulary as long as the meaning is identical.",
+        "",
+        "YOUR PROCESS — follow this every time:",
+        "",
+        "Step 1 (ANALYZE THE JOB). Read the job description carefully. "
+        "Identify the 5-8 most important things this employer cares "
+        "about — specific technologies, domain words, scale signals, "
+        "team words, and any unusual requirements they call out. These "
+        "are your tailoring targets.",
+        "",
+        "Step 2 (SELECT relevant pool bullets). For each company, find "
+        "the source bullets that overlap with the job's targets. A "
+        "bullet is \"relevant\" if it mentions even ONE of the "
+        "technologies, domains, or skills the job cares about. Skip "
+        "bullets that don't fit the job at all.",
+        "",
+        "Step 3 (DECIDE: keep, edit, or merge). For each selected "
+        "bullet, ask: \"Is this already a perfect fit for the job as-is?\"",
+        "  - If YES: keep it verbatim. Do not change a bullet just to "
+        "    look like you did something. A great untouched bullet is "
+        "    always better than a tampered one.",
+        "  - If NO, but a small edit would make it more relevant: "
+        "    drop irrelevant sub-phrases, reorder clauses so the "
+        "    job-relevant part comes first, or swap vocabulary for the "
+        "    job's exact wording (only when it means the SAME thing).",
+        "  - If two pool bullets describe the SAME project or "
+        "    initiative at the SAME company AND the merge would be "
+        "    more relevant for this job: merge them. Different projects "
+        "    must NEVER be merged.",
+        "",
+        "Step 4 (BUDGET FIT — see hard rules below). Check that your "
+        "bullets fit the per-company line budget. Tighten or expand "
+        "wording to hit the budget. NEVER add a new fact just to fill "
+        "space; if you don't have enough relevant pool material, "
+        "include a less-relevant pool bullet instead of inventing.",
+        "",
+        "WORKED EXAMPLE 1 — small edit improves relevance:",
+        "",
+        "  Source (Compass pool):",
+        "  \"Built and maintained Go gRPC backend services and React "
+        "frontend components for template publishing, brand-aware "
+        "search, and multi-org access control on a platform serving "
+        "thousands of real estate agents\"",
+        "",
+        "  Job cares about: backend distributed systems, multi-tenant "
+        "access control. Job is backend-only.",
+        "",
+        "  Acceptable edited output (drops React and template "
+        "publishing as off-topic, leads with \"multi-tenant access "
+        "control\"; every remaining fact is in the source):",
+        "  \"Built and maintained multi-tenant access control on Go "
+        "gRPC backend services serving thousands of real estate "
+        "agents\"",
+        "",
+        "  FORBIDDEN output (invented \"high-throughput\" and "
+        "\"99.9% availability\" — neither is in the source):",
+        "  \"Built and maintained high-throughput Go gRPC backend "
+        "services with 99.9% availability and multi-tenant access "
+        "control...\"",
+        "",
+        "WORKED EXAMPLE 2 — keep verbatim because it's already perfect:",
+        "",
+        "  Source (JP Morgan pool):",
+        "  \"Configured distributed tracing with Zipkin and monitoring "
+        "with Prometheus to identify and resolve latency bottlenecks "
+        "in microservice architectures\"",
+        "",
+        "  Job cares about: observability, distributed systems, "
+        "Prometheus, performance tuning.",
+        "",
+        "  Acceptable output (verbatim — this bullet already hits "
+        "exactly what the job wants; rewriting it would not improve "
+        "anything):",
+        "  \"Configured distributed tracing with Zipkin and monitoring "
+        "with Prometheus to identify and resolve latency bottlenecks "
+        "in microservice architectures\"",
+        "",
+        f"CANDIDATE SKILLS: {_CANDIDATE_SKILLS}",
+        "",
+        "EXPERIENCE BULLETS (the \"pool\" — your only source of facts; "
+        "every output bullet must trace back here):",
+        "",
+        pool_block,
+        "",
+        "═══════════════════════════════════════════════════════════════",
+        "HARD CONSTRAINTS — violations cause your response to be "
+        "rejected and the entire job to fail. There is NO partial credit.",
+        "═══════════════════════════════════════════════════════════════",
+        "",
+        "1. LINE BUDGET (hard):",
+        budget_block,
+        f"   - Total: {AI_RESUME_TOTAL_LINES_MIN}-{AI_RESUME_TOTAL_LINES_MAX} "
+        "rendered lines across all four companies (no exceptions)",
+        "",
+        "   How rendered lines are counted (this is the validator's "
+        "EXACT rule — count characters yourself the same way):",
+        f"   - bullet length <= {AI_RESUME_ONE_LINE_MAX_CHARS} chars "
+        "  ==> 1 rendered line",
+        f"   - bullet length {AI_RESUME_ONE_LINE_MAX_CHARS + 1}-"
+        f"{AI_RESUME_TWO_LINE_MAX_CHARS} chars ==> 2 rendered lines",
+        f"   - bullet length > {AI_RESUME_TWO_LINE_MAX_CHARS} chars "
+        "  ==> FORBIDDEN, the response is rejected",
+        "",
+        "1a. CONCRETE BUDGET TARGETS — follow these exactly:",
+        target_block,
+        "",
+        "2. COMPANY LOCK: Every bullet you produce for a company must "
+        "describe work done at THAT company. Never attribute work from "
+        "one company to another. Your ONLY source for each company's "
+        "bullets is that company's section of the pool above. (You can "
+        "and should rewrite the language — but the underlying facts "
+        "must come from that same company's pool.)",
+        "",
+        "3. GROUND-TRUTH FACTS: Rewrite freely, BUT every factual claim "
+        "in your output — every technology, metric, scope, outcome, "
+        "team size, timeline — must be traceable to a source bullet "
+        "from the SAME company. You can rephrase 'thousands of real "
+        "estate agents' as 'thousands of users on a high-scale "
+        "platform' (same fact, different framing). You CANNOT invent a "
+        "number, tool, or outcome that does not appear in the pool. "
+        "If the source says 'reduced latency' without a percentage, "
+        "you cannot write '40% latency reduction'.",
+        "",
+        "4. MERGE RULE: You may merge two bullets into one ONLY if they "
+        "describe the SAME project or initiative in the pool. Different "
+        "projects must stay separate — combining them fabricates "
+        "relationships that did not exist.",
+        "",
+        "5. STYLE: Match the voice of the existing pool bullets. Use "
+        "strong active verbs, technical specificity, and quantitative "
+        "outcomes only where the source bullets provide them.",
+        "",
+        "6. OUTPUT STRUCTURE: Your bullets object must contain exactly "
+        "these four keys in this order: " +
+        ", ".join(f'"{c}"' for c in _ai_resume_company_order()) + ".",
+        "",
+        "MANDATORY SELF-CHECK before responding:",
+        "",
+        "Quality check Q1 — TRUTH. For EVERY bullet you wrote, walk "
+        "through each technology, metric, scope, outcome, team size, "
+        "and timeline word by word. Confirm each one appears in the "
+        "SAME-company source bullets. If you can't trace a fact to a "
+        "source bullet, REMOVE it. This is your single most important "
+        "check — a fabricated detail is worse than a generic bullet.",
+        "",
+        "Quality check Q2 — RELEVANCE. For each bullet, ask: \"Would "
+        "this employer find this useful?\" If a bullet is irrelevant to "
+        "the job, swap it for a more relevant pool bullet (or its "
+        "tailored edit). If a bullet is relevant but leads with the "
+        "wrong clause, reorder it. If it's relevant AND already leads "
+        "well — leave it alone, even if you didn't change it.",
+        "",
+        "Mechanical check M1 — CHARACTER COUNT. For EACH bullet you "
+        "wrote, count its character length. If any bullet exceeds the "
+        "per-company maximum from section 1a, rewrite or replace it. "
+        f"Aim for ~{AI_RESUME_ONE_LINE_MAX_CHARS - 5} chars max for "
+        f"single-line bullets to give yourself a safety margin.",
+        "",
+        "Mechanical check M2 — PER-COMPANY LINE SUM. For EACH company, "
+        "sum up the rendered lines using the rule in section 1. "
+        "Compare against that company's budget. If you are over or "
+        "under budget, adjust bullet count or bullet lengths.",
+        "",
+        "Mechanical check M3 — TOTAL LINE SUM. Sum the rendered lines "
+        "across all four companies. It MUST be in "
+        f"[{AI_RESUME_TOTAL_LINES_MIN}, {AI_RESUME_TOTAL_LINES_MAX}].",
+        "",
+        "Only after every check passes, return your JSON response.",
+        "",
+        "═══════════════════════════════════════════════════════════════",
+        "RESPONSE FORMAT",
+        "═══════════════════════════════════════════════════════════════",
+        "",
+        "You must return a JSON object with TWO top-level fields: "
+        "`analysis` (your self-explanation) and `bullets` (the actual "
+        "tailored resume content). The analysis is what makes this "
+        "auditable — be honest and specific.",
+        "",
+        "The `analysis` object has three sub-fields:",
+        "  - `job_focus`: 1-2 sentences naming what this employer "
+        "    cares about most (the tailoring targets you identified "
+        "    in Step 1).",
+        "  - `per_company`: an object with one entry per company "
+        "    (Compass, Mastercard, JP Morgan, Leidos). Each entry is "
+        "    1-3 sentences explaining what you kept verbatim, what "
+        "    you edited and why, and what you merged. Be concrete — "
+        "    name the bullets you touched.",
+        "  - `dropped`: an object with one entry per company. Each "
+        "    entry is a list of strings; each string names a pool "
+        "    bullet you DID NOT include (use a short identifier like "
+        "    'bullet #2: M&A REST APIs') and gives a one-phrase "
+        "    reason (e.g., 'job is backend-only, frontend not "
+        "    relevant'). If you included every pool bullet for a "
+        "    company, use an empty list [].",
+        "",
+        "Return ONLY a JSON object in this exact shape, with no markdown "
+        "and no text outside the JSON:",
+        "",
+        "{",
+        '  "analysis": {',
+        '    "job_focus": "1-2 sentences on what the job emphasizes",',
+        '    "per_company": {',
+        ",\n".join(
+            f'      "{c}": "1-3 sentences on kept/edited/merged bullets"'
+            for c in _ai_resume_company_order()
+        ),
+        "    },",
+        '    "dropped": {',
+        ",\n".join(
+            f'      "{c}": ["bullet #X: short label — reason"]'
+            for c in _ai_resume_company_order()
+        ),
+        "    }",
+        "  },",
+        '  "bullets": {',
+        ",\n".join(
+            f'    "{c}": ["bullet 1", "bullet 2", "..."]'
+            for c in _ai_resume_company_order()
+        ),
+        "  }",
+        "}",
+    ])
+
+
+def _build_ai_resume_user_message(job):
+    """Per-job user message. Mirrors _build_batch_request (line ~1210)
+    but adds a brief instruction to respect the budget for this job."""
+    relevant_desc = _extract_relevant_description(
+        job.get("description", ""), max_chars=2500
+    )
+    return (
+        "Tailor a set of resume bullets for this specific job posting. "
+        "Respect every hard constraint from the system prompt.\n\n"
+        f"Company: {job.get('company', '')}\n"
+        f"Title: {job.get('title', '')}\n\n"
+        f"DESCRIPTION (relevant excerpt):\n{relevant_desc}"
+    )
+
+
+def _build_ai_resume_batch_request(job_id, system_prompt, job):
+    """Build one entry of an Anthropic Messages Batches request for
+    the Sonnet bullet generator. Same structure as _build_batch_request
+    but uses AI_RESUME_MODEL and the resume-specific system prompt.
+    """
+    return {
+        "custom_id": job_id,
+        "params": {
+            "model": AI_RESUME_MODEL,
+            "max_tokens": 2048,
+            "system": [{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            "messages": [{
+                "role": "user",
+                "content": _build_ai_resume_user_message(job),
+            }],
+        },
+    }
+
+
+def _parse_ai_resume_response(raw_text):
+    """Parse Sonnet's JSON response. Returns one of:
+
+        {"ok": True,  "bullets": {...}, "analysis": {...}|None}
+        {"ok": False, "error": "..."}
+
+    Tolerates leading/trailing whitespace, code fences, and a top-level
+    wrapping object — the only thing it insists on is finding a "bullets"
+    key whose value is a dict of lists-of-strings. The "analysis" key
+    is optional (older responses or tolerant fallbacks may omit it).
+    """
+    if not raw_text:
+        return {"ok": False, "error": "empty response"}
+    # Strip markdown code fences if present
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return {"ok": False, "error": "no JSON object in response"}
+    try:
+        data = json.loads(m.group(0))
+    except Exception as e:
+        return {"ok": False, "error": f"JSON parse error: {e}"}
+    bullets = data.get("bullets") if isinstance(data, dict) else None
+    if not isinstance(bullets, dict):
+        return {"ok": False, "error": "missing 'bullets' object"}
+    # Normalize per-company values to stripped-string lists
+    out = {}
+    for company, value in bullets.items():
+        if not isinstance(value, list):
+            return {"ok": False,
+                    "error": f"'{company}' value is not a list"}
+        clean = []
+        for item in value:
+            if not isinstance(item, str):
+                return {"ok": False,
+                        "error": f"'{company}' contains a non-string bullet"}
+            s = item.strip()
+            if s:
+                clean.append(s)
+        out[company] = clean
+
+    # Best-effort extraction of the analysis block. Missing/malformed
+    # analysis is NOT a hard error — we still return the bullets and
+    # let downstream code render a "no explanation captured" notice.
+    analysis = None
+    raw_analysis = data.get("analysis") if isinstance(data, dict) else None
+    if isinstance(raw_analysis, dict):
+        job_focus = raw_analysis.get("job_focus")
+        per_company = raw_analysis.get("per_company")
+        dropped = raw_analysis.get("dropped")
+        analysis = {
+            "job_focus": (job_focus.strip()
+                          if isinstance(job_focus, str) else None),
+            "per_company": (per_company
+                            if isinstance(per_company, dict) else {}),
+            "dropped": (dropped
+                        if isinstance(dropped, dict) else {}),
+        }
+
+    return {"ok": True, "bullets": out, "analysis": analysis}
+
+
+def _validate_ai_resume_bullets(bullets):
+    """Validate the parsed bullets dict against the hard constraints.
+
+    Returns (ok: bool, errors: list[str]). On failure the runner will
+    trigger the validation-retry path (one more live Sonnet call).
+    """
+    errors = []
+    expected_companies = _ai_resume_company_order()
+
+    # Shape: every expected company key must be present
+    for c in expected_companies:
+        if c not in bullets:
+            errors.append(f"missing company key: {c!r}")
+    extra = [k for k in bullets.keys() if k not in expected_companies]
+    if extra:
+        errors.append(f"unexpected company keys: {extra}")
+
+    if errors:
+        return False, errors
+
+    # Per-bullet char length and per-company line budget
+    total_lines = 0
+    for c in expected_companies:
+        company_bullets = bullets.get(c, [])
+        if not company_bullets:
+            errors.append(f"{c}: no bullets returned")
+            continue
+        company_lines = 0
+        for idx, b in enumerate(company_bullets, 1):
+            lines = _count_lines(b)
+            if lines >= 3:
+                errors.append(
+                    f"{c} bullet #{idx}: {len(b)} chars exceeds "
+                    f"{AI_RESUME_TWO_LINE_MAX_CHARS} char maximum"
+                )
+            company_lines += lines
+        lo, hi = AI_RESUME_LINE_BUDGET.get(c, (0, 999))
+        if company_lines < lo or company_lines > hi:
+            errors.append(
+                f"{c}: {company_lines} lines outside budget [{lo}, {hi}]"
+            )
+        total_lines += company_lines
+
+    if (total_lines < AI_RESUME_TOTAL_LINES_MIN
+            or total_lines > AI_RESUME_TOTAL_LINES_MAX):
+        errors.append(
+            f"total lines = {total_lines}, must be in "
+            f"[{AI_RESUME_TOTAL_LINES_MIN}, "
+            f"{AI_RESUME_TOTAL_LINES_MAX}]"
+        )
+
+    return (not errors), errors
+
+
+def _find_on_disk_resume_path(job):
+    """Return the absolute path of an existing on-disk resume.txt for
+    this job, or None if no file is found. Mirrors the naming logic in
+    process_new_postings.generate_resume_files()."""
+    try:
+        from process_new_postings import sanitize_dirname, RESUMES_DIR
+    except Exception:
+        return None
+    try:
+        company_dir = sanitize_dirname(job.get("company", ""))
+        title_dir = sanitize_dirname(job.get("title", ""))
+    except Exception:
+        return None
+    if not company_dir or not title_dir:
+        return None
+    base = os.path.join(RESUMES_DIR, company_dir, title_dir)
+    candidates = [
+        os.path.join(base, "resume.txt"),
+        os.path.join(base + "_" + str(job.get("id", "")), "resume.txt"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _apply_ai_resume_to_job(job_id, bullets, analysis=None):
+    """Render Sonnet's bullets dict into the final text resume and
+    persist it. Overwrites jobs.resume_text and any on-disk resume.txt,
+    sets ai_resume_status='ready' and ai_resume_generated_at=NOW().
+    Also persists Sonnet's self-explanation block (analysis) to
+    ai_resume_reasoning so the user can audit what changed and why.
+
+    Returns (ok: bool, message: str). Raises on hard DB errors.
+    """
+    from process_new_postings import generate_resume_txt, customize_skills
+
+    with Db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, company, title, location, work_type, salary, "
+            "posted_date, import_date, description, score, tier, "
+            "job_link, apply_link FROM jobs WHERE id = %s",
+            (job_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return False, f"job {job_id} not found"
+        (jid, company, title, location, work_type, salary,
+         posted_date, import_date, description, score, tier,
+         job_link, apply_link) = row
+        job = {
+            "id": jid, "company": company, "title": title,
+            "location": location, "work_type": work_type, "salary": salary,
+            "posted_date": posted_date, "import_date": import_date,
+            "description": description or "", "score": score,
+            "tier": tier, "job_link": job_link, "apply_link": apply_link,
+        }
+
+        langs, frameworks, misc = customize_skills(job["description"])
+        resume_text = generate_resume_txt(
+            job, bullets, langs, frameworks, misc
+        )
+
+        reasoning_json = json.dumps(analysis) if analysis else None
+        cur.execute(
+            "UPDATE jobs SET resume_text = %s, "
+            "ai_resume_generated_at = NOW(), "
+            "ai_resume_status = 'ready', "
+            "ai_resume_last_raw = NULL, "
+            "ai_resume_last_errors = NULL, "
+            "ai_resume_reasoning = %s "
+            "WHERE id = %s",
+            (resume_text, reasoning_json, job_id),
+        )
+
+    # Overwrite the on-disk resume.txt if it exists so the file and
+    # the DB stay in sync. If no file exists, the DB row is the
+    # source of truth and /api/resume-text/<id> will serve the new
+    # text anyway.
+    disk_path = _find_on_disk_resume_path(job)
+    if disk_path:
+        try:
+            with open(disk_path, "w") as f:
+                f.write(resume_text)
+        except Exception as e:
+            # Non-fatal — DB is authoritative
+            print(f"_apply_ai_resume_to_job: disk write failed for "
+                  f"{job_id}: {e}")
+
+    return True, f"applied AI resume for {job_id}"
+
+
+def _retrieve_ai_resume_batch_results_raw(batch_id):
+    """Yield (custom_id, {ok, text, error}) for each result in the
+    Sonnet bullet-generation batch. Unlike _retrieve_anthropic_batch_results
+    this returns the raw text so the caller can run its own parser and
+    validator (which may trigger a retry)."""
+    client = _get_anthropic_client()
+    for result in client.messages.batches.results(batch_id):
+        custom_id = result.custom_id
+        rtype = result.result.type
+        if rtype == "succeeded":
+            try:
+                msg = result.result.message
+                raw = msg.content[0].text
+                yield custom_id, {"ok": True, "text": raw}
+            except Exception as e:
+                yield custom_id, {"ok": False,
+                                  "error": f"extract error: {e}"}
+        elif rtype == "errored":
+            err = getattr(result.result, "error", None)
+            err_msg = str(err) if err else "unknown batch error"
+            yield custom_id, {"ok": False, "error": err_msg[:240]}
+        elif rtype == "expired":
+            yield custom_id, {"ok": False, "error": "batch request expired"}
+        elif rtype == "canceled":
+            yield custom_id, {"ok": False, "error": "batch request canceled"}
+        else:
+            yield custom_id, {"ok": False,
+                              "error": f"unknown result type: {rtype}"}
+
+
+# ─────────────────────────────────────────────────────────
+# AI RESUME BULLET GENERATION — DB row + in-memory state helpers
+# ─────────────────────────────────────────────────────────
+
+_AI_RESUME_BATCH_COLS = {
+    "anthropic_batch_id", "status", "batch_processing_status",
+    "job_ids", "pending_jobs", "request_counts",
+    "total", "succeeded", "failed", "estimated_cost",
+    "message", "last_error", "stopped",
+    "started_at", "finished_at",
+}
+
+
+def _new_ai_resume_batch_row(job_ids):
+    """Insert a fresh ai_resume_batches row; return the batch UUID."""
+    batch_uuid = str(uuid.uuid4())
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO ai_resume_batches
+                    (id, status, job_ids, total, message)
+                VALUES (%s, 'queued', %s, %s, 'Queued')
+            """, (batch_uuid, json.dumps(list(job_ids)), len(job_ids)))
+    except Exception as e:
+        print(f"Warning: could not insert ai_resume_batches row: {e}")
+    return batch_uuid
+
+
+def _update_ai_resume_batch_row(batch_uuid, **fields):
+    """Patch-update an ai_resume_batches row with whitelisted fields.
+
+    JSONB columns are serialised to strings; timestamp sentinel
+    "NOW()" is passed through as a SQL expression."""
+    kv = {k: v for k, v in fields.items() if k in _AI_RESUME_BATCH_COLS}
+    if not kv:
+        return
+    sets = []
+    vals = []
+    for k, v in kv.items():
+        if v == "NOW()":
+            sets.append(f"{k} = NOW()")
+            continue
+        sets.append(f"{k} = %s")
+        if k in ("request_counts", "pending_jobs", "job_ids") \
+                and v is not None and not isinstance(v, str):
+            vals.append(json.dumps(v))
+        else:
+            vals.append(v)
+    vals.append(batch_uuid)
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"UPDATE ai_resume_batches SET {', '.join(sets)}, "
+                "updated_at = NOW() WHERE id = %s",
+                vals,
+            )
+    except Exception as e:
+        print(f"Warning: _update_ai_resume_batch_row failed for "
+              f"{batch_uuid}: {e}")
+
+
+def _mem_update_ai_resume(batch_uuid, patch):
+    """Atomically patch the in-memory AI resume batch state."""
+    with _ai_resume_batches_lock:
+        s = _ai_resume_batches_state.get(batch_uuid)
+        if s is not None:
+            s.update(patch)
+
+
+def _flush_ai_resume_progress(batch_uuid):
+    """Copy the current in-memory state to the DB row."""
+    with _ai_resume_batches_lock:
+        s = dict(_ai_resume_batches_state.get(batch_uuid) or {})
+    if not s:
+        return
+    _update_ai_resume_batch_row(
+        batch_uuid,
+        status=s.get("status", "running"),
+        anthropic_batch_id=s.get("batch_id"),
+        batch_processing_status=s.get("batch_processing_status"),
+        total=s.get("total") or 0,
+        succeeded=s.get("succeeded") or 0,
+        failed=s.get("failed") or 0,
+        estimated_cost=s.get("estimated_cost") or 0,
+        request_counts=s.get("batch_request_counts"),
+        message=s.get("message"),
+        last_error=s.get("last_error"),
+        stopped=bool(s.get("stopped")),
+    )
+
+
+def _set_jobs_ai_resume_status(job_ids, status, batch_uuid=None):
+    """Bulk-update ai_resume_status for a set of jobs. Used to mark
+    jobs pending when a batch is submitted and failed/ready as
+    results land."""
+    if not job_ids:
+        return
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE jobs SET ai_resume_status = %s WHERE id = ANY(%s)",
+                (status, list(job_ids)),
+            )
+    except Exception as e:
+        print(f"_set_jobs_ai_resume_status failed: {e}")
+
+
+def _save_ai_resume_failure(job_id, raw_text, errors):
+    """Persist Sonnet's raw output and the validator error list for a
+    failed job, and flip ai_resume_status to 'failed'. Used so the
+    Failure Inspection modal can show the user what Sonnet actually
+    produced and let them Edit-as-text or Retry.
+
+    raw_text may be None (e.g., when the failure happened before
+    Sonnet returned anything — batch error, parse error). errors is
+    a list of strings.
+    """
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE jobs SET ai_resume_status = 'failed', "
+                "ai_resume_last_raw = %s, "
+                "ai_resume_last_errors = %s "
+                "WHERE id = %s",
+                (raw_text,
+                 json.dumps(list(errors)) if errors else None,
+                 job_id),
+            )
+    except Exception as e:
+        print(f"_save_ai_resume_failure failed for {job_id}: {e}")
+
+
+def _job_has_pending_ai_resume(job_id):
+    """Check whether a job is currently inside an in-flight AI resume
+    batch. Used to block the live regenerate path."""
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT ai_resume_status FROM jobs WHERE id = %s",
+                (job_id,),
+            )
+            row = cur.fetchone()
+    except Exception as e:
+        print(f"_job_has_pending_ai_resume failed: {e}")
+        return False
+    return bool(row) and row[0] == "pending"
+
+
+def _ai_resume_batch_row_to_dict(row, desc):
+    """Serialize an ai_resume_batches row to a JSON-safe dict.
+
+    Also merges fresher in-memory state from _ai_resume_batches_state
+    when the batch is still running in this process."""
+    from decimal import Decimal
+    keys = [c[0] for c in desc]
+    d = {}
+    for k, v in zip(keys, row):
+        if hasattr(v, "isoformat"):
+            d[k] = v.isoformat()
+        elif isinstance(v, Decimal):
+            # estimated_cost is NUMERIC(10,4) → Decimal → not
+            # JSON-serializable. Cast to float for the wire.
+            d[k] = float(v)
+        else:
+            d[k] = v
+    d["id"] = str(d.get("id", ""))
+    # Merge fresher in-memory state
+    with _ai_resume_batches_lock:
+        mem = _ai_resume_batches_state.get(d["id"])
+        if mem:
+            for field in ("status", "message", "succeeded", "failed",
+                          "estimated_cost", "batch_processing_status",
+                          "last_error"):
+                if mem.get(field) is not None:
+                    d[field] = mem[field]
+            if mem.get("batch_request_counts") is not None:
+                d["request_counts"] = mem["batch_request_counts"]
+    return d
+
+
+def _load_jobs_for_ai_resume(job_ids):
+    """Load the full job dicts needed to build Sonnet batch requests.
+
+    Returns a list in the SAME order as job_ids, skipping any IDs
+    that don't exist in the DB."""
+    if not job_ids:
+        return []
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, company, title, location, work_type, salary, "
+                "posted_date, import_date, description, score, tier, "
+                "job_link, apply_link FROM jobs WHERE id = ANY(%s)",
+                (list(job_ids),),
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        print(f"_load_jobs_for_ai_resume failed: {e}")
+        return []
+    by_id = {}
+    for r in rows:
+        (jid, company, title, location, work_type, salary, posted_date,
+         import_date, description, score, tier, job_link, apply_link) = r
+        by_id[jid] = {
+            "id": jid, "company": company, "title": title,
+            "location": location, "work_type": work_type,
+            "salary": salary, "posted_date": posted_date,
+            "import_date": import_date, "description": description or "",
+            "score": score, "tier": tier,
+            "job_link": job_link, "apply_link": apply_link,
+        }
+    # Preserve caller order
+    return [by_id[j] for j in job_ids if j in by_id]
+
+
+# ─────────────────────────────────────────────────────────
+# AI RESUME BULLET GENERATION — batch runner, live regenerate, restart
+# ─────────────────────────────────────────────────────────
+
+def _try_ai_resume_generate_one_live(job, system_prompt):
+    """Call Sonnet synchronously for a single job, parse, validate,
+    and apply on success. Returns a dict:
+        {ok: True,  message: str}
+        {ok: False, message: str, raw: str|None, errors: [str]}
+    Used by the batch runner's validation-retry fallback and by
+    /api/ai-resume/regenerate.
+    """
+    user_message = _build_ai_resume_user_message(job)
+    try:
+        raw = _call_claude_with_retry(
+            system_prompt,
+            [{"role": "user", "content": user_message}],
+            model=AI_RESUME_MODEL,
+        )
+    except Exception as e:
+        return {"ok": False,
+                "message": f"sonnet call failed: {str(e)[:200]}",
+                "raw": None,
+                "errors": [f"sonnet call failed: {str(e)[:200]}"]}
+
+    parsed = _parse_ai_resume_response(raw)
+    if not parsed.get("ok"):
+        return {"ok": False,
+                "message": f"parse failed: {parsed.get('error')}",
+                "raw": raw,
+                "errors": [f"parse failed: {parsed.get('error')}"]}
+
+    ok, errors = _validate_ai_resume_bullets(parsed["bullets"])
+    if not ok:
+        return {"ok": False,
+                "message": "validation failed: " + "; ".join(errors[:3]),
+                "raw": raw,
+                "errors": list(errors)}
+
+    try:
+        aok, amsg = _apply_ai_resume_to_job(
+            job["id"], parsed["bullets"], analysis=parsed.get("analysis")
+        )
+        if aok:
+            return {"ok": True, "message": amsg}
+        return {"ok": False, "message": amsg,
+                "raw": raw, "errors": [amsg]}
+    except Exception as e:
+        msg = f"apply failed: {str(e)[:200]}"
+        return {"ok": False, "message": msg, "raw": raw, "errors": [msg]}
+
+
+def _regenerate_ai_resume_live(job_id):
+    """Synchronous single-job regenerate. Blocked if the job has a
+    pending batch. Returns (ok: bool, message: str). On failure also
+    saves Sonnet's raw output and the validator errors so the user
+    can inspect them in the failure modal."""
+    if _job_has_pending_ai_resume(job_id):
+        return False, (
+            "Job is currently inside an in-flight AI resume batch. "
+            "Wait for the batch to finish before regenerating."
+        )
+    jobs = _load_jobs_for_ai_resume([job_id])
+    if not jobs:
+        return False, f"job {job_id} not found"
+    system_prompt = _build_ai_resume_system_prompt()
+    result = _try_ai_resume_generate_one_live(jobs[0], system_prompt)
+    if result.get("ok"):
+        return True, result.get("message", "ok")
+    _save_ai_resume_failure(
+        job_id, result.get("raw"), result.get("errors") or []
+    )
+    return False, result.get("message", "regenerate failed")
+
+
+def _run_ai_resume_batch(batch_uuid, job_ids):
+    """Background thread: submit an AI resume batch to Anthropic,
+    poll every 60s, apply results. Mirrors _run_import_csv_ai_batch
+    (line ~1943 area) in structure and state-management style."""
+    stop_event = _ai_resume_batch_stop_events.setdefault(
+        batch_uuid, threading.Event()
+    )
+
+    with _ai_resume_batches_lock:
+        _ai_resume_batches_state[batch_uuid] = {
+            "id": batch_uuid, "running": True, "status": "running",
+            "total": len(job_ids), "succeeded": 0, "failed": 0,
+            "estimated_cost": 0.0,
+            "message": f"Loading {len(job_ids)} jobs\u2026",
+        }
+    _flush_ai_resume_progress(batch_uuid)
+    _update_ai_resume_batch_row(batch_uuid, status="running",
+                                started_at="NOW()")
+
+    try:
+        jobs = _load_jobs_for_ai_resume(job_ids)
+        if not jobs:
+            _mem_update_ai_resume(batch_uuid, {
+                "running": False, "status": "failed",
+                "message": "No jobs loaded from DB — aborting",
+            })
+            _flush_ai_resume_progress(batch_uuid)
+            _update_ai_resume_batch_row(batch_uuid, finished_at="NOW()")
+            return
+
+        job_by_id = {j["id"]: j for j in jobs}
+        # Persist the full job snapshot so restart recovery can
+        # rebuild job_by_id without re-querying.
+        _update_ai_resume_batch_row(batch_uuid, pending_jobs=jobs)
+
+        # Mark the rows as pending so the UI shows a spinner
+        _set_jobs_ai_resume_status(
+            [j["id"] for j in jobs], "pending", batch_uuid
+        )
+
+        system_prompt = _build_ai_resume_system_prompt()
+        batch_requests = [
+            _build_ai_resume_batch_request(j["id"], system_prompt, j)
+            for j in jobs
+        ]
+
+        _mem_update_ai_resume(batch_uuid, {
+            "message": f"Submitting batch of {len(jobs)} jobs to Anthropic\u2026",
+        })
+        _flush_ai_resume_progress(batch_uuid)
+
+        try:
+            batch = _create_anthropic_batch(batch_requests)
+        except Exception as e:
+            _mem_update_ai_resume(batch_uuid, {
+                "running": False, "status": "failed",
+                "message": f"Batch submission failed: {str(e)[:200]}",
+                "last_error": str(e)[:240],
+            })
+            _flush_ai_resume_progress(batch_uuid)
+            _update_ai_resume_batch_row(batch_uuid, finished_at="NOW()",
+                                        pending_jobs=None)
+            _set_jobs_ai_resume_status(
+                [j["id"] for j in jobs], "failed", batch_uuid
+            )
+            return
+
+        _mem_update_ai_resume(batch_uuid, {
+            "batch_id": batch.id,
+            "batch_processing_status": getattr(batch, "processing_status",
+                                               "in_progress"),
+            "message": (f"Batch {batch.id[:8]}\u2026 submitted. "
+                        "Polling every 60s."),
+        })
+        _update_ai_resume_batch_row(
+            batch_uuid,
+            anthropic_batch_id=batch.id,
+            batch_processing_status=getattr(batch, "processing_status",
+                                            "in_progress"),
+        )
+        _flush_ai_resume_progress(batch_uuid)
+
+        _poll_ai_resume_batch_until_done(batch_uuid, batch, stop_event,
+                                         job_by_id)
+
+    except Exception as e:
+        _mem_update_ai_resume(batch_uuid, {
+            "running": False, "status": "failed",
+            "message": f"Batch error: {str(e)[:200]}",
+            "last_error": str(e)[:240],
+        })
+        _flush_ai_resume_progress(batch_uuid)
+        _update_ai_resume_batch_row(batch_uuid, finished_at="NOW()",
+                                    pending_jobs=None)
+
+
+def _poll_ai_resume_batch_until_done(batch_uuid, batch, stop_event,
+                                     job_by_id):
+    """Shared polling loop used by both fresh batches and restart
+    resumes. Polls every 60s, applies results on 'ended'."""
+    poll_interval = 60
+    consecutive_errors = 0
+    batch_id = batch.id
+
+    while batch.processing_status != "ended":
+        if stop_event.is_set():
+            _mem_update_ai_resume(batch_uuid, {
+                "running": False, "status": "canceled", "stopped": True,
+                "message": (
+                    f"Stopped polling batch {batch_id[:8]}\u2026. "
+                    "Anthropic batch still running — results preserved."
+                ),
+            })
+            _flush_ai_resume_progress(batch_uuid)
+            _update_ai_resume_batch_row(batch_uuid, finished_at="NOW()")
+            return
+
+        time.sleep(poll_interval)
+        try:
+            batch = _get_anthropic_batch(batch_id)
+            consecutive_errors = 0
+        except Exception as e:
+            consecutive_errors += 1
+            err = f"poll error: {str(e)[:200]}"
+            _mem_update_ai_resume(batch_uuid, {"last_error": err})
+            _flush_ai_resume_progress(batch_uuid)
+            if consecutive_errors >= 20:
+                _mem_update_ai_resume(batch_uuid, {
+                    "running": False, "status": "failed",
+                    "message": f"Polling failed 20 times: {err}",
+                })
+                _flush_ai_resume_progress(batch_uuid)
+                _update_ai_resume_batch_row(batch_uuid,
+                                            finished_at="NOW()")
+                _set_jobs_ai_resume_status(
+                    list(job_by_id.keys()), "failed", batch_uuid
+                )
+                return
+            continue
+
+        counts = getattr(batch, "request_counts", None)
+        counts_dict = None
+        if counts is not None:
+            counts_dict = {
+                "processing": getattr(counts, "processing", 0),
+                "succeeded": getattr(counts, "succeeded", 0),
+                "errored": getattr(counts, "errored", 0),
+                "canceled": getattr(counts, "canceled", 0),
+                "expired": getattr(counts, "expired", 0),
+            }
+        with _ai_resume_batches_lock:
+            s = _ai_resume_batches_state.get(batch_uuid, {})
+            s["batch_processing_status"] = batch.processing_status
+            s["batch_request_counts"] = counts_dict
+            if counts_dict:
+                finished = (counts_dict["succeeded"] + counts_dict["errored"]
+                            + counts_dict["canceled"]
+                            + counts_dict["expired"])
+                s["message"] = (
+                    f"Batch {batch_id[:8]}\u2026 {batch.processing_status} "
+                    f"({finished}/{len(job_by_id)} processed)"
+                )
+        _flush_ai_resume_progress(batch_uuid)
+
+    # Batch ended — retrieve + apply
+    _mem_update_ai_resume(batch_uuid, {
+        "message": f"Batch {batch_id[:8]}\u2026 ended. Applying results\u2026",
+    })
+    _flush_ai_resume_progress(batch_uuid)
+
+    # Build the system prompt once for the validation-retry path
+    retry_system_prompt = _build_ai_resume_system_prompt()
+
+    succeeded = 0
+    failed = 0
+    processed_ids = set()
+    for custom_id, result in _retrieve_ai_resume_batch_results_raw(batch_id):
+        processed_ids.add(custom_id)
+        job = job_by_id.get(custom_id)
+        if not job:
+            failed += 1
+            continue
+
+        applied_ok = False
+        last_err = None
+        # Track raw + structured errors for the failure-inspection modal
+        first_raw = None
+        first_errors = []
+
+        if result.get("ok"):
+            first_raw = result.get("text")
+            parsed = _parse_ai_resume_response(result["text"])
+            if parsed.get("ok"):
+                vok, verrors = _validate_ai_resume_bullets(parsed["bullets"])
+                if vok:
+                    try:
+                        aok, amsg = _apply_ai_resume_to_job(
+                            custom_id, parsed["bullets"],
+                            analysis=parsed.get("analysis"),
+                        )
+                        if aok:
+                            applied_ok = True
+                            succeeded += 1
+                        else:
+                            last_err = amsg
+                            first_errors = [amsg]
+                    except Exception as e:
+                        last_err = f"apply error: {str(e)[:200]}"
+                        first_errors = [last_err]
+                else:
+                    last_err = "validation failed: " + "; ".join(verrors[:3])
+                    first_errors = list(verrors)
+            else:
+                last_err = f"parse failed: {parsed.get('error')}"
+                first_errors = [last_err]
+        else:
+            last_err = result.get("error") or "unknown batch result"
+            first_errors = [last_err]
+
+        if not applied_ok:
+            # Validation-retry path: one extra live Sonnet call
+            retry_result = _try_ai_resume_generate_one_live(
+                job, retry_system_prompt
+            )
+            if retry_result.get("ok"):
+                succeeded += 1
+                applied_ok = True
+            else:
+                failed += 1
+                # Persist whichever raw output is more useful — prefer
+                # the retry's (newer) if it has one, fall back to the
+                # batch's. Both attempts' errors are recorded so the
+                # user sees the full picture in the modal.
+                retry_raw = retry_result.get("raw")
+                retry_errors = retry_result.get("errors") or []
+                combined_errors = []
+                if first_errors:
+                    combined_errors.append("Batch attempt:")
+                    combined_errors.extend(first_errors)
+                if retry_errors:
+                    combined_errors.append("Retry attempt:")
+                    combined_errors.extend(retry_errors)
+                final_raw = retry_raw if retry_raw else first_raw
+                _save_ai_resume_failure(
+                    custom_id, final_raw, combined_errors
+                )
+                last_err = (
+                    f"{last_err} | retry: "
+                    f"{retry_result.get('message', 'failed')}"
+                )
+
+        with _ai_resume_batches_lock:
+            s = _ai_resume_batches_state.get(batch_uuid, {})
+            s["succeeded"] = succeeded
+            s["failed"] = failed
+            s["estimated_cost"] = (
+                succeeded * AI_RESUME_COST_PER_JOB_BATCH
+                + failed * AI_RESUME_COST_PER_JOB_BATCH
+            )
+            if last_err and not applied_ok:
+                s["last_error"] = last_err[:240]
+        _flush_ai_resume_progress(batch_uuid)
+
+    # Any job that was in the batch but has no result — mark failed
+    missed = [j for j in job_by_id if j not in processed_ids]
+    if missed:
+        _set_jobs_ai_resume_status(missed, "failed", batch_uuid)
+        failed += len(missed)
+
+    total_jobs = len(job_by_id)
+    _mem_update_ai_resume(batch_uuid, {
+        "running": False, "status": "completed",
+        "succeeded": succeeded, "failed": failed,
+        "message": (
+            f"Done! {succeeded}/{total_jobs} AI resumes generated "
+            f"({failed} failed). Batch {batch_id[:8]}\u2026"
+        ),
+    })
+    _flush_ai_resume_progress(batch_uuid)
+    _update_ai_resume_batch_row(batch_uuid, finished_at="NOW()",
+                                pending_jobs=None)
+
+
+def _run_ai_resume_batch_resume(batch_uuid, anthropic_batch_id):
+    """Resume polling an in-flight AI resume batch after a server
+    restart. Reads pending_jobs from the DB to reconstruct the
+    job dict map, then delegates to _poll_ai_resume_batch_until_done.
+    """
+    stop_event = _ai_resume_batch_stop_events.setdefault(
+        batch_uuid, threading.Event()
+    )
+
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT pending_jobs FROM ai_resume_batches WHERE id = %s",
+                (batch_uuid,),
+            )
+            row = cur.fetchone()
+    except Exception as e:
+        print(f"Resume AI-resume {batch_uuid}: DB error: {e}")
+        return
+
+    if not row:
+        print(f"Resume AI-resume {batch_uuid}: row gone, aborting")
+        return
+
+    pending_jobs_data = row[0]
+    if not pending_jobs_data:
+        _update_ai_resume_batch_row(
+            batch_uuid, status="failed",
+            message="Resume failed: pending_jobs missing",
+            finished_at="NOW()",
+        )
+        return
+
+    new_jobs = pending_jobs_data if isinstance(pending_jobs_data, list) else []
+    job_by_id = {j["id"]: j for j in new_jobs}
+
+    with _ai_resume_batches_lock:
+        _ai_resume_batches_state[batch_uuid] = {
+            "id": batch_uuid, "running": True, "status": "running",
+            "batch_id": anthropic_batch_id,
+            "total": len(new_jobs),
+            "succeeded": 0, "failed": 0, "estimated_cost": 0.0,
+            "message": (f"Resumed — polling Anthropic batch "
+                        f"{anthropic_batch_id[:8]}\u2026"),
+        }
+    _flush_ai_resume_progress(batch_uuid)
+
+    try:
+        batch = _get_anthropic_batch(anthropic_batch_id)
+    except Exception as e:
+        _mem_update_ai_resume(batch_uuid, {
+            "running": False, "status": "failed",
+            "message": f"Resume poll error: {e}",
+        })
+        _flush_ai_resume_progress(batch_uuid)
+        _update_ai_resume_batch_row(batch_uuid, finished_at="NOW()")
+        return
+
+    _poll_ai_resume_batch_until_done(batch_uuid, batch, stop_event, job_by_id)
+
+
+def _resume_in_flight_ai_resume_batches():
+    """Called at server startup — respawn polling threads for any
+    ai_resume_batches rows with status IN ('queued','running').
+    Parallel to _resume_in_flight_imports()."""
+    try:
+        with Db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, anthropic_batch_id
+                  FROM ai_resume_batches
+                 WHERE status IN ('queued', 'running')
+            """)
+            rows = cur.fetchall()
+    except Exception as e:
+        print(f"_resume_in_flight_ai_resume_batches: DB error: {e}")
+        return
+
+    for batch_uuid, anthropic_batch_id in rows:
+        batch_uuid = str(batch_uuid)
+        if not anthropic_batch_id:
+            _update_ai_resume_batch_row(
+                batch_uuid, status="failed",
+                message="Abandoned before Anthropic batch was submitted",
+                finished_at="NOW()",
+            )
+            print(f"Resume: marked unsubmitted AI-resume batch "
+                  f"{batch_uuid[:8]} as failed")
+            continue
+
+        t = threading.Thread(
+            target=_run_ai_resume_batch_resume,
+            args=(batch_uuid, anthropic_batch_id),
+            daemon=True,
+        )
+        t.start()
+        print(f"Resume: respawned AI-resume batch poller for "
+              f"{batch_uuid[:8]} (anthropic={anthropic_batch_id[:8]})")
 
 
 # ─────────────────────────────────────────────────────────
@@ -2738,6 +4075,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                         SELECT j.id, j.company, j.title, j.location, j.work_type, j.salary,
                                j.posted_date, j.import_date, j.score, j.tier,
                                j.job_link, j.apply_link, j.ai_reasoning, j.regex_score,
+                               j.ai_resume_generated_at, j.ai_resume_status,
+                               j.ai_resume_last_raw, j.ai_resume_last_errors,
+                               j.ai_resume_reasoning,
                                js.status, js.notes, js.applicants,
                                js.live_status, js.live_status_checked, js.timestamps,
                                js.pdf_path
@@ -3068,6 +4408,152 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     desc = cur.description
                 result = [_import_row_to_dict(r, desc) for r in rows]
                 _json_response(self, result)
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── /api/ai-resume/batches — list or single AI resume batch ──
+        if self.path == "/api/ai-resume/batches" or \
+                self.path.startswith("/api/ai-resume/batches?") or \
+                self.path.startswith("/api/ai-resume/batches/"):
+            parsed = urllib.parse.urlparse(self.path)
+            parts = parsed.path.rstrip("/").split("/")
+            # /api/ai-resume/batches/<uuid>
+            if len(parts) >= 5 and parts[4]:
+                batch_uuid = parts[4]
+                try:
+                    with Db() as conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            "SELECT * FROM ai_resume_batches WHERE id = %s",
+                            (batch_uuid,),
+                        )
+                        row = cur.fetchone()
+                        if not row:
+                            _json_response(
+                                self, {"error": "Not found"}, 404
+                            )
+                            return
+                        d = _ai_resume_batch_row_to_dict(row, cur.description)
+                    _json_response(self, d)
+                except Exception as e:
+                    _json_response(self, {"error": str(e)}, 500)
+                return
+            # list
+            try:
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT * FROM ai_resume_batches "
+                        "ORDER BY created_at DESC LIMIT 50"
+                    )
+                    rows = cur.fetchall()
+                    desc = cur.description
+                result = [_ai_resume_batch_row_to_dict(r, desc) for r in rows]
+                _json_response(self, result)
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── /api/ai-resume/failure/<job_id> — failed Sonnet inspection ──
+        # Returns the captured raw Sonnet output, the validator errors,
+        # and a best-effort rendered preview (which the user can edit
+        # and save via /api/ai-resume/edit). Used by the Failure
+        # Inspection modal opened from the red "AI Failed" badge.
+        if self.path.startswith("/api/ai-resume/failure/"):
+            job_id = self.path[len("/api/ai-resume/failure/"):].strip()
+            if not job_id:
+                _json_response(self, {"error": "Missing job ID"}, 400)
+                return
+            try:
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT id, company, title, location, work_type, "
+                        "salary, posted_date, import_date, description, "
+                        "score, tier, job_link, apply_link, "
+                        "ai_resume_status, ai_resume_last_raw, "
+                        "ai_resume_last_errors "
+                        "FROM jobs WHERE id = %s",
+                        (job_id,),
+                    )
+                    row = cur.fetchone()
+                if not row:
+                    _json_response(self, {"error": "Job not found"}, 404)
+                    return
+                (jid, company, title, location, work_type, salary,
+                 posted_date, import_date, description, score, tier,
+                 job_link, apply_link, status, raw_text,
+                 errors_json) = row
+                errors_list = []
+                if errors_json:
+                    if isinstance(errors_json, list):
+                        errors_list = errors_json
+                    elif isinstance(errors_json, str):
+                        try:
+                            errors_list = json.loads(errors_json)
+                        except Exception:
+                            errors_list = [errors_json]
+
+                # Best-effort rendered preview: try to parse the raw
+                # Sonnet output and run it through generate_resume_txt
+                # so the user can edit a real text resume rather than
+                # raw JSON. If the parse fails, fall back to the raw
+                # text itself. We also pull out Sonnet's analysis
+                # block (if present) so the failure modal can show
+                # WHAT Sonnet was trying to do alongside WHY it
+                # failed validation.
+                preview = None
+                preview_source = None  # "rendered" | "raw" | None
+                analysis = None
+                if raw_text:
+                    parsed = _parse_ai_resume_response(raw_text)
+                    if parsed.get("ok"):
+                        analysis = parsed.get("analysis")
+                        try:
+                            from process_new_postings import (
+                                generate_resume_txt, customize_skills
+                            )
+                            job_dict = {
+                                "id": jid, "company": company,
+                                "title": title, "location": location,
+                                "work_type": work_type, "salary": salary,
+                                "posted_date": posted_date,
+                                "import_date": import_date,
+                                "description": description or "",
+                                "score": score, "tier": tier,
+                                "job_link": job_link,
+                                "apply_link": apply_link,
+                            }
+                            langs, frameworks, misc = customize_skills(
+                                job_dict["description"]
+                            )
+                            preview = generate_resume_txt(
+                                job_dict, parsed["bullets"],
+                                langs, frameworks, misc,
+                            )
+                            preview_source = "rendered"
+                        except Exception as e:
+                            preview = raw_text
+                            preview_source = "raw"
+                            errors_list = list(errors_list) + [
+                                f"render preview failed: {str(e)[:200]}"
+                            ]
+                    else:
+                        preview = raw_text
+                        preview_source = "raw"
+
+                _json_response(self, {
+                    "job_id": jid,
+                    "company": company,
+                    "title": title,
+                    "status": status,
+                    "errors": errors_list,
+                    "raw": raw_text,
+                    "preview": preview,
+                    "preview_source": preview_source,
+                    "reasoning": analysis,
+                })
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
             return
@@ -3726,6 +5212,193 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 _json_response(self, {"error": str(e)}, 500)
             return
 
+        # ── POST /api/ai-resume/estimate — cost preview ──
+        # Body: {job_ids: [...]}. Returns counts + batch/live cost.
+        if self.path == "/api/ai-resume/estimate":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length)) if length > 0 else {}
+                job_ids = body.get("job_ids") or []
+                if not isinstance(job_ids, list):
+                    _json_response(self, {"error": "job_ids must be a list"}, 400)
+                    return
+                n = len(job_ids)
+                _json_response(self, {
+                    "count": n,
+                    "cost_batch": round(n * AI_RESUME_COST_PER_JOB_BATCH, 4),
+                    "cost_live": round(n * AI_RESUME_COST_PER_JOB_LIVE, 4),
+                })
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── POST /api/ai-resume/batch — submit a Sonnet batch ──
+        # Body: {job_ids: [...]}. Spawns a background thread and
+        # returns a batch UUID immediately. Client polls
+        # /api/ai-resume/batches/<uuid> for status.
+        if self.path == "/api/ai-resume/batch":
+            if not _ANTHROPIC_KEY:
+                _json_response(
+                    self,
+                    {"error": "Anthropic API key not configured"},
+                    500,
+                )
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length)) if length > 0 else {}
+                job_ids = body.get("job_ids") or []
+                if not isinstance(job_ids, list) or not job_ids:
+                    _json_response(
+                        self,
+                        {"error": "job_ids must be a non-empty list"},
+                        400,
+                    )
+                    return
+                # De-dup while preserving order
+                seen = set()
+                dedup_ids = []
+                for j in job_ids:
+                    if j and j not in seen:
+                        seen.add(j)
+                        dedup_ids.append(j)
+                batch_uuid = _new_ai_resume_batch_row(dedup_ids)
+                threading.Thread(
+                    target=_run_ai_resume_batch,
+                    args=(batch_uuid, dedup_ids),
+                    daemon=True,
+                ).start()
+                _json_response(self, {
+                    "ok": True,
+                    "batch_uuid": batch_uuid,
+                    "count": len(dedup_ids),
+                })
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── POST /api/ai-resume/batches/<uuid>/cancel ──
+        if (self.path.startswith("/api/ai-resume/batches/")
+                and self.path.endswith("/cancel")):
+            try:
+                path = self.path[len("/api/ai-resume/batches/"):]
+                batch_uuid = path[:-len("/cancel")]
+                ev = _ai_resume_batch_stop_events.get(batch_uuid)
+                if ev:
+                    ev.set()
+                    _mem_update_ai_resume(batch_uuid, {
+                        "message": ("Stop requested — polling will stop "
+                                    "on next tick. Anthropic batch still "
+                                    "running."),
+                    })
+                    _json_response(self, {"ok": True})
+                else:
+                    _json_response(
+                        self,
+                        {"ok": True, "message": "Not running in this process"},
+                    )
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── POST /api/ai-resume/regenerate — live single-job rerun ──
+        # Body: {job_id}. Synchronous; blocked if the job is in a pending batch.
+        if self.path == "/api/ai-resume/regenerate":
+            if not _ANTHROPIC_KEY:
+                _json_response(
+                    self,
+                    {"error": "Anthropic API key not configured"},
+                    500,
+                )
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length)) if length > 0 else {}
+                job_id = (body.get("job_id") or "").strip()
+                if not job_id:
+                    _json_response(self, {"error": "job_id required"}, 400)
+                    return
+                ok, message = _regenerate_ai_resume_live(job_id)
+                _json_response(
+                    self,
+                    {"ok": ok, "message": message},
+                    200 if ok else 400,
+                )
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
+        # ── POST /api/ai-resume/edit — plain textarea save ──
+        # Body: {job_id, resume_text}. Overwrites jobs.resume_text and the
+        # on-disk resume.txt. Promotes 'failed' jobs to 'ready' (this is
+        # how the user recovers from a Sonnet validation failure) and
+        # clears the captured raw output + errors. For jobs that are
+        # already 'ready', preserves ai_resume_generated_at so the
+        # original generation timestamp survives a manual tweak.
+        if self.path == "/api/ai-resume/edit":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length)) if length > 0 else {}
+                job_id = (body.get("job_id") or "").strip()
+                resume_text = body.get("resume_text")
+                if not job_id or resume_text is None:
+                    _json_response(
+                        self,
+                        {"error": "job_id and resume_text required"},
+                        400,
+                    )
+                    return
+                with Db() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT id, company, title, ai_resume_status "
+                        "FROM jobs WHERE id = %s",
+                        (job_id,),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        _json_response(self, {"error": "job not found"}, 404)
+                        return
+                    current_status = row[3]
+                    if current_status == "failed":
+                        # Recovery path: bump to ready, set the
+                        # generation timestamp, clear the raw/errors
+                        # AND clear reasoning (the user's edit no
+                        # longer matches Sonnet's explanation).
+                        cur.execute(
+                            "UPDATE jobs SET resume_text = %s, "
+                            "ai_resume_status = 'ready', "
+                            "ai_resume_generated_at = NOW(), "
+                            "ai_resume_last_raw = NULL, "
+                            "ai_resume_last_errors = NULL, "
+                            "ai_resume_reasoning = NULL "
+                            "WHERE id = %s",
+                            (resume_text, job_id),
+                        )
+                    else:
+                        # Edit-in-place on an already-ready resume:
+                        # preserve generated_at, but clear the
+                        # reasoning since the user just changed the
+                        # text Sonnet was explaining.
+                        cur.execute(
+                            "UPDATE jobs SET resume_text = %s, "
+                            "ai_resume_reasoning = NULL "
+                            "WHERE id = %s",
+                            (resume_text, job_id),
+                        )
+                    job = {"id": row[0], "company": row[1], "title": row[2]}
+                disk_path = _find_on_disk_resume_path(job)
+                if disk_path:
+                    try:
+                        with open(disk_path, "w") as f:
+                            f.write(resume_text)
+                    except Exception as e:
+                        print(f"/api/ai-resume/edit: disk write failed: {e}")
+                _json_response(self, {"ok": True})
+            except Exception as e:
+                _json_response(self, {"error": str(e)}, 500)
+            return
+
         # ── POST /api/import-csv — LinkedIn CSV upload ───
         if self.path.startswith("/api/import-csv"):
             if _import_status.get("running"):
@@ -4120,6 +5793,7 @@ if __name__ == "__main__":
     print(f"Open http://localhost:{PORT} in your browser")
     print("Press Ctrl+C to stop\n")
     _resume_in_flight_imports()
+    _resume_in_flight_ai_resume_batches()
     server = http.server.ThreadingHTTPServer(("", PORT), DashboardHandler)
     try:
         server.serve_forever()

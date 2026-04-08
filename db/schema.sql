@@ -112,3 +112,53 @@ CREATE INDEX IF NOT EXISTS idx_import_batches_status     ON import_batches(statu
 CREATE INDEX IF NOT EXISTS idx_import_batches_created_at ON import_batches(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_import_batches_import_dt  ON import_batches(import_date);
 CREATE INDEX IF NOT EXISTS idx_import_batches_anthropic  ON import_batches(anthropic_batch_id);
+
+-- ─────────────────────────────────────────────────────────
+-- Phase 2: AI-tailored resume bullets (Sonnet batch generation)
+-- ─────────────────────────────────────────────────────────
+-- Additive columns on jobs for tracking per-job AI resume state.
+-- ai_resume_status: NULL  = never generated (regex bullets)
+--                   'pending' = currently in an in-flight batch
+--                   'ready'   = AI resume successfully generated
+--                   'failed'  = sonnet failed twice (batch + retry)
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ai_resume_generated_at TIMESTAMP;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ai_resume_status       VARCHAR(20);
+-- Captured on every Sonnet failure (batch path + retry path) so the user
+-- can inspect what the model produced and either Edit-as-text it into a
+-- ready resume or hit Retry. Cleared on success.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ai_resume_last_raw     TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ai_resume_last_errors  JSONB;
+-- Sonnet's self-explanation: job_focus, per_company notes, and the
+-- list of pool bullets it dropped (with reasons). Stored as JSONB so
+-- we can render structured sections in the resume preview modal.
+-- Cleared when the user manually edits the resume text (since the
+-- explanation no longer matches what's on the resume).
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ai_resume_reasoning    JSONB;
+
+-- Track every AI resume batch submission and its state machine.
+-- Mirrors the import_batches pattern so the polling thread and
+-- restart-recovery code can follow the same shape.
+CREATE TABLE IF NOT EXISTS ai_resume_batches (
+  id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  anthropic_batch_id      VARCHAR(128),
+  status                  VARCHAR(20)  NOT NULL,   -- 'queued'|'running'|'completed'|'failed'|'canceled'
+  batch_processing_status VARCHAR(32),
+  job_ids                 JSONB        NOT NULL,   -- array of job IDs in this batch
+  pending_jobs            JSONB,                   -- snapshot of job dicts for restart recovery
+  request_counts          JSONB,                   -- {"processing":n,"succeeded":n,...}
+  total                   INTEGER      NOT NULL DEFAULT 0,
+  succeeded               INTEGER      NOT NULL DEFAULT 0,
+  failed                  INTEGER      NOT NULL DEFAULT 0,
+  estimated_cost          NUMERIC(10,4) NOT NULL DEFAULT 0,
+  message                 TEXT,
+  last_error              TEXT,
+  stopped                 BOOLEAN      NOT NULL DEFAULT FALSE,
+  created_at              TIMESTAMP    NOT NULL DEFAULT NOW(),
+  updated_at              TIMESTAMP    NOT NULL DEFAULT NOW(),
+  started_at              TIMESTAMP,
+  finished_at             TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_resume_batches_status     ON ai_resume_batches(status);
+CREATE INDEX IF NOT EXISTS idx_ai_resume_batches_created_at ON ai_resume_batches(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_resume_batches_anthropic  ON ai_resume_batches(anthropic_batch_id);
