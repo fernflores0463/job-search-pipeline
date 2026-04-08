@@ -3858,14 +3858,14 @@ function App() {
             />
             <button
               onClick={startAICsvImport}
-              disabled={!aiCsvFile || aiCsvStatus?.running}
+              disabled={!aiCsvFile}
               className={"px-6 py-2 rounded text-base font-bold border-2 shadow-md transition-all " + (
-                !aiCsvFile || aiCsvStatus?.running
+                !aiCsvFile
                   ? "bg-pink-200 text-pink-700 border-pink-400 cursor-not-allowed"
                   : "bg-pink-600 text-white border-pink-700 hover:bg-pink-700 hover:shadow-lg ring-2 ring-pink-300"
               )}
             >
-              {aiCsvStatus?.running ? '\u23F3 Scoring with AI...' : '\u25B6 Score with AI'}
+              &#9654; Score with AI
             </button>
             {aiCsvStatus?.running && (
               <button
@@ -3887,7 +3887,6 @@ function App() {
                 type="checkbox"
                 checked={aiCsvUseBatch}
                 onChange={() => setAiCsvUseBatch(!aiCsvUseBatch)}
-                disabled={aiCsvStatus?.running}
               />
               <span className="font-medium">Use Batch API (50% off, async)</span>
             </label>
