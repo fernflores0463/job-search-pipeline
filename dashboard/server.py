@@ -276,7 +276,6 @@ def _flush_import_progress(batch_uuid):
     )
 
 
-
 def _import_row_to_dict(row, desc):
     """Convert a DB cursor row to a serialisable dict.
 
@@ -1083,10 +1082,10 @@ AI_RESUME_COST_PER_JOB_BATCH = 0.011
 # Per-company rendered-line budgets. Mastercard is a hard equality.
 # Total must land in [AI_RESUME_TOTAL_LINES_MIN, AI_RESUME_TOTAL_LINES_MAX].
 AI_RESUME_LINE_BUDGET = {
-    "Compass":    (9, 10),
+    "Compass": (9, 10),
     "Mastercard": (5, 5),   # fixed
-    "JP Morgan":  (9, 10),
-    "Leidos":     (6, 7),
+    "JP Morgan": (9, 10),
+    "Leidos": (6, 7),
 }
 AI_RESUME_TOTAL_LINES_MIN = 27
 AI_RESUME_TOTAL_LINES_MAX = 31
@@ -1613,8 +1612,8 @@ def _build_ai_resume_system_prompt():
         "outcomes only where the source bullets provide them.",
         "",
         "6. OUTPUT STRUCTURE: Your bullets object must contain exactly "
-        "these four keys in this order: " +
-        ", ".join(f'"{c}"' for c in _ai_resume_company_order()) + ".",
+        "these four keys in this order: "
+        + ", ".join(f'"{c}"' for c in _ai_resume_company_order()) + ".",
         "",
         "MANDATORY SELF-CHECK before responding:",
         "",
@@ -3394,7 +3393,7 @@ def _run_import_csv_ai_batch(batch_uuid, csv_bytes, location):
                         f"({finished}/{len(new_jobs)} processed)"
                     )
             _flush_import_progress(batch_uuid)
-    
+
             if batch.processing_status == "ended":
                 break
 
@@ -3555,9 +3554,11 @@ def _run_import_csv_ai_batch_resume(batch_uuid, anthropic_batch_id):
     new_jobs = pending_jobs_data if isinstance(pending_jobs_data, list) else []
     job_by_id = {j["id"]: j for j in new_jobs}
 
-    _mem_update(batch_uuid, {"running": True, "status": "running",
-                              "batch_id": anthropic_batch_id,
-                              "message": f"Resumed — polling Anthropic batch {anthropic_batch_id[:8]}\u2026"})
+    _mem_update(batch_uuid, {
+        "running": True, "status": "running",
+        "batch_id": anthropic_batch_id,
+        "message": f"Resumed — polling Anthropic batch {anthropic_batch_id[:8]}\u2026",
+    })
     _flush_import_progress(batch_uuid)
 
     # First check if the batch already ended while the server was down
@@ -3621,9 +3622,8 @@ def _run_import_csv_ai_batch_resume(batch_uuid, anthropic_batch_id):
         _flush_import_progress(batch_uuid)
 
     # Batch ended — retrieve results and insert
-    _mem_update(batch_uuid, {"message": f"(Resumed) Batch ended. Retrieving results\u2026"})
+    _mem_update(batch_uuid, {"message": "(Resumed) Batch ended. Retrieving results\u2026"})
 
-    _TIER_RANK = {"Weak Match": 0, "Match": 1, "Strong Match": 2}
     scored_jobs = []
     for custom_id, result in _retrieve_anthropic_batch_results(anthropic_batch_id):
         job = job_by_id.get(custom_id)
@@ -4899,7 +4899,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             try:
                 import requests as req_lib
                 from bs4 import BeautifulSoup
-                from datetime import date as _date
                 sys.path.insert(0, PARENT_DIR)
                 from process_new_postings import (
                     is_excluded_company,
@@ -5093,7 +5092,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 return
 
             try:
-                from datetime import date as _date
                 sys.path.insert(0, PARENT_DIR)
                 from process_new_postings import (
                     calc_tech_score, calc_level_bonus,
@@ -5214,8 +5212,9 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 ev = _ai_import_stop_events.get(target_id)
                 if ev:
                     ev.set()
-                _mem_update(target_id, {"message":
-                    "Stop requested \u2014 finishing remaining jobs with regex fallback\u2026"})
+                _mem_update(target_id, {
+                    "message": "Stop requested \u2014 finishing remaining jobs with regex fallback\u2026",
+                })
                 _json_response(self, {"ok": True})
             else:
                 _json_response(self, {"ok": True, "message": "Not running"})
@@ -5711,9 +5710,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 anthropic_batch_id
                             )
                         except Exception as ce:
-                            logger.warning(
-                                "Anthropic batch cancel failed: %s", ce
-                            )
+                            print(f"Anthropic batch cancel failed: {ce}")
                     # Signal the worker to stop
                     with _ai_imports_lock:
                         ev = _ai_import_stop_events.get(batch_uuid)
@@ -5799,9 +5796,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                 anthropic_batch_id
                             )
                         except Exception as ce:
-                            logger.warning(
-                                "Anthropic batch cancel on delete failed: %s", ce
-                            )
+                            print(f"Anthropic batch cancel on delete failed: {ce}")
                     with _ai_imports_lock:
                         ev = _ai_import_stop_events.get(batch_uuid)
                     if ev:
