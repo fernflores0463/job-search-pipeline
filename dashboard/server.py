@@ -4144,7 +4144,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                                j.job_link, j.apply_link, j.ai_reasoning, j.regex_score,
                                j.ai_resume_generated_at, j.ai_resume_status,
                                j.ai_resume_last_raw, j.ai_resume_last_errors,
-                               j.ai_resume_reasoning,
+                               j.ai_resume_reasoning, j.created_at,
                                js.status, js.notes, js.applicants,
                                js.live_status, js.live_status_checked, js.timestamps,
                                js.pdf_path
