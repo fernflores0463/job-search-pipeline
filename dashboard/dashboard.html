@@ -3197,6 +3197,12 @@ function App() {
   const [sortBy, setSortBy] = useState("score");
   const [sortDir, setSortDir] = useState("desc");
   const [page, setPage] = useState(1);
+  const [showStale, setShowStale] = useState(() => {
+    try { return localStorage.getItem("job-search/showStale") === "true"; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("job-search/showStale", showStale); } catch {}
+  }, [showStale]);
 
   // Wrappers that update both state and hash
   const setBatchDetailDate = useCallback((date) => {
@@ -3792,10 +3798,20 @@ function App() {
     return () => { delete window._getPlans; delete window._addJobToPlan; delete window._syncAppPlans; delete window._openBatchDetail; delete window._openJobDetail; delete window._openPlanDetail; };
   }, [appPlans, saveAppPlans]);
 
+  const STALE_DAYS = 21;
+  const isStale = (job) => {
+    if (!job.created_at) return false;
+    const status = job.status;
+    if (status && status !== 'New') return false;
+    return Date.now() - new Date(job.created_at).getTime() > STALE_DAYS * 24 * 60 * 60 * 1000;
+  };
+
+  const staleCount = useMemo(() => jobs.filter(isStale).length, [jobs]);
   const favCount = useMemo(() => jobs.filter(j => j.favorited).length, [jobs]);
 
   const filtered = useMemo(() => {
     let result = jobs;
+    if (!showStale) result = result.filter(j => !isStale(j));
     if (filters.favoritesOnly)
       result = result.filter(j => j.favorited);
     if (filters.aiScoredOnly)
@@ -3827,10 +3843,10 @@ function App() {
       return sortDir === "desc" ? -v : v;
     });
     return result;
-  }, [jobs, filters, sortBy, sortDir]);
+  }, [jobs, filters, sortBy, sortDir, showStale]);
 
   // Reset to page 1 whenever the filtered set changes
-  useEffect(() => { setPage(1); }, [filters, sortBy, sortDir]);
+  useEffect(() => { setPage(1); }, [filters, sortBy, sortDir, showStale]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const pagedJobs = useMemo(
@@ -4715,6 +4731,15 @@ function App() {
                 return aiCount > 0 ? <span className="text-xs text-gray-400">({aiCount})</span> : null;
               })()}
             </label>
+            <label className="flex items-center gap-2 text-sm cursor-pointer mt-1">
+              <input
+                type="checkbox"
+                checked={showStale}
+                onChange={() => setShowStale(v => !v)}
+              />
+              <span className="font-medium">Show Stale</span>
+              {staleCount > 0 && <span className="text-xs text-gray-400">({staleCount})</span>}
+            </label>
           </div>
 
           <div className="mb-4">
@@ -4746,7 +4771,7 @@ function App() {
           </div>
 
           <button
-            onClick={() => setFilters({tiers: [], statuses: [], search: "", favoritesOnly: false, aiScoredOnly: false})}
+            onClick={() => { setFilters({tiers: [], statuses: [], search: "", favoritesOnly: false, aiScoredOnly: false}); setShowStale(false); }}
             className="text-xs text-blue-600 hover:underline"
           >Clear All Filters</button>
         </div>
