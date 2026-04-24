@@ -3914,7 +3914,7 @@ function App() {
       if (j.company) counts[j.company] = (counts[j.company] || 0) + 1;
     });
     return Object.entries(counts)
-      .sort((a, b) => a[0].toLowerCase().localeCompare(b[0].toLowerCase()))
+      .sort((a, b) => b[1] - a[1] || a[0].toLowerCase().localeCompare(b[0].toLowerCase()))
       .map(([name, count]) => ({ name, count }));
   }, [jobsForFacets]);
 
