@@ -3192,9 +3192,9 @@ function App() {
   const [view, setView, batchDetailDate, setHashBatchDate, selectedId, setHashJobId, jobDetailId, setJobDetailId, planDetailId, setPlanDetailId, statsExpandedBatch, setStatsExpandedBatch] = useHashRoute();
   const [loaded, setLoaded] = useState(!IS_SERVED);
   const [filters, setFilters] = useState({
-    tiers: [], statuses: [], search: "", favoritesOnly: false, aiScoredOnly: false
+    tiers: [], statuses: [], companies: [], search: "", favoritesOnly: false, aiScoredOnly: false
   });
-  const [sortBy, setSortBy] = useState("score");
+  const [sortBy, setSortBy] = useState("posted_date");
   const [sortDir, setSortDir] = useState("desc");
   const [page, setPage] = useState(1);
   const [showStale, setShowStale] = useState(() => {
@@ -3809,27 +3809,34 @@ function App() {
   const staleCount = useMemo(() => jobs.filter(isStale).length, [jobs]);
   const favCount = useMemo(() => jobs.filter(j => j.favorited).length, [jobs]);
 
-  const filtered = useMemo(() => {
-    let result = jobs;
-    if (!showStale) result = result.filter(j => !isStale(j));
-    if (filters.favoritesOnly)
-      result = result.filter(j => j.favorited);
-    if (filters.aiScoredOnly)
-      result = result.filter(j => j.ai_reasoning);
-    if (filters.tiers.length > 0)
-      result = result.filter(j => filters.tiers.includes(j.tier));
-    if (filters.statuses.length > 0)
-      result = result.filter(j => filters.statuses.includes(j.status));
-    if (filters.search) {
-      const s = filters.search.toLowerCase();
+  const applyFilters = (jobsList, f, stale) => {
+    let result = jobsList;
+    if (!stale) result = result.filter(j => !isStale(j));
+    if (f.favoritesOnly) result = result.filter(j => j.favorited);
+    if (f.aiScoredOnly) result = result.filter(j => j.ai_reasoning);
+    if (f.tiers.length > 0) result = result.filter(j => f.tiers.includes(j.tier));
+    if (f.statuses.length > 0) result = result.filter(j => f.statuses.includes(j.status));
+    if (f.search) {
+      const s = f.search.toLowerCase();
       result = result.filter(j =>
-        j.company.toLowerCase().includes(s) || j.title.toLowerCase().includes(s) || j.id.toLowerCase().includes(s)
+        (j.company || "").toLowerCase().includes(s) || (j.title || "").toLowerCase().includes(s) || j.id.toLowerCase().includes(s)
       );
     }
+    if (f.companies && f.companies.length > 0) result = result.filter(j => f.companies.includes(j.company));
+    return result;
+  };
+
+  const jobsForFacets = useMemo(
+    () => applyFilters(jobs, { ...filters, companies: [] }, showStale),
+    [jobs, filters, showStale]
+  );
+
+  const filtered = useMemo(() => {
+    let result = applyFilters(jobs, filters, showStale);
     result = [...result].sort((a, b) => {
       let v = 0;
-      if (sortBy === "score") v = a.score - b.score;
-      else if (sortBy === "company") v = a.company.localeCompare(b.company);
+      if (sortBy === "score") v = (a.score || 0) - (b.score || 0);
+      else if (sortBy === "company") v = (a.company || "").localeCompare(b.company || "");
       else if (sortBy === "salary") v = (a.salary || "").localeCompare(b.salary || "");
       else if (sortBy === "status") v = STATUSES.indexOf(a.status) - STATUSES.indexOf(b.status);
       else if (sortBy === "tier") {
@@ -3839,6 +3846,15 @@ function App() {
       else if (sortBy === "applicants") {
         const parseNum = s => { const m = (s || "").match(/(\d+)/); return m ? parseInt(m[1]) : 0; };
         v = parseNum(a.applicants) - parseNum(b.applicants);
+      }
+      else if (sortBy === "posted_date") {
+        const aNull = a.posted_date == null || a.posted_date === "";
+        const bNull = b.posted_date == null || b.posted_date === "";
+        if (aNull && bNull) return (b.created_at || "").localeCompare(a.created_at || "");
+        if (aNull) return 1;
+        if (bNull) return -1;
+        v = a.posted_date.localeCompare(b.posted_date);
+        if (v === 0) return (b.created_at || "").localeCompare(a.created_at || "");
       }
       return sortDir === "desc" ? -v : v;
     });
@@ -3889,6 +3905,18 @@ function App() {
       return { ...prev, [key]: next };
     });
   };
+
+  const [companySearch, setCompanySearch] = useState("");
+
+  const availableCompanies = useMemo(() => {
+    const counts = {};
+    jobsForFacets.forEach(j => {
+      if (j.company) counts[j.company] = (counts[j.company] || 0) + 1;
+    });
+    return Object.entries(counts)
+      .sort((a, b) => a[0].toLowerCase().localeCompare(b[0].toLowerCase()))
+      .map(([name, count]) => ({ name, count }));
+  }, [jobsForFacets]);
 
   const handleSort = (col) => {
     if (sortBy === col) setSortDir(d => d === "asc" ? "desc" : "asc");
@@ -4770,8 +4798,48 @@ function App() {
             ))}
           </div>
 
+          <div className="mb-4">
+            <h3 className="text-xs font-semibold text-gray-500 uppercase mb-2">Company</h3>
+            <input
+              type="text"
+              placeholder="Filter companies…"
+              value={companySearch}
+              onChange={e => setCompanySearch(e.target.value)}
+              className="w-full px-2 py-1 border rounded text-xs mb-2"
+            />
+            {(() => {
+              const searchLC = companySearch.toLowerCase();
+              const selectedItems = [
+                ...filters.companies
+                  .filter(c => !availableCompanies.some(a => a.name === c) && c.toLowerCase().includes(searchLC))
+                  .map(c => ({ name: c, count: 0 })),
+                ...availableCompanies.filter(({ name }) => filters.companies.includes(name) && name.toLowerCase().includes(searchLC)),
+              ];
+              const unselected = availableCompanies.filter(({ name }) => !filters.companies.includes(name) && name.toLowerCase().includes(searchLC));
+              const rows = [...selectedItems, ...unselected];
+              return (
+                <div className="border rounded overflow-y-auto" style={{maxHeight: '256px'}}>
+                  {rows.length === 0 && (
+                    <p className="text-xs text-gray-400 px-2 py-1">No companies</p>
+                  )}
+                  {rows.map(({ name, count }) => (
+                    <label key={name} className="flex items-center gap-2 text-xs px-2 py-1 cursor-pointer hover:bg-gray-50">
+                      <input
+                        type="checkbox"
+                        checked={filters.companies.includes(name)}
+                        onChange={() => toggleFilter("companies", name)}
+                      />
+                      <span className="flex-1 truncate">{name}</span>
+                      <span className="text-gray-400">({count})</span>
+                    </label>
+                  ))}
+                </div>
+              );
+            })()}
+          </div>
+
           <button
-            onClick={() => { setFilters({tiers: [], statuses: [], search: "", favoritesOnly: false, aiScoredOnly: false}); setShowStale(false); }}
+            onClick={() => { setFilters({tiers: [], statuses: [], companies: [], search: "", favoritesOnly: false, aiScoredOnly: false}); setShowStale(false); setCompanySearch(""); }}
             className="text-xs text-blue-600 hover:underline"
           >Clear All Filters</button>
         </div>
