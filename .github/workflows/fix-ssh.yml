@@ -28,18 +28,26 @@ jobs:
           chmod 600 /tmp/fix_key.pem
           SSH_OPTS="-i /tmp/fix_key.pem -o StrictHostKeyChecking=no -o ConnectTimeout=15"
           ssh $SSH_OPTS ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "
-            echo '=== iptables INPUT chain ==='
-            sudo iptables -L INPUT -n --line-numbers
+            echo '=== sshd listening sockets ==='
+            sudo ss -tnlp | grep sshd || echo '(nothing)'
+
             echo ''
-            echo '=== firewalld status ==='
-            sudo systemctl is-active firewalld 2>/dev/null || echo 'not running'
+            echo '=== sshd_config Port / ListenAddress / AllowUsers ==='
+            sudo grep -E '^Port|^ListenAddress|^AllowUsers|^AllowGroups|^DenyUsers|^PermitRootLogin' /etc/ssh/sshd_config
+
             echo ''
-            echo '=== sshd status ==='
-            sudo systemctl is-active sshd
+            echo '=== TCP wrappers ==='
+            echo '-- /etc/hosts.allow --'
+            cat /etc/hosts.allow 2>/dev/null || echo '(not present)'
+            echo '-- /etc/hosts.deny --'
+            cat /etc/hosts.deny 2>/dev/null || echo '(not present)'
+
             echo ''
-            echo '=== Allowing ${{ inputs.allowed_ip }} on port 22 ==='
-            sudo iptables -I INPUT 1 -p tcp -s ${{ inputs.allowed_ip }} --dport 22 -j ACCEPT
-            echo 'Done. New INPUT chain:'
-            sudo iptables -L INPUT -n --line-numbers
+            echo '=== network interfaces ==='
+            ip addr show | grep -E 'inet |^[0-9]'
+
+            echo ''
+            echo '=== last 20 sshd journal lines ==='
+            sudo journalctl -u sshd -n 20 --no-pager 2>/dev/null || echo '(no journal)'
           "
           rm -f /tmp/fix_key.pem
