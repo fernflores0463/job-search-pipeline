@@ -27,6 +27,15 @@ PORT = 8080
 DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(DIR)
 
+def _load_version():
+    try:
+        with open(os.path.join(PARENT_DIR, "VERSION")) as f:
+            return f.read().strip()
+    except Exception:
+        return "unknown"
+
+_APP_VERSION = _load_version()
+
 # Allow importing db module from repo root
 sys.path.insert(0, PARENT_DIR)
 from db.db import Db, init_pool  # noqa: E402
@@ -106,6 +115,7 @@ _LOGIN_HTML = """<!DOCTYPE html>
     .error {{ background: #fef2f2; color: #dc2626; border: 1px solid #fecaca;
              border-radius: 8px; padding: 0.65rem 0.875rem;
              font-size: 0.8rem; margin-bottom: 1rem; }}
+    .version {{ margin-top: 1.5rem; text-align: center; font-size: 0.75rem; color: #94a3b8; }}
   </style>
 </head>
 <body>
@@ -118,6 +128,7 @@ _LOGIN_HTML = """<!DOCTYPE html>
       <input id="pw" type="password" name="password" autofocus autocomplete="current-password">
       <button type="submit">Sign In</button>
     </form>
+    <div class="version">v{version}</div>
   </div>
 </body>
 </html>"""
@@ -210,7 +221,7 @@ def _new_import_row(mode, location, csv_filename=None):
 _IMPORT_BATCH_COLS = {
     "status", "anthropic_batch_id", "batch_processing_status",
     "total", "progress", "added", "scored_ai", "scored_fallback",
-    "regex_agree", "ai_promoted", "ai_demoted", "estimated_cost",
+    "regex_agree", "ai_promoted", "ai_demoted", "estimated_cost", "actual_cost",
     "request_counts", "pending_jobs", "message", "last_error",
     "stopped", "finished_at", "started_at",
 }
@@ -1079,6 +1090,12 @@ AI_RESUME_MODEL = "claude-sonnet-4-20250514"
 AI_RESUME_COST_PER_JOB_LIVE = 0.022
 AI_RESUME_COST_PER_JOB_BATCH = 0.011
 
+# Actual per-token pricing for batch API (50% discount applied).
+# Used to compute actual_cost from real token counts after a batch ends.
+# Haiku 4.5 batch: $0.40/MTok input, $2.00/MTok output
+HAIKU_BATCH_INPUT_COST_PER_MTOK  = 0.40
+HAIKU_BATCH_OUTPUT_COST_PER_MTOK = 2.00
+
 # Per-company rendered-line budgets. Mastercard is a hard equality.
 # Total must land in [AI_RESUME_TOTAL_LINES_MIN, AI_RESUME_TOTAL_LINES_MAX].
 AI_RESUME_LINE_BUDGET = {
@@ -1356,11 +1373,14 @@ def _retrieve_anthropic_batch_results(batch_id):
                     continue
                 data = json.loads(m.group(0))
                 ai_fit_score = max(1, min(10, int(data.get("fit_score", 5))))
+                usage = getattr(msg, "usage", None)
                 yield custom_id, {
                     "used_ai": True,
                     "ai_fit_score": ai_fit_score,
                     "legacy_score": _ai_score_to_legacy_scale(ai_fit_score),
                     "reasoning": str(data.get("reasoning", "")).strip(),
+                    "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+                    "output_tokens": getattr(usage, "output_tokens", 0) or 0,
                 }
             except Exception as e:
                 yield custom_id, {
@@ -3401,6 +3421,8 @@ def _run_import_csv_ai_batch(batch_uuid, csv_bytes, location):
 
         _TIER_RANK = {"Weak Match": 0, "Match": 1, "Strong Match": 2}
         scored_jobs = []
+        total_input_tokens = 0
+        total_output_tokens = 0
         for custom_id, result in _retrieve_anthropic_batch_results(batch.id):
             job = job_by_id.get(custom_id)
             if not job:
@@ -3415,6 +3437,8 @@ def _run_import_csv_ai_batch(batch_uuid, csv_bytes, location):
                 job["score"] = result["legacy_score"]
                 job["tier"] = assign_tier(result["legacy_score"])
                 job["ai_reasoning"] = result["reasoning"]
+                total_input_tokens += result.get("input_tokens", 0)
+                total_output_tokens += result.get("output_tokens", 0)
                 ai_rank = _TIER_RANK.get(job["tier"], 1)
                 rx_rank = _TIER_RANK.get(regex_tier, 1)
                 with _ai_imports_lock:
@@ -3438,6 +3462,11 @@ def _run_import_csv_ai_batch(batch_uuid, csv_bytes, location):
                     if err:
                         s["last_error"] = err
             scored_jobs.append(job)
+
+        actual_cost = (
+            total_input_tokens * HAIKU_BATCH_INPUT_COST_PER_MTOK
+            + total_output_tokens * HAIKU_BATCH_OUTPUT_COST_PER_MTOK
+        ) / 1_000_000
 
         _mem_update(batch_uuid, {"message": f"Inserting {len(scored_jobs)} jobs into DB\u2026"})
 
@@ -3502,7 +3531,8 @@ def _run_import_csv_ai_batch(batch_uuid, csv_bytes, location):
                 ],
             })
         _flush_import_progress(batch_uuid)
-        _update_import_row(batch_uuid, finished_at="NOW()", added=len(scored_jobs), pending_jobs=None)
+        _update_import_row(batch_uuid, finished_at="NOW()", added=len(scored_jobs),
+                           pending_jobs=None, actual_cost=actual_cost)
 
     except Exception as e:
         _mem_update(batch_uuid, {"running": False, "status": "failed",
@@ -3625,6 +3655,8 @@ def _run_import_csv_ai_batch_resume(batch_uuid, anthropic_batch_id):
     _mem_update(batch_uuid, {"message": "(Resumed) Batch ended. Retrieving results\u2026"})
 
     scored_jobs = []
+    total_input_tokens = 0
+    total_output_tokens = 0
     for custom_id, result in _retrieve_anthropic_batch_results(anthropic_batch_id):
         job = job_by_id.get(custom_id)
         if not job:
@@ -3639,6 +3671,8 @@ def _run_import_csv_ai_batch_resume(batch_uuid, anthropic_batch_id):
             job["score"] = result["legacy_score"]
             job["tier"] = assign_tier(result["legacy_score"])
             job["ai_reasoning"] = result["reasoning"]
+            total_input_tokens += result.get("input_tokens", 0)
+            total_output_tokens += result.get("output_tokens", 0)
             with _ai_imports_lock:
                 s = _ai_imports.get(batch_uuid, {})
                 s["scored_ai"] = s.get("scored_ai", 0) + 1
@@ -3653,6 +3687,11 @@ def _run_import_csv_ai_batch_resume(batch_uuid, anthropic_batch_id):
                 if result.get("error"):
                     s["last_error"] = str(result["error"])[:240]
         scored_jobs.append(job)
+
+    actual_cost = (
+        total_input_tokens * HAIKU_BATCH_INPUT_COST_PER_MTOK
+        + total_output_tokens * HAIKU_BATCH_OUTPUT_COST_PER_MTOK
+    ) / 1_000_000
 
     try:
         with Db() as conn:
@@ -3708,7 +3747,8 @@ def _run_import_csv_ai_batch_resume(batch_uuid, anthropic_batch_id):
             "message": f"(Resumed) Done! Inserted {len(scored_jobs)} jobs.",
         })
     _flush_import_progress(batch_uuid)
-    _update_import_row(batch_uuid, finished_at="NOW()", added=len(scored_jobs), pending_jobs=None)
+    _update_import_row(batch_uuid, finished_at="NOW()", added=len(scored_jobs),
+                       pending_jobs=None, actual_cost=actual_cost)
 
 
 def _resume_in_flight_imports():
@@ -4054,7 +4094,7 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 '<div class="error">Incorrect password. Please try again.</div>'
                 if error else ""
             )
-            html = _LOGIN_HTML.replace("{error_block}", error_block)
+            html = _LOGIN_HTML.replace("{error_block}", error_block).replace("{version}", _APP_VERSION)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()

@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS import_batches (
   ai_promoted              INTEGER NOT NULL DEFAULT 0,
   ai_demoted               INTEGER NOT NULL DEFAULT 0,
   estimated_cost           NUMERIC(10,4) NOT NULL DEFAULT 0,
+  actual_cost              NUMERIC(10,4),
   request_counts           JSONB,                   -- {"processing":n,"succeeded":n,...}
   pending_jobs             JSONB,                   -- filtered new_jobs list for restart recovery
   message                  TEXT,
