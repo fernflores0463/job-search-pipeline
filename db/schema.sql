@@ -163,3 +163,8 @@ CREATE TABLE IF NOT EXISTS ai_resume_batches (
 CREATE INDEX IF NOT EXISTS idx_ai_resume_batches_status     ON ai_resume_batches(status);
 CREATE INDEX IF NOT EXISTS idx_ai_resume_batches_created_at ON ai_resume_batches(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ai_resume_batches_anthropic  ON ai_resume_batches(anthropic_batch_id);
+
+-- ─────────────────────────────────────────────────────────
+-- Idempotent column additions (safe to re-run on any env)
+-- ─────────────────────────────────────────────────────────
+ALTER TABLE import_batches ADD COLUMN IF NOT EXISTS actual_cost NUMERIC(10,4);
