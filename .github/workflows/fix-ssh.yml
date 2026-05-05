@@ -22,32 +22,19 @@ jobs:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/job-search-github-actions
           aws-region: us-west-2
 
-      - name: Run iptables diagnostic and fix on EC2
+      - name: Add port 2222 to sshd and restart
         run: |
           echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/fix_key.pem
           chmod 600 /tmp/fix_key.pem
           SSH_OPTS="-i /tmp/fix_key.pem -o StrictHostKeyChecking=no -o ConnectTimeout=15"
           ssh $SSH_OPTS ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "
-            echo '=== sshd listening sockets ==='
-            sudo ss -tnlp | grep sshd || echo '(nothing)'
-
+            echo '=== Adding Port 2222 to sshd_config ==='
+            grep -q '^Port 2222' /etc/ssh/sshd_config || echo 'Port 2222' | sudo tee -a /etc/ssh/sshd_config
             echo ''
-            echo '=== sshd_config Port / ListenAddress / AllowUsers ==='
-            sudo grep -E '^Port|^ListenAddress|^AllowUsers|^AllowGroups|^DenyUsers|^PermitRootLogin' /etc/ssh/sshd_config
-
+            echo '=== Restarting sshd ==='
+            sudo systemctl restart sshd
             echo ''
-            echo '=== TCP wrappers ==='
-            echo '-- /etc/hosts.allow --'
-            cat /etc/hosts.allow 2>/dev/null || echo '(not present)'
-            echo '-- /etc/hosts.deny --'
-            cat /etc/hosts.deny 2>/dev/null || echo '(not present)'
-
-            echo ''
-            echo '=== network interfaces ==='
-            ip addr show | grep -E 'inet |^[0-9]'
-
-            echo ''
-            echo '=== last 20 sshd journal lines ==='
-            sudo journalctl -u sshd -n 20 --no-pager 2>/dev/null || echo '(no journal)'
+            echo '=== sshd listening sockets after restart ==='
+            sudo ss -tnlp | grep sshd
           "
           rm -f /tmp/fix_key.pem
