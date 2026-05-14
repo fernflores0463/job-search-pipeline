@@ -46,14 +46,9 @@ from db.db import Db, init_pool  # noqa: E402
 
 
 def _load_config():
-    config_path = os.path.join(PARENT_DIR, "config.json")
-    if not os.path.exists(config_path):
-        print("Error: config.json not found in project root.")
-        print("Please copy config.example.json to config.json and fill in your details:")
-        print("  cp config.example.json config.json")
-        sys.exit(1)
-    with open(config_path) as f:
-        return json.load(f)
+    """Load config from local file or AWS SSM Parameter Store (production fallback)."""
+    from db.config_loader import load_config as _load
+    return _load()
 
 
 _config = _load_config()
@@ -4846,9 +4841,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             try:
-                config_path = os.path.join(PARENT_DIR, "config.json")
-                with open(config_path) as f:
-                    cfg = json.load(f)
+                from db.config_loader import load_config as _load_cfg, save_config as _save_cfg
+                cfg = _load_cfg()
 
                 # Update candidate info if provided
                 if "candidate" in body:
@@ -4865,9 +4859,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 if "skills_template" in body:
                     cfg["skills_template"] = body["skills_template"]
 
-                with open(config_path, "w") as f:
-                    json.dump(cfg, f, indent=2)
-                    f.write("\n")
+                # Persist locally and push to SSM
+                _save_cfg(cfg)
 
                 # Reload in-memory config
                 global _config, _BULLET_POOL, _CANDIDATE_SKILLS

@@ -35,15 +35,9 @@ METADATA_FILE = os.path.join(RESUMES_DIR, "all_jobs_metadata.json")
 
 
 def load_config():
-    """Load config.json from the project root. Exit with helpful message if missing."""
-    config_path = os.path.join(BASE_DIR, "config.json")
-    if not os.path.exists(config_path):
-        print("Error: config.json not found.")
-        print("Please copy config.example.json to config.json and fill in your details:")
-        print("  cp config.example.json config.json")
-        sys.exit(1)
-    with open(config_path) as f:
-        return json.load(f)
+    """Load config from local file or AWS SSM Parameter Store (production fallback)."""
+    from db.config_loader import load_config as _load
+    return _load()
 
 
 # Load config and populate all settings from it
