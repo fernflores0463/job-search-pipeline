@@ -27,6 +27,7 @@ PORT = 8080
 DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(DIR)
 
+
 def _load_version():
     try:
         with open(os.path.join(PARENT_DIR, "VERSION")) as f:
@@ -34,7 +35,9 @@ def _load_version():
     except Exception:
         return "unknown"
 
+
 _APP_VERSION = _load_version()
+
 
 # Allow importing db module from repo root
 sys.path.insert(0, PARENT_DIR)
@@ -1088,7 +1091,7 @@ AI_RESUME_COST_PER_JOB_BATCH = 0.011
 # Actual per-token pricing for batch API (50% discount applied).
 # Used to compute actual_cost from real token counts after a batch ends.
 # Haiku 4.5 batch: $0.40/MTok input, $2.00/MTok output
-HAIKU_BATCH_INPUT_COST_PER_MTOK  = 0.40
+HAIKU_BATCH_INPUT_COST_PER_MTOK = 0.40
 HAIKU_BATCH_OUTPUT_COST_PER_MTOK = 2.00
 
 # Per-company rendered-line budgets. Mastercard is a hard equality.

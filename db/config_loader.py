@@ -127,4 +127,4 @@ def upload_current_config() -> None:
     s3_path = f"s3://{_S3_BUCKET}/{_S3_KEY}"
     print(f"[config] Uploading config.json to {s3_path} ({patterns} exclusion patterns)...")
     _push_to_s3(cfg)
-    print(f"[config] Done.")
+    print("[config] Done.")
