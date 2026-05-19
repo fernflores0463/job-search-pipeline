@@ -2927,6 +2927,7 @@ def _run_import_csv(csv_bytes, location):
             existing = {row[0] for row in cur.fetchall()}
 
         new_jobs = [j for j in processed if j["job_link"] not in existing]
+        new_jobs.sort(key=lambda j: j["id"])  # consistent lock order prevents deadlock
 
         # Insert new jobs + initial job_state rows
         with Db() as conn:
@@ -3154,6 +3155,7 @@ def _run_import_csv_ai(batch_uuid, csv_bytes, location):
         with ThreadPoolExecutor(max_workers=2) as executor:
             scored_jobs = list(executor.map(score_one, new_jobs))
 
+        scored_jobs.sort(key=lambda j: j["id"])  # consistent lock order prevents deadlock
         _mem_update(batch_uuid, {"message": f"Inserting {len(scored_jobs)} jobs into DB\u2026"})
 
         with Db() as conn:
@@ -3489,6 +3491,7 @@ def _run_import_csv_ai_batch(batch_uuid, csv_bytes, location):
             + total_output_tokens * HAIKU_BATCH_OUTPUT_COST_PER_MTOK
         ) / 1_000_000
 
+        scored_jobs.sort(key=lambda j: j["id"])  # consistent lock order prevents deadlock
         _mem_update(batch_uuid, {"message": f"Inserting {len(scored_jobs)} jobs into DB\u2026"})
 
         with Db() as conn:
@@ -3714,6 +3717,7 @@ def _run_import_csv_ai_batch_resume(batch_uuid, anthropic_batch_id):
         + total_output_tokens * HAIKU_BATCH_OUTPUT_COST_PER_MTOK
     ) / 1_000_000
 
+    scored_jobs.sort(key=lambda j: j["id"])  # consistent lock order prevents deadlock
     try:
         with Db() as conn:
             cur = conn.cursor()
