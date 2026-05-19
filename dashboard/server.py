@@ -222,6 +222,7 @@ _IMPORT_BATCH_COLS = {
     "regex_agree", "ai_promoted", "ai_demoted", "estimated_cost", "actual_cost",
     "request_counts", "pending_jobs", "message", "last_error",
     "stopped", "finished_at", "started_at",
+    "import_date", "location",
 }
 
 
@@ -3004,9 +3005,19 @@ def _run_import_csv_ai(batch_uuid, csv_bytes, location):
         if not location and rows:
             location = (rows[0].get("Search Location") or "").strip() or None
 
-        # Fetch import_date label from the pre-inserted row
+        # Fetch import_date label from the pre-inserted row; backfill location
+        # if it was discovered from the CSV's Search Location column.
         with _ai_imports_lock:
             batch_label = _ai_imports[batch_uuid]["import_date"]
+
+        if location and " — " not in batch_label:
+            short_id = batch_label.rsplit("#", 1)[-1] if "#" in batch_label else ""
+            new_label = _build_batch_label("live", location, short_id)
+            with _ai_imports_lock:
+                _ai_imports[batch_uuid]["import_date"] = new_label
+                _ai_imports[batch_uuid]["location"] = location
+            _update_import_row(batch_uuid, import_date=new_label, location=location)
+            batch_label = new_label
 
         # Filter (same logic as regex import)
         seen, filtered = set(), []
@@ -3263,6 +3274,15 @@ def _run_import_csv_ai_batch(batch_uuid, csv_bytes, location):
 
         with _ai_imports_lock:
             batch_label = _ai_imports[batch_uuid]["import_date"]
+
+        if location and " — " not in batch_label:
+            short_id = batch_label.rsplit("#", 1)[-1] if "#" in batch_label else ""
+            new_label = _build_batch_label("batch", location, short_id)
+            with _ai_imports_lock:
+                _ai_imports[batch_uuid]["import_date"] = new_label
+                _ai_imports[batch_uuid]["location"] = location
+            _update_import_row(batch_uuid, import_date=new_label, location=location)
+            batch_label = new_label
 
         seen, filtered = set(), []
         for r in rows:
