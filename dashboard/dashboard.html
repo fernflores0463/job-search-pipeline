@@ -3244,12 +3244,12 @@ function App() {
   const [scrapeStatus, setScrapeStatus] = useState(null);
 
   const [showImport, setShowImport]         = useState(false);
-  const [importFile, setImportFile]         = useState(null);
+  const [importFiles, setImportFiles]       = useState([]);
   const [importLocation, setImportLocation] = useState('');
   const [importStatus, setImportStatus]     = useState(null);
 
   const [showAICsvImport, setShowAICsvImport]   = useState(false);
-  const [aiCsvFile, setAiCsvFile]               = useState(null);
+  const [aiCsvFiles, setAiCsvFiles]             = useState([]);
   const [aiCsvLocation, setAiCsvLocation]       = useState('');
   const [aiCsvStatus, setAiCsvStatus]           = useState(null);
   // Submit via Anthropic Batch API for 50% cost discount (async).
@@ -3457,48 +3457,82 @@ function App() {
       .trim();
   };
 
-  const startImport = useCallback(() => {
-    if (!importFile) return;
-    const qs = importLocation.trim()
-      ? `?location=${encodeURIComponent(importLocation.trim())}` : '';
-    fetch(`/api/import-csv${qs}`, {
-      method: 'POST', body: importFile,
-      headers: { 'Content-Type': 'text/csv' },
-    }).then(r => r.json()).then(() => {
-      setImportStatus({ running: true, message: 'Starting...' });
-      const poll = setInterval(() =>
-        fetch('/api/import-status').then(r => r.json()).then(s => {
-          setImportStatus(s);
-          if (!s.running) clearInterval(poll);
-        }), 1500);
-    });
-  }, [importFile, importLocation]);
+  const startImport = useCallback(async () => {
+    if (!importFiles.length) return;
+    for (let i = 0; i < importFiles.length; i++) {
+      const file = importFiles[i];
+      const loc = importLocation.trim() || inferLocationFromFilename(file.name);
+      const qs = loc ? `?location=${encodeURIComponent(loc)}` : '';
+      setImportStatus({ running: true, message: importFiles.length > 1 ? `File ${i + 1}/${importFiles.length}: Starting…` : 'Starting…' });
+      await fetch(`/api/import-csv${qs}`, {
+        method: 'POST', body: file, headers: { 'Content-Type': 'text/csv' },
+      }).then(r => r.json());
+      await new Promise(resolve => {
+        const poll = setInterval(() =>
+          fetch('/api/import-status').then(r => r.json()).then(s => {
+            setImportStatus({
+              ...s,
+              message: importFiles.length > 1 ? `File ${i + 1}/${importFiles.length}: ${s.message}` : s.message,
+            });
+            if (!s.running) { clearInterval(poll); resolve(); }
+          }), 1500);
+      });
+    }
+  }, [importFiles, importLocation]);
 
-  const startAICsvImport = useCallback(() => {
-    if (!aiCsvFile) return;
-    const params = [];
-    if (aiCsvLocation.trim()) params.push('location=' + encodeURIComponent(aiCsvLocation.trim()));
-    if (aiCsvUseBatch) params.push('mode=batch');
-    // Capture the original CSV filename so the Imports view can
-    // show it in the dedicated CSV column instead of the synthesized
-    // composite label.
-    if (aiCsvFile.name) params.push('filename=' + encodeURIComponent(aiCsvFile.name));
-    const qs = params.length ? '?' + params.join('&') : '';
-    fetch(`/api/import-csv-ai${qs}`, {
-      method: 'POST', body: aiCsvFile,
-      headers: { 'Content-Type': 'text/csv' },
-    }).then(r => r.json()).then(data => {
-      if (data.error) {
-        setAiCsvStatus({ running: false, message: 'Error: ' + data.error });
-        return;
-      }
-      // Store the batch UUID so the sync useEffect can drive panel updates
-      // from the global imports state instead of a dedicated SSE stream.
-      setLastStartedImportId(data.id);
+  const startAICsvImport = useCallback(async () => {
+    if (!aiCsvFiles.length) return;
+
+    if (aiCsvUseBatch) {
+      // Batch mode: fire all files in parallel — backend accepts each immediately
+      const promises = aiCsvFiles.map(file => {
+        const loc = aiCsvLocation.trim() || inferLocationFromFilename(file.name);
+        const params = ['mode=batch'];
+        if (loc) params.push('location=' + encodeURIComponent(loc));
+        if (file.name) params.push('filename=' + encodeURIComponent(file.name));
+        return fetch(`/api/import-csv-ai?${params.join('&')}`, {
+          method: 'POST', body: file, headers: { 'Content-Type': 'text/csv' },
+        }).then(r => r.json());
+      });
+      const results = await Promise.all(promises);
+      const err = results.find(d => d.error);
+      if (err) { setAiCsvStatus({ running: false, message: 'Error: ' + err.error }); return; }
+      setLastStartedImportId(results[results.length - 1]?.id);
       refreshImports();
-      setAiCsvStatus({ running: true, message: aiCsvUseBatch ? 'Submitting batch to Anthropic...' : 'Starting AI scoring...', progress: 0, total: 0, scored_ai: 0, scored_fallback: 0, estimated_cost: 0, mode: aiCsvUseBatch ? 'batch' : 'live' });
-    });
-  }, [aiCsvFile, aiCsvLocation, aiCsvUseBatch, refreshImports]);
+      const msg = aiCsvFiles.length === 1
+        ? 'Submitting batch to Anthropic…'
+        : `${aiCsvFiles.length} batches submitted — check Imports tab for progress.`;
+      setAiCsvStatus({ running: aiCsvFiles.length === 1, message: msg, progress: 0, total: 0, scored_ai: 0, scored_fallback: 0, estimated_cost: 0, mode: 'batch' });
+    } else {
+      // Live mode: single-runner — process files one at a time
+      for (let i = 0; i < aiCsvFiles.length; i++) {
+        const file = aiCsvFiles[i];
+        const loc = aiCsvLocation.trim() || inferLocationFromFilename(file.name);
+        const params = [];
+        if (loc) params.push('location=' + encodeURIComponent(loc));
+        if (file.name) params.push('filename=' + encodeURIComponent(file.name));
+        const qs = params.length ? '?' + params.join('&') : '';
+        const data = await fetch(`/api/import-csv-ai${qs}`, {
+          method: 'POST', body: file, headers: { 'Content-Type': 'text/csv' },
+        }).then(r => r.json());
+        if (data.error) { setAiCsvStatus({ running: false, message: 'Error: ' + data.error }); return; }
+        setLastStartedImportId(data.id);
+        refreshImports();
+        const fileLabel = aiCsvFiles.length > 1 ? `File ${i + 1}/${aiCsvFiles.length}: ` : '';
+        setAiCsvStatus({ running: true, message: `${fileLabel}Starting AI scoring…`, progress: 0, total: 0, scored_ai: 0, scored_fallback: 0, estimated_cost: 0, mode: 'live' });
+        // Wait for this import to finish before starting the next
+        if (i < aiCsvFiles.length - 1) {
+          const importId = data.id;
+          await new Promise(resolve => {
+            const poll = setInterval(() =>
+              fetch(`/api/imports/${importId}`).then(r => r.json()).then(imp => {
+                if (imp.status !== 'running' && imp.status !== 'queued') { clearInterval(poll); resolve(); }
+              }).catch(() => { clearInterval(poll); resolve(); }), 2000);
+          });
+        }
+      }
+    }
+  }, [aiCsvFiles, aiCsvLocation, aiCsvUseBatch, refreshImports]);
 
   const startScrape = useCallback(() => {
     if (!scrapeUrl.trim()) return;
@@ -4315,26 +4349,33 @@ function App() {
           <div className="flex items-center gap-3 flex-wrap">
             <span className="text-sm font-medium text-green-700">Import LinkedIn CSV:</span>
             <input
-              type="file" accept=".csv"
+              type="file" accept=".csv" multiple
               onChange={e => {
-                const file = e.target.files[0] || null;
-                setImportFile(file);
-                if (file) {
-                  const inferred = inferLocationFromFilename(file.name);
+                const files = Array.from(e.target.files);
+                setImportFiles(files);
+                if (files.length === 1) {
+                  const inferred = inferLocationFromFilename(files[0].name);
                   if (inferred) setImportLocation(inferred);
+                } else if (files.length > 1) {
+                  setImportLocation('');
                 }
               }}
               className="text-sm text-gray-700"
             />
+            {importFiles.length > 1 && (
+              <span className="text-xs font-medium text-green-700 bg-green-100 px-2 py-0.5 rounded-full">
+                {importFiles.length} files
+              </span>
+            )}
             <input
-              type="text" placeholder="Location (e.g. Seattle)"
+              type="text" placeholder={importFiles.length > 1 ? "Location override (optional)" : "Location (e.g. Seattle)"}
               value={importLocation}
               onChange={e => setImportLocation(e.target.value)}
               className="w-48 px-3 py-1.5 border border-green-300 rounded text-sm focus:outline-none"
             />
             <button
               onClick={startImport}
-              disabled={!importFile || importStatus?.running}
+              disabled={!importFiles.length || importStatus?.running}
               className="px-4 py-1.5 bg-green-600 text-white rounded text-sm font-medium hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {importStatus?.running ? 'Importing...' : 'Import'}
@@ -4392,28 +4433,35 @@ function App() {
           <div className="flex items-center gap-3 flex-wrap">
             <span className="text-sm font-medium text-pink-700">&#129302; AI Import LinkedIn CSV:</span>
             <input
-              type="file" accept=".csv"
+              type="file" accept=".csv" multiple
               onChange={e => {
-                const file = e.target.files[0] || null;
-                setAiCsvFile(file);
-                if (file) {
-                  const inferred = inferLocationFromFilename(file.name);
+                const files = Array.from(e.target.files);
+                setAiCsvFiles(files);
+                if (files.length === 1) {
+                  const inferred = inferLocationFromFilename(files[0].name);
                   if (inferred) setAiCsvLocation(inferred);
+                } else if (files.length > 1) {
+                  setAiCsvLocation('');
                 }
               }}
               className="text-sm text-gray-700"
             />
+            {aiCsvFiles.length > 1 && (
+              <span className="text-xs font-medium text-pink-700 bg-pink-100 px-2 py-0.5 rounded-full">
+                {aiCsvFiles.length} files
+              </span>
+            )}
             <input
-              type="text" placeholder="Location (e.g. Seattle)"
+              type="text" placeholder={aiCsvFiles.length > 1 ? "Location override (optional)" : "Location (e.g. Seattle)"}
               value={aiCsvLocation}
               onChange={e => setAiCsvLocation(e.target.value)}
               className="w-48 px-3 py-1.5 border border-pink-300 rounded text-sm focus:outline-none"
             />
             <button
               onClick={startAICsvImport}
-              disabled={!aiCsvFile}
+              disabled={!aiCsvFiles.length}
               className={"px-6 py-2 rounded text-base font-bold border-2 shadow-md transition-all " + (
-                !aiCsvFile
+                !aiCsvFiles.length
                   ? "bg-pink-200 text-pink-700 border-pink-400 cursor-not-allowed"
                   : "bg-pink-600 text-white border-pink-700 hover:bg-pink-700 hover:shadow-lg ring-2 ring-pink-300"
               )}
