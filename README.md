@@ -35,12 +35,11 @@ GitHub Actions CI/CD
        |
        v
 EC2 + nginx (HTTPS, TLS 1.3, rate limiting)
-  '-- Docker: dashboard/server.py -> port 8080
+  |-- Docker: dashboard/server.py -> port 8080
+  '-- Docker: postgres:15           (named volume 'pgdata')
        |
        v
-RDS PostgreSQL 15
-  '-- 5 tables: jobs, job_state, application_plans,
-                application_plan_jobs, company_cache
+  Nightly pg_dump -> s3://fernflores-job-search-resumes/db-backups/
 ```
 
 ---
@@ -132,11 +131,10 @@ When you're satisfied, merge to `main` to trigger the production deploy.
 ### One-Time Setup (before first dev deploy)
 
 ```bash
-# 1. Create the dev database on RDS
-# SSH to EC2, then run:
-docker run --rm -e PGPASSWORD=<db-password> postgres:15 \
-  psql -h <RDS-HOST> -U <db-user> -d <prod-db-name> \
-  -c "CREATE DATABASE jobsearch_dev;"
+# 1. Create the dev database in the local Postgres container
+ssh ec2-user@<EC2-IP> \
+  "docker exec \$(docker ps -qf name=db) \
+     psql -U jobsearch -c 'CREATE DATABASE jobsearch_dev;'"
 
 # 2. Open port 8081 in the EC2 security group
 aws ec2 authorize-security-group-ingress \
@@ -144,6 +142,8 @@ aws ec2 authorize-security-group-ingress \
   --protocol tcp --port 8081 \
   --cidr 0.0.0.0/0
 ```
+
+> **Note:** [.github/workflows/deploy-dev.yml](.github/workflows/deploy-dev.yml) still reads RDS-pointing SSM parameters (`/job-search/db-host`, etc.) and runs the dev container outside the compose network. It needs a follow-up update to point at the new local Postgres container before dev deploys will work post-migration.
 
 ---
 
@@ -320,11 +320,50 @@ PostgreSQL schema lives in `db/schema.sql`. Five tables:
 | `application_plan_jobs` | Jobs within each plan |
 | `company_cache` | Company summaries and logo URLs |
 
-DB credentials are read from environment variables (`DB_HOST`, `DB_PASSWORD`, etc.) or pulled from AWS Parameter Store automatically in production.
+DB credentials are read from environment variables (`DB_HOST`, `DB_PASSWORD`, etc.). In production, the bootstrap script fetches the password from SSM (`/job-search/db-password-local`) and injects it into the generated `docker-compose.yml`.
 
 ### Additive migrations
 
 New columns are added at the bottom of `db/schema.sql` as idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements. Safe to re-run on existing databases — all new columns are nullable.
+
+### Applying schema changes in production
+
+The schema is auto-applied **only at first boot** of the `db` container (via `docker-entrypoint-initdb.d`). After that, schema changes need to be applied manually:
+
+```bash
+# 1. Bake the new schema.sql into the image (it lives at /app/db/schema.sql)
+git push origin main      # CI builds + deploys the new image
+
+# 2. Re-extract schema.sql from the new image to the EC2 mount point
+ssh ec2-user@<EC2-IP>
+docker create --name tmp-schema <ECR_URL>/job-search-pipeline:latest
+docker cp tmp-schema:/app/db/schema.sql /home/ec2-user/schema.sql
+docker rm tmp-schema
+
+# 3. Apply it to the running db container (idempotent — safe to re-run)
+docker exec -i $(docker ps -qf name=db) psql -U jobsearch jobsearch \
+  < /home/ec2-user/schema.sql
+```
+
+### Backups
+
+A cron job runs `/usr/local/bin/backup-db.sh` nightly at 03:00 UTC, dumping the database to `s3://fernflores-job-search-resumes/db-backups/jobsearch-<TIMESTAMP>.sql.gz`. Logs go to `/var/log/db-backup.log`.
+
+Run a backup on demand:
+```bash
+ssh ec2-user@<EC2-IP> '/usr/local/bin/backup-db.sh'
+```
+
+### Restoring from a backup
+
+`/usr/local/bin/restore-db.sh` downloads a backup from S3 and applies it to the running `db` container. **Destructive** — overwrites current data; prompts for confirmation.
+
+```bash
+ssh ec2-user@<EC2-IP>
+/usr/local/bin/restore-db.sh latest
+# or a specific key:
+/usr/local/bin/restore-db.sh db-backups/jobsearch-20260515T030000Z.sql.gz
+```
 
 ### One-time migration from JSON files
 If you have existing data in the legacy JSON files:
@@ -363,10 +402,11 @@ The app runs on EC2 behind nginx with a TLS certificate from Let's Encrypt. CI/C
 ### Infrastructure
 | Resource | Detail |
 |---|---|
-| EC2 | t3.micro, Amazon Linux 2023 |
-| RDS | PostgreSQL 15, t3.micro |
-| ECR | Docker image registry |
-| IAM | OIDC role for GitHub Actions (ECR push only); EC2 instance role (SSM + ECR pull) |
+| EC2 | t3.micro, Amazon Linux 2023 — runs both the app container and the Postgres container |
+| Postgres | `postgres:15` Docker container; data in named volume `pgdata`; nightly `pg_dump` to S3 |
+| S3 | `fernflores-job-search-resumes` — `config/config.json` and `db-backups/jobsearch-*.sql.gz` |
+| ECR | Docker image registry for the app image |
+| IAM | OIDC role for GitHub Actions (ECR push only); EC2 instance role (SSM + ECR pull + S3 read/write) |
 | nginx | HTTPS redirect, TLS 1.2/1.3, rate limiting on `/api/login` |
 
 ### CI/CD

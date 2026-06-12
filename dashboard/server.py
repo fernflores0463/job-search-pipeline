@@ -27,6 +27,7 @@ PORT = 8080
 DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(DIR)
 
+
 def _load_version():
     try:
         with open(os.path.join(PARENT_DIR, "VERSION")) as f:
@@ -34,7 +35,9 @@ def _load_version():
     except Exception:
         return "unknown"
 
+
 _APP_VERSION = _load_version()
+
 
 # Allow importing db module from repo root
 sys.path.insert(0, PARENT_DIR)
@@ -219,6 +222,7 @@ _IMPORT_BATCH_COLS = {
     "regex_agree", "ai_promoted", "ai_demoted", "estimated_cost", "actual_cost",
     "request_counts", "pending_jobs", "message", "last_error",
     "stopped", "finished_at", "started_at",
+    "import_date", "location",
 }
 
 
@@ -974,23 +978,23 @@ def _get_anthropic_client():
     return _anthropic_client
 
 
-def _call_claude(system_prompt, messages, model="claude-sonnet-4-20250514"):
+def _call_claude(system_prompt, messages, model="claude-sonnet-4-6", system_blocks=None):
     """Call the Anthropic Claude API with prompt caching.
 
-    The system prompt is marked with cache_control so Anthropic
-    caches it across calls. Subsequent requests within the 5-minute
-    TTL pay only 10% of the input token cost for the cached portion.
+    Pass system_blocks to use pre-built cache-annotated blocks (e.g. for
+    the split-block pattern in /api/ai-review). Otherwise system_prompt is
+    wrapped in a single 1-hour cached block.
     """
     client = _get_anthropic_client()
     if not client:
         raise RuntimeError("Anthropic client not initialized")
 
-    # Structure system prompt as a cacheable content block
-    system_blocks = [{
-        "type": "text",
-        "text": system_prompt,
-        "cache_control": {"type": "ephemeral"},
-    }]
+    if system_blocks is None:
+        system_blocks = [{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        }]
 
     response = client.messages.create(
         model=model,
@@ -998,11 +1002,19 @@ def _call_claude(system_prompt, messages, model="claude-sonnet-4-20250514"):
         system=system_blocks,
         messages=messages,
     )
+    usage = response.usage
+    print(
+        f"[claude] model={model} "
+        f"in={usage.input_tokens} "
+        f"cache_write={getattr(usage, 'cache_creation_input_tokens', 0)} "
+        f"cache_read={getattr(usage, 'cache_read_input_tokens', 0)} "
+        f"out={usage.output_tokens}"
+    )
     return response.content[0].text
 
 
 def _call_claude_with_retry(
-    system_prompt, messages, model="claude-sonnet-4-20250514",
+    system_prompt, messages, model="claude-sonnet-4-6",
     max_retries=3, initial_backoff=5,
 ):
     """Call _call_claude with exponential backoff on rate limits.
@@ -1071,13 +1083,8 @@ AI_SCORING_COST_PER_JOB = 0.0017
 # AI RESUME BULLET GENERATION (Claude Sonnet — Phase 2)
 # ─────────────────────────────────────────────────────────
 
-AI_RESUME_MODEL = "claude-sonnet-4-20250514"
-# NOTE: Phase 2 PRD targets "Sonnet 4.6" (claude-sonnet-4-6). When the
-# 4.6 model ID is available in the Anthropic API, swap this constant
-# (and ideally the existing _call_claude default at the top of this
-# file) to the new ID. Until then we use the same Sonnet 4 model as
-# the existing /api/ai-chat endpoint to guarantee a valid model ID.
-# Sonnet: $3/MTok input, $15/MTok output. Batch API gives 50% off.
+AI_RESUME_MODEL = "claude-sonnet-4-6"
+# Sonnet 4.6: $3/MTok input, $15/MTok output. Batch API gives 50% off.
 # Per-job token budget (amortized with prompt caching):
 #   ~3,500 input (cached system ~2,000 + user ~1,500)
 #   ~800 output
@@ -1088,7 +1095,7 @@ AI_RESUME_COST_PER_JOB_BATCH = 0.011
 # Actual per-token pricing for batch API (50% discount applied).
 # Used to compute actual_cost from real token counts after a batch ends.
 # Haiku 4.5 batch: $0.40/MTok input, $2.00/MTok output
-HAIKU_BATCH_INPUT_COST_PER_MTOK  = 0.40
+HAIKU_BATCH_INPUT_COST_PER_MTOK = 0.40
 HAIKU_BATCH_OUTPUT_COST_PER_MTOK = 2.00
 
 # Per-company rendered-line budgets. Mastercard is a hard equality.
@@ -1311,7 +1318,7 @@ def _build_batch_request(job_id, system_prompt, job):
             "system": [{
                 "type": "text",
                 "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }],
             "messages": [{"role": "user", "content": user_message}],
         },
@@ -1746,7 +1753,7 @@ def _build_ai_resume_batch_request(job_id, system_prompt, job):
             "system": [{
                 "type": "text",
                 "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }],
             "messages": [{
                 "role": "user",
@@ -2920,6 +2927,7 @@ def _run_import_csv(csv_bytes, location):
             existing = {row[0] for row in cur.fetchall()}
 
         new_jobs = [j for j in processed if j["job_link"] not in existing]
+        new_jobs.sort(key=lambda j: j["id"])  # consistent lock order prevents deadlock
 
         # Insert new jobs + initial job_state rows
         with Db() as conn:
@@ -3001,9 +3009,19 @@ def _run_import_csv_ai(batch_uuid, csv_bytes, location):
         if not location and rows:
             location = (rows[0].get("Search Location") or "").strip() or None
 
-        # Fetch import_date label from the pre-inserted row
+        # Fetch import_date label from the pre-inserted row; backfill location
+        # if it was discovered from the CSV's Search Location column.
         with _ai_imports_lock:
             batch_label = _ai_imports[batch_uuid]["import_date"]
+
+        if location and " — " not in batch_label:
+            short_id = batch_label.rsplit("#", 1)[-1] if "#" in batch_label else ""
+            new_label = _build_batch_label("live", location, short_id)
+            with _ai_imports_lock:
+                _ai_imports[batch_uuid]["import_date"] = new_label
+                _ai_imports[batch_uuid]["location"] = location
+            _update_import_row(batch_uuid, import_date=new_label, location=location)
+            batch_label = new_label
 
         # Filter (same logic as regex import)
         seen, filtered = set(), []
@@ -3137,6 +3155,7 @@ def _run_import_csv_ai(batch_uuid, csv_bytes, location):
         with ThreadPoolExecutor(max_workers=2) as executor:
             scored_jobs = list(executor.map(score_one, new_jobs))
 
+        scored_jobs.sort(key=lambda j: j["id"])  # consistent lock order prevents deadlock
         _mem_update(batch_uuid, {"message": f"Inserting {len(scored_jobs)} jobs into DB\u2026"})
 
         with Db() as conn:
@@ -3260,6 +3279,15 @@ def _run_import_csv_ai_batch(batch_uuid, csv_bytes, location):
 
         with _ai_imports_lock:
             batch_label = _ai_imports[batch_uuid]["import_date"]
+
+        if location and " — " not in batch_label:
+            short_id = batch_label.rsplit("#", 1)[-1] if "#" in batch_label else ""
+            new_label = _build_batch_label("batch", location, short_id)
+            with _ai_imports_lock:
+                _ai_imports[batch_uuid]["import_date"] = new_label
+                _ai_imports[batch_uuid]["location"] = location
+            _update_import_row(batch_uuid, import_date=new_label, location=location)
+            batch_label = new_label
 
         seen, filtered = set(), []
         for r in rows:
@@ -3463,6 +3491,7 @@ def _run_import_csv_ai_batch(batch_uuid, csv_bytes, location):
             + total_output_tokens * HAIKU_BATCH_OUTPUT_COST_PER_MTOK
         ) / 1_000_000
 
+        scored_jobs.sort(key=lambda j: j["id"])  # consistent lock order prevents deadlock
         _mem_update(batch_uuid, {"message": f"Inserting {len(scored_jobs)} jobs into DB\u2026"})
 
         with Db() as conn:
@@ -3688,6 +3717,7 @@ def _run_import_csv_ai_batch_resume(batch_uuid, anthropic_batch_id):
         + total_output_tokens * HAIKU_BATCH_OUTPUT_COST_PER_MTOK
     ) / 1_000_000
 
+    scored_jobs.sort(key=lambda j: j["id"])  # consistent lock order prevents deadlock
     try:
         with Db() as conn:
             cur = conn.cursor()
@@ -5604,7 +5634,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 entry.get("context", key)
                 for key, entry in _config["experience"].items()
             )
-            system_parts = [
+
+            # Block 1: static preamble (cached globally, ~700 tokens).
+            # Must not contain any per-job or per-session content.
+            static_preamble = "\n".join([
                 "You are a resume review assistant for a software "
                 f"engineer named {_candidate_name}.",
                 f"{_candidate_name} has experience at: "
@@ -5645,29 +5678,34 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 "technologies in the job posting and the candidate's "
                 "actual experience",
                 "- Be direct and actionable — no generic advice",
-                "",
+            ])
+
+            # Block 2: bullet pool (cached globally, ~1,500 tokens).
+            bullet_pool_block = "\n".join([
                 f"\n--- {_candidate_name.upper()}'S FULL EXPERIENCE "
                 "BULLET POOL ---",
                 "These are ALL available resume bullets the candidate "
                 "can draw from:",
                 _format_bullet_pool(),
-            ]
+            ])
 
+            # Block 3: per-job context (not cached — varies per job/PDF).
+            per_job_parts = []
             if job_id:
                 job_context, resume_text = _build_job_context(job_id)
                 if job_context:
-                    system_parts.append(
+                    per_job_parts.append(
                         "\n--- TARGET JOB POSTING ---\n" + job_context
                     )
                 if resume_text:
-                    system_parts.append(
+                    per_job_parts.append(
                         "\n--- CURRENT TAILORED RESUME FOR THIS JOB ---"
                     )
-                    system_parts.append(
+                    per_job_parts.append(
                         "This resume was auto-generated for this job. "
                         "Review it critically and suggest improvements:"
                     )
-                    system_parts.append(resume_text)
+                    per_job_parts.append(resume_text)
 
                 if include_pdf:
                     job = load_job(job_id)
@@ -5678,19 +5716,49 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     if pdf_path:
                         pdf_text = _extract_pdf_text(pdf_path)
                         if pdf_text:
-                            system_parts.append(
+                            per_job_parts.append(
                                 "\n--- UPLOADED PDF RESUME ---"
                             )
-                            system_parts.append(pdf_text)
+                            per_job_parts.append(pdf_text)
 
-            system_prompt = "\n".join(system_parts)
+            # Build structured system blocks: two globally cached,
+            # plus an optional uncached per-job block.
+            ai_review_system_blocks = [
+                {"type": "text", "text": static_preamble,
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                {"type": "text", "text": bullet_pool_block,
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            ]
+            if per_job_parts:
+                ai_review_system_blocks.append(
+                    {"type": "text", "text": "\n".join(per_job_parts)}
+                )
+
+            # Cache-mark the last assistant turn so each new user
+            # message only pays full price for the new content.
             claude_messages = list(history)
+            if claude_messages:
+                last = dict(claude_messages[-1])
+                content = last["content"]
+                if isinstance(content, str):
+                    content = [{"type": "text", "text": content,
+                                "cache_control": {"type": "ephemeral"}}]
+                else:
+                    content = list(content)
+                    last_block = dict(content[-1])
+                    last_block["cache_control"] = {"type": "ephemeral"}
+                    content[-1] = last_block
+                last["content"] = content
+                claude_messages[-1] = last
             claude_messages.append(
                 {"role": "user", "content": user_message}
             )
 
             try:
-                response = _call_claude(system_prompt, claude_messages)
+                response = _call_claude(
+                    "", claude_messages,
+                    system_blocks=ai_review_system_blocks,
+                )
                 _json_response(self, {"response": response})
             except Exception as e:
                 _json_response(self, {"error": str(e)}, 500)
