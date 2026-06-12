@@ -64,12 +64,15 @@ jobs:
           pkill -f 'sleep.*job-search-dev' 2>/dev/null || true
 
           echo "==> Reading DB credentials from Parameter Store..."
-          DB_HOST=$(aws ssm get-parameter --name /job-search/db-host --query Parameter.Value --output text)
+          # Postgres now runs as a container on the prod compose network (ec2-user_default);
+          # RDS was decommissioned. Dev uses the jobsearch_dev database on that same container.
+          DB_HOST=db
           DB_USER=$(aws ssm get-parameter --name /job-search/db-user --query Parameter.Value --output text)
           DB_PASS=$(aws ssm get-parameter --name /job-search/db-password --with-decryption --query Parameter.Value --output text)
 
           echo "==> Applying schema to jobsearch_dev..."
           docker run --rm \
+            --network ec2-user_default \
             -e DB_HOST="$DB_HOST" \
             -e DB_NAME=jobsearch_dev \
             -e DB_USER="$DB_USER" \
@@ -80,6 +83,7 @@ jobs:
 
           echo "==> Starting dev container on port 8081..."
           docker run -d --name job-search-dev \
+            --network ec2-user_default \
             -p 8081:8080 \
             -e DB_HOST="$DB_HOST" \
             -e DB_NAME=jobsearch_dev \
